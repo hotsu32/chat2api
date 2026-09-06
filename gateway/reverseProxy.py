@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import random
@@ -120,6 +121,57 @@ async def get_real_req_token(token):
         return req_token
 
 
+# curl_cffi 走 Clash 代理时偶发 SSL_ERROR_SYSCALL / connection reset（GFW 对新建 TLS 连接 RST）。
+# 浏览器靠静默重试 + keep-alive 复用连接所以稳定；镜像网关注每次请求都新建连接，需对幂等请求做轻量重试。
+_TRANSIENT_NETWORK_MARKERS = (
+    "ssl_error_syscall",
+    "ssl_connect",
+    "connection closed",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "timed out",
+    "timeout",
+    "recv failure",
+    "send failure",
+    "broken pipe",
+    "network is unreachable",
+    "remote end closed",
+    "eof",
+)
+
+
+def _is_transient_network_error(exc) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_NETWORK_MARKERS)
+
+
+async def _request_with_retry(method, url, *, params, headers, cookies, data, max_attempts, client_factory):
+    """发上游请求；幂等请求遇到瞬时网络错误（SSL reset / 连接重置）时重建 client 重试。
+
+    成功返回 (response, client)，client 保持打开（供流式响应 / background 关闭）；
+    失败时内部已关闭所有 client 并 re-raise 原始异常。
+    """
+    last_exc = None
+    for attempt in range(max_attempts):
+        client = client_factory()
+        try:
+            r = await client.request(method, url, params=params, headers=headers,
+                                     cookies=cookies, data=data, stream=True, allow_redirects=False)
+            return r, client
+        except Exception as e:
+            await client.close()
+            last_exc = e
+            if attempt < max_attempts - 1 and _is_transient_network_error(e):
+                logger.warning(
+                    f"[retry] transient network error ({attempt + 1}/{max_attempts}) for {url}: {str(e)[:120]}"
+                )
+                await asyncio.sleep(0.4 * (attempt + 1))
+                continue
+            raise
+    raise last_exc
+
+
 def save_conversation(token, conversation_id, title=None):
     if conversation_id not in globals.conversation_map:
         conversation_detail = {
@@ -202,11 +254,14 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         request_cookies = dict(request.cookies)
         # 注入账号持有者的 session cookie（__Secure-next-auth.session-token / cf_clearance / oai-did），
         # 镜像用户浏览器没有这些 cookie，需由网关注入，chatgpt.com 才能正确认证
-        try:
-            for _k, _v in (p.split("=", 1) for p in get_session_cookie().split("; ") if "=" in p):
-                request_cookies[_k] = _v
-        except Exception:
-            pass
+        # 例外：estuary/content 等 sig 签名端点，sig 本身已自足；注入 session cookie 会让上游
+        # 拿签名与会话做一致性校验而冲突，返回 500（实测不带 cookie 时返回 200 image/png）。
+        if "estuary" not in path:
+            try:
+                for _k, _v in (p.split("=", 1) for p in get_session_cookie().split("; ") if "=" in p):
+                    request_cookies[_k] = _v
+            except Exception:
+                pass
 
         # headers = {
         #     key: value for key, value in request.headers.items()
@@ -282,14 +337,25 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
 
         if "backend-api/sentinel/chat-requirements" in path and sentinel_proxy_url_list:
             sentinel_proxy_url = random.choice(sentinel_proxy_url_list).replace("{}", session_id) if sentinel_proxy_url_list else None
-            client = Client(proxy=sentinel_proxy_url)
+
+            def _make_client():
+                return Client(proxy=sentinel_proxy_url)
         else:
             proxy_url = proxy_url.replace("{}", session_id) if proxy_url else None
-            client = Client(proxy=proxy_url, impersonate=impersonate)
+
+            def _make_client():
+                return Client(proxy=proxy_url, impersonate=impersonate)
+
+        # 幂等请求（GET/HEAD/OPTIONS）遇到瞬时 SSL/连接重置自动重试，消除偶发 502
+        # （如 GPT 图片 estuary/content、会话轮询 api/auth/session）
+        max_attempts = 3 if request.method.upper() in ("GET", "HEAD", "OPTIONS") else 1
+        client = None
         try:
+            r, client = await _request_with_retry(
+                request.method, f"{base_url}/{path}", params=params, headers=headers,
+                cookies=request_cookies, data=data, max_attempts=max_attempts, client_factory=_make_client,
+            )
             background = BackgroundTask(client.close)
-            r = await client.request(request.method, f"{base_url}/{path}", params=params, headers=headers,
-                                     cookies=request_cookies, data=data, stream=True, allow_redirects=False)
             if r.status_code == 307 or r.status_code == 302 or r.status_code == 301:
                 return Response(status_code=307,
                                 headers={"Location": r.headers.get("Location")
@@ -356,10 +422,12 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                                         status_code=r.status_code, background=background)
                 return response
         except HTTPException as e:
-            await client.close()
+            if client is not None:
+                await client.close()
             raise HTTPException(status_code=e.status_code, detail=e.detail)
         except Exception as e:
-            await client.close()
+            if client is not None:
+                await client.close()
             logger.error(f"Reverse proxy failed for {path}: {str(e)}")
             raise HTTPException(status_code=502, detail="Upstream request failed")
     except HTTPException as e:

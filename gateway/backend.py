@@ -683,6 +683,10 @@ async def reverse_proxy(request: Request, path: str):
             if re.match(banned_path, path):
                 raise HTTPException(status_code=403, detail="Forbidden")
 
+    # Statsig/Datadog 遥测（/ces/*）：直接短路返回 202，避免转发到上游造成日志噪音与账号遥测泄漏
+    if normalized_path.startswith("/ces/"):
+        return Response(status_code=202)
+
     # 如果后台路径没有命中显式 admin 路由，说明 nginx / API_PREFIX 映射大概率错了。
     if "/admin/" in normalized_path or normalized_path.endswith("/admin"):
         raise HTTPException(
