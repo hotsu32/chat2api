@@ -42,18 +42,25 @@ def _load_session_cookie() -> str:
 
 
 def _fetch_official_html_sync(cookie: str, proxy_url: str = None) -> str:
-    r = cffi_requests.get(
-        "https://chatgpt.com/",
-        impersonate="chrome124",
-        proxy=proxy_url,
-        headers={"User-Agent": _FETCH_UA, "Cookie": cookie},
-        timeout=30,
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"fetch official frontend failed: HTTP {r.status_code}")
-    if '"authStatus":"logged_in"' not in r.text:
-        raise RuntimeError("official frontend not logged_in (session cookie expired?)")
-    return r.text
+    last_err = None
+    for _attempt in range(3):
+        try:
+            r = cffi_requests.get(
+                "https://chatgpt.com/",
+                impersonate="chrome124",
+                proxy=proxy_url,
+                headers={"User-Agent": _FETCH_UA, "Cookie": cookie},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                raise RuntimeError(f"fetch official frontend failed: HTTP {r.status_code}")
+            if '"authStatus":"logged_in"' not in r.text:
+                raise RuntimeError("official frontend not logged_in (session cookie expired?)")
+            return r.text
+        except Exception as e:
+            last_err = e
+            logger.warning(f"[frontend_sync] fetch attempt {_attempt + 1} failed: {e}")
+    raise last_err
 
 
 def _default_proxy() -> str:

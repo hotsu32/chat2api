@@ -46,6 +46,7 @@ if enable_gateway:
     import gateway.gpts
     import gateway.share
     import gateway.v1
+    import gateway.f_conversation_gateway
     import gateway.backend
 else:
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"])
