@@ -18,7 +18,7 @@ from app import app
 from chatgpt.authorization import get_req_token, verify_token
 from chatgpt.fp import get_fp
 from chatgpt.proofofWork import get_config, get_answer_token, get_requirements_token
-from gateway.reverseProxy import content_generator, headers_accept_list
+from gateway.reverseProxy import content_generator, headers_accept_list, resolve_seed_token
 from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import (
@@ -121,7 +121,7 @@ async def _server_sentinel(request, access_token, req_token, headers, fp):
 @app.post("/backend-api/sentinel/chat-requirements/prepare")
 async def f_sentinel_prepare(request: Request):
     """拦截 sentinel prepare：服务端算 sentinel，返回假 prepare_token（让前端跳过 PoW）。"""
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    token = resolve_seed_token(request)
     req_token = await get_real_req_token_wrapper(token)
     access_token = await verify_token(req_token)
     headers, fp = _build_headers(request, access_token, req_token)
@@ -163,7 +163,7 @@ async def f_conversation_prepare(request: Request):
 @app.post("/backend-api/f/conversation")
 async def f_conversation(request: Request):
     """拦截 f/conversation：服务端 sentinel + 转发老接口 /backend-api/conversation。"""
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    token = resolve_seed_token(request)
     req_token = await get_real_req_token_wrapper(token)
     access_token = await verify_token(req_token)
     headers, fp = _build_headers(request, access_token, req_token)

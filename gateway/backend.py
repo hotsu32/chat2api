@@ -16,8 +16,9 @@ from chatgpt.authorization import verify_token
 from chatgpt.fp import get_fp
 from chatgpt.proofofWork import get_answer_token, get_config, get_requirements_token
 from gateway.chatgpt import chatgpt_html
+from gateway.identity import build_session
 from gateway.reverseProxy import chatgpt_reverse_proxy, content_generator, get_real_req_token, headers_reject_list, \
-    headers_accept_list
+    headers_accept_list, resolve_seed_token
 from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import x_sign, turnstile_solver_url, chatgpt_base_url_list, no_sentinel, sentinel_proxy_url_list, \
@@ -137,7 +138,7 @@ async def post_subscriptions(request: Request):
 
 @app.api_route("/backend-api/conversations", methods=["GET", "PATCH"])
 async def get_conversations(request: Request):
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    token = resolve_seed_token(request)
     if len(token) == 45 or token.startswith("eyJhbGciOi"):
         return await chatgpt_reverse_proxy(request, "backend-api/conversations")
     if request.method == "GET":
@@ -169,7 +170,7 @@ async def get_conversations(request: Request):
 
 @app.get("/backend-api/conversation/{conversation_id}")
 async def update_conversation(request: Request, conversation_id: str):
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    token = resolve_seed_token(request)
     conversation_details_response = await chatgpt_reverse_proxy(request,
                                                                 f"backend-api/conversation/{conversation_id}")
     if len(token) == 45 or token.startswith("eyJhbGciOi"):
@@ -194,7 +195,7 @@ async def update_conversation(request: Request, conversation_id: str):
 
 @app.patch("/backend-api/conversation/{conversation_id}")
 async def patch_conversation(request: Request, conversation_id: str):
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    token = resolve_seed_token(request)
     patch_response = (await chatgpt_reverse_proxy(request, f"backend-api/conversation/{conversation_id}"))
     if len(token) == 45 or token.startswith("eyJhbGciOi"):
         return patch_response
@@ -439,6 +440,23 @@ async def get_me(request: Request):
 @app.post("/backend-api/edge")
 async def edge():
     return Response(status_code=204)
+
+
+@app.api_route("/api/auth/session", methods=["GET", "POST"])
+async def auth_session(request: Request):
+    """拦截 /api/auth/session：返回种子账号的合成 session，不依赖 owner session cookie。
+
+    官网前端水合时会用该接口刷新 session，若返回 owner 身份则与重写后的 client-bootstrap
+    不一致（触发 React #418），且泄漏 owner 凭据。这里按 SeedToken 合成并直接返回。
+    """
+    token = resolve_seed_token(request)
+    try:
+        req_token = await get_real_req_token(token)
+        access_token = await verify_token(req_token) or ""
+    except Exception:
+        access_token = ""
+    session = build_session(access_token)
+    return Response(content=json.dumps(session, ensure_ascii=False), media_type="application/json")
 
 
 if no_sentinel:

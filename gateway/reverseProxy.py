@@ -121,6 +121,18 @@ async def get_real_req_token(token):
         return req_token
 
 
+def resolve_seed_token(request: Request) -> str:
+    """返回用户身份标识（SeedToken）：优先取 `token` cookie，回退到 Authorization 头。
+
+    浏览器前端会把账号持有者抓取 logged_in HTML 时带出的 client-bootstrap JWT 塞进
+    Authorization 头；若以它为准，所有用户会串号到同一账号。真正的用户身份是 `token` cookie。
+    """
+    seed = request.cookies.get("token", "").strip()
+    if not seed:
+        seed = request.headers.get("authorization", "").replace("Bearer ", "").strip()
+    return seed
+
+
 # curl_cffi 走 Clash 代理时偶发 SSL_ERROR_SYSCALL / connection reset（GFW 对新建 TLS 连接 RST）。
 # 浏览器靠静默重试 + keep-alive 复用连接所以稳定；镜像网关注每次请求都新建连接，需对幂等请求做轻量重试。
 _TRANSIENT_NETWORK_MARKERS = (
@@ -286,14 +298,13 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
             base_url = "https://web-sandbox.oaiusercontent.com"
             path = path.replace("sandbox/", "")
 
-        token = headers.get("authorization", "").replace("Bearer ", "").strip()
-        if token:
-            req_token = await get_real_req_token(token)
-            access_token = await verify_token(req_token)
+        # 会话隔离：账号身份以 `token` cookie（SeedToken）为准，而非浏览器 Authorization 头里的
+        # client-bootstrap JWT（那是账号持有者抓 HTML 时泄漏的凭据，会导致所有用户串号到同一账号）。
+        seed_token = resolve_seed_token(request)
+        req_token = await get_real_req_token(seed_token)
+        access_token = await verify_token(req_token)
+        if access_token:
             headers.update({"authorization": f"Bearer {access_token}"})
-
-        cookie_token = request.cookies.get("token", "")
-        req_token = await get_real_req_token(cookie_token)
         fp = get_fp(req_token).copy()
 
         session_id = hashlib.md5(req_token.encode()).hexdigest()
@@ -369,7 +380,7 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                 logger.info(f"Request UA: {user_agent}")
                 logger.info(f"Request impersonate: {impersonate}")
                 conv_key = r.cookies.get("conv_key", "")
-                response = StreamingResponse(content_generator(r, token, history), media_type=r.headers.get("content-type", ""),
+                response = StreamingResponse(content_generator(r, seed_token, history), media_type=r.headers.get("content-type", ""),
                                   background=background)
                 response.set_cookie("conv_key", value=conv_key)
                 return response
