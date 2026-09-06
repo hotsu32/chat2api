@@ -308,7 +308,10 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                 response.set_cookie("conv_key", value=conv_key)
                 return response
             elif 'image' in r.headers.get("content-type", "") or "audio" in r.headers.get("content-type", "") or "video" in r.headers.get("content-type", ""):
-                rheaders = dict(r.headers)
+                # curl_cffi 的 acontent() 会自动解压 gzip/br，需剥离原 content-encoding，
+                # 否则浏览器拿到明文又按 br/gzip 解码，报 ERR_CONTENT_DECODING_FAILED
+                rheaders = {k: v for k, v in r.headers.items()
+                            if k.lower() not in ("content-encoding", "content-length", "transfer-encoding")}
                 response = Response(content=await r.acontent(), headers=rheaders,
                                         status_code=r.status_code, background=background)
                 return response
