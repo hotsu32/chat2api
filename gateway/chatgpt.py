@@ -1,18 +1,12 @@
-import json
 from urllib.parse import quote
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 
-from app import app, templates
+from app import app
+from gateway.frontend_sync import get_frontend_template, get_session_cookie
 from gateway.login import login_html
-from utils.kv_utils import set_value_for_key_list
-
-with open("templates/chatgpt_context_1.json", "r", encoding="utf-8") as f:
-    chatgpt_context_1 = json.load(f)
-with open("templates/chatgpt_context_2.json", "r", encoding="utf-8") as f:
-    chatgpt_context_2 = json.load(f)
-
+from utils.Logger import logger
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -23,38 +17,32 @@ async def chatgpt_html(request: Request):
     if not token:
         return await login_html(request)
 
+    # SeedToken（非 45 长度 / 非 eyJ）先 URL encode，保持 gateway 反代时的识别语义
+    inject_token = token
     if len(token) != 45 and not token.startswith("eyJhbGciOi"):
-        token = quote(token)
+        inject_token = quote(token)
 
-    user_chatgpt_context_1 = chatgpt_context_1.copy()
-    user_chatgpt_context_2 = chatgpt_context_2.copy()
+    # 官网最新 logged_in 版 HTML（已含正确的 client-bootstrap session 数据）
+    html = await get_frontend_template()
 
-    set_value_for_key_list(user_chatgpt_context_1, "accessToken", token)
-    if request.cookies.get("oai-locale"):
-        set_value_for_key_list(user_chatgpt_context_1, "locale", request.cookies.get("oai-locale"))
-    else:
-        accept_language = request.headers.get("accept-language")
-        if accept_language:
-            set_value_for_key_list(user_chatgpt_context_1, "locale", accept_language.split(",")[0])
+    # 清空本地存储，避免不同用户间的前端状态串扰
+    clear_script = "<script>localStorage.clear();</script>"
+    html = html.replace("</head>", clear_script + "</head>", 1)
 
-    user_chatgpt_context_1 = json.dumps(user_chatgpt_context_1, separators=(',', ':'), ensure_ascii=False)
-    user_chatgpt_context_2 = json.dumps(user_chatgpt_context_2, separators=(',', ':'), ensure_ascii=False)
-
-    escaped_context_1 = user_chatgpt_context_1.replace("\\", "\\\\").replace('"', '\\"')
-    escaped_context_2 = user_chatgpt_context_2.replace("\\", "\\\\").replace('"', '\\"')
-
-    clear_localstorage_script = """
-    <script>
-        localStorage.clear();
-    </script>
-    """
-
-    response = templates.TemplateResponse("chatgpt.html", {
-        "request": request,
-        "react_chatgpt_context_1": escaped_context_1,
-        "react_chatgpt_context_2": escaped_context_2,
-        "clear_localstorage_script": clear_localstorage_script
-    })
+    response = HTMLResponse(content=html)
+    # 用户标识 cookie（SeedToken / access_token），gateway 反代时据此识别用户
     response.set_cookie("token", value=token, expires="Thu, 01 Jan 2099 00:00:00 GMT")
+    # 设置账号持有者的 session cookie，让前端能通过 cookie 认证
+    for part in get_session_cookie().split("; "):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k == "__Secure-next-auth.session-token":
+                response.set_cookie(
+                    k, value=v, expires="Thu, 01 Jan 2099 00:00:00 GMT",
+                    path="/", samesite="lax", secure=True, httponly=True,
+                )
+            elif k == "cf_clearance":
+                response.set_cookie(k, value=v, expires="Thu, 01 Jan 2099 00:00:00 GMT", path="/")
+            elif k == "oai-did":
+                response.set_cookie(k, value=v, expires="Thu, 01 Jan 2099 00:00:00 GMT", path="/")
     return response
-

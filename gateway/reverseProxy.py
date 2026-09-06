@@ -14,6 +14,7 @@ from chatgpt.fp import get_fp
 from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import chatgpt_base_url_list, sentinel_proxy_url_list, force_no_history, file_host, voice_host, accept_language
+from gateway.frontend_sync import get_session_cookie
 
 
 def generate_current_time():
@@ -77,14 +78,33 @@ headers_accept_list = [
     "openai-sentinel-chat-requirements-token",
     "openai-sentinel-proof-token",
     "openai-sentinel-turnstile-token",
+    "openai-sentinel-arkose-token",
+    "x-conduit-token",
+    "x-openai-target-path",
+    "x-openai-target-route",
+    "x-oai-is",
+    "x-oai-turn-trace-id",
     "accept",
     "authorization",
     "accept-encoding",
     "accept-language",
     "content-type",
     "oai-device-id",
+    "oai-session-id",
+    "oai-client-version",
+    "oai-client-build-number",
     "oai-echo-logs",
     "oai-language",
+    "oai-telemetry",
+    "sec-ch-ua",
+    "sec-ch-ua-arch",
+    "sec-ch-ua-bitness",
+    "sec-ch-ua-full-version",
+    "sec-ch-ua-full-version-list",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-model",
+    "sec-ch-ua-platform",
+    "sec-ch-ua-platform-version",
     "sec-fetch-dest",
     "sec-fetch-mode",
     "sec-fetch-site",
@@ -180,6 +200,13 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
 
         params = dict(request.query_params)
         request_cookies = dict(request.cookies)
+        # 注入账号持有者的 session cookie（__Secure-next-auth.session-token / cf_clearance / oai-did），
+        # 镜像用户浏览器没有这些 cookie，需由网关注入，chatgpt.com 才能正确认证
+        try:
+            for _k, _v in (p.split("=", 1) for p in get_session_cookie().split("; ") if "=" in p):
+                request_cookies[_k] = _v
+        except Exception:
+            pass
 
         # headers = {
         #     key: value for key, value in request.headers.items()
@@ -192,8 +219,10 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         }
 
         base_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
-        if "assets/" in path:
+        if "cdn/" in path or "assets/" in path:
             base_url = "https://cdn.oaistatic.com"
+            # 官网新版前端资源路径带 /cdn/ 前缀（/cdn/assets/xxx），cdn 上实际是 /assets/xxx
+            path = path.replace("cdn/", "", 1)
         if "file-" in path and "backend-api" not in path:
             base_url = "https://files.oaiusercontent.com"
         if "v1/" in path:
