@@ -1,7 +1,9 @@
 import json
+import time
 from datetime import datetime, timezone
 
 import utils.globals as globals
+import utils.store as store
 from utils.Logger import logger
 
 
@@ -234,6 +236,50 @@ def get_bound_proxy(req_token):
     return None
 
 
+def _status_label(token, account):
+    """Map the SQLite three-state ``accounts.status`` to the admin-panel label."""
+    status = (account or {}).get("status")
+    if status == "disabled":
+        return "停用"
+    if status == "unhealthy":
+        return "异常"
+    if status == "healthy":
+        return "正常"
+    # Defensive fallback: token present in memory but not yet in accounts table.
+    return "异常" if token in set(globals.error_token_list) else "正常"
+
+
+def _antiban_modules():
+    """Lazy import to avoid a circular import (routing -> antiban.bucket -> routing)."""
+    from utils.antiban import circuit as antiban_circuit
+    from utils.antiban import cooldown
+    return antiban_circuit, cooldown
+
+
+def _antiban_status(token):
+    """dead/cooling/healthy — read-only projection of the antiban subsystem state."""
+    antiban_circuit, cooldown = _antiban_modules()
+    if antiban_circuit.is_token_dead(token):
+        return "dead"
+    next_available = cooldown.get_next_available(token)
+    if next_available and next_available > time.time():
+        return "cooling"
+    return "healthy"
+
+
+def _dead_reason(token):
+    entry = globals.antiban_dead_tokens.get(token) or {}
+    return entry.get("reason", "")
+
+
+def _next_available_at(token):
+    _, cooldown = _antiban_modules()
+    next_available = cooldown.get_next_available(token)
+    if next_available and next_available > time.time():
+        return format_refresh_time(next_available)
+    return "-"
+
+
 def get_dashboard_payload():
     config = get_routing_config()
     bindings = config.get("bindings", {})
@@ -271,7 +317,8 @@ def get_dashboard_payload():
     for index, token in enumerate(tokens, start=1):
         binding = bindings.get(token, {})
         account_meta = config.get("account_meta", {}).get(token, {})
-        status = "异常" if token in error_tokens else "正常"
+        acct = store.get_account(token) or {}
+        status = _status_label(token, acct)
         proxy_name = binding.get("proxy_name", "-")
         proxy_url = binding.get("proxy_url", "")
         group_name = binding.get("group", "-")
@@ -291,6 +338,12 @@ def get_dashboard_payload():
             "token_masked": mask_token(token),
             "token_type": token_type,
             "status": status,
+            "plan_type": acct.get("plan_type") or "-",
+            "nickname": acct.get("nickname") or "",
+            "antiban_status": _antiban_status(token),
+            "dead_reason": _dead_reason(token),
+            "next_available_at": _next_available_at(token),
+            "usage_count": store.query_usage_count(account=token),
             "proxy_name": proxy_name,
             "proxy_url": proxy_url,
             "group": group_name,
@@ -303,6 +356,21 @@ def get_dashboard_payload():
             "refresh_error": refresh_info.get("last_error", ""),
             "refresh_fail_count": refresh_info.get("fail_count", 0),
             "can_refresh": token_type == "RefreshToken",
+        })
+
+    users = []
+    for user in store.list_users():
+        seed = user.get("seed") or ""
+        current_account = user.get("current_account") or ""
+        users.append({
+            "seed": seed,
+            "seed_masked": mask_token(seed),
+            "tier": user.get("plan_type") or "unknown",
+            "current_account": current_account,
+            "current_account_masked": mask_token(current_account),
+            "conversation_count": len(store.list_seed_conversations(seed)),
+            "usage_count": store.query_usage_count(seed=seed),
+            "status": user.get("status") or "active",
         })
 
     alerts = []
@@ -334,9 +402,11 @@ def get_dashboard_payload():
             "proxy_total": len(proxies),
             "group_total": len(grouped_rules),
             "bound_total": len(bindings),
+            "users_total": len(users),
         },
         "ip_cards": proxy_stats,
         "accounts": accounts,
+        "users": users,
         "rules": list(grouped_rules.values()),
         "alerts": alerts,
         "updated_at": config.get("updated_at"),
