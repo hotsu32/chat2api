@@ -242,6 +242,19 @@ def get_account_by_plan(plan_type: str, status: Optional[str] = "healthy") -> Li
         return []
 
 
+def get_healthy_accounts() -> List[Dict[str, Any]]:
+    """Return all healthy accounts (any tier), for graceful fallback when a tier pool is empty."""
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                f"SELECT {', '.join(_ACCOUNT_SELECT_COLS)} FROM accounts WHERE status='healthy' ORDER BY rowid"
+            ).fetchall()
+            return [_account_row_to_dict(r, _ACCOUNT_SELECT_COLS) for r in rows]
+    except Exception as e:
+        logger.error(f"[store] get_healthy_accounts error: {e}")
+        return []
+
+
 def upsert_account(token: str, **fields: Any) -> None:
     """Partial upsert. Only non-None whitelisted fields are written; updated_at bumped."""
     if not token:
@@ -637,14 +650,15 @@ def load_all() -> Dict[str, Any]:
                 {"id": f"proxy-{i + 1}", "name": p[0], "proxy_url": p[1]} for i, p in enumerate(proxies)
             ]
 
-            users = conn.execute("SELECT seed, current_account FROM users ORDER BY rowid").fetchall()
-            for seed, account in users:
-                result["seed_map"][seed] = {"token": account, "conversations": []}
+            users = conn.execute("SELECT seed, plan_type, current_account FROM users ORDER BY rowid").fetchall()
+            for seed, plan_type, account in users:
+                result["seed_map"][seed] = {"token": account, "plan_type": plan_type, "conversations": []}
 
             convs = conn.execute("SELECT conv_id, seed, account, title, create_time, update_time FROM conversations").fetchall()
             for conv_id, seed, account, title, create_time, update_time in convs:
                 result["conversation_map"][conv_id] = {
                     "id": conv_id, "title": title, "create_time": create_time, "update_time": update_time,
+                    "account": account,
                 }
                 entry = result["seed_map"].get(seed)
                 if entry and conv_id not in entry["conversations"]:

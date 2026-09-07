@@ -190,7 +190,9 @@ def save_conversation(token, conversation_id, title=None):
             "id": conversation_id,
             "title": title,
             "create_time": generate_current_time(),
-            "update_time": generate_current_time()
+            "update_time": generate_current_time(),
+            # 会话历史跟号走：记录创建时的账号，切号后列表按当前账号过滤
+            "account": globals.seed_map.get(token, {}).get("token", ""),
         }
         globals.conversation_map[conversation_id] = conversation_detail
     else:

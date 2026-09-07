@@ -172,12 +172,16 @@ def persist_fp_token(token):
 
 
 def persist_seed_map():
-    """Sync users (seed -> current_account); delete users no longer in seed_map."""
+    """Sync users (seed -> current_account/plan_type); delete users no longer in seed_map."""
     known = set()
     for seed, entry in seed_map.items():
         if isinstance(entry, dict):
             known.add(seed)
-            store.upsert_user(seed, current_account=entry.get("token", ""))
+            store.upsert_user(
+                seed,
+                current_account=entry.get("token", ""),
+                plan_type=entry.get("plan_type"),
+            )
     for u in store.list_users():
         if u["seed"] not in known:
             store.delete_user(u["seed"])
@@ -187,7 +191,8 @@ def persist_conversation(seed, conv_id):
     """Sync a single conversation (targeted; used by reverseProxy.save_conversation)."""
     c = conversation_map.get(conv_id, {}) or {}
     entry = seed_map.get(seed)
-    account = entry.get("token", "") if isinstance(entry, dict) else None
+    # 会话历史跟号走：以会话自身记录的 account 为准，回退到 seed 当前账号
+    account = c.get("account") or (entry.get("token", "") if isinstance(entry, dict) else None)
     store.upsert_conversation(
         conv_id, seed, account, c.get("title"), c.get("create_time"), c.get("update_time")
     )
@@ -202,7 +207,9 @@ def persist_conversation_map():
         account = entry.get("token", "")
         for conv_id in entry.get("conversations", []):
             c = conversation_map.get(conv_id, {}) or {}
-            rows.append((conv_id, seed, account, c.get("title"), c.get("create_time"), c.get("update_time")))
+            # 每个会话保留自己创建时的账号，切号后不被当前账号覆盖
+            conv_account = c.get("account") or account
+            rows.append((conv_id, seed, conv_account, c.get("title"), c.get("create_time"), c.get("update_time")))
     store.replace_conversations(rows)
 
 

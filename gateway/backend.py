@@ -48,15 +48,17 @@ def has_direct_access_token(token: str) -> bool:
 @app.get("/backend-api/accounts/check/v4-2023-04-27")
 async def check_account(request: Request):
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    seed = request.cookies.get("token", "").strip()
     check_account_response = await chatgpt_reverse_proxy(request, "backend-api/accounts/check/v4-2023-04-27")
-    if has_direct_access_token(token):
+    # 只有真正无 seed cookie 的直连 API 客户端才放行上游（否则泄漏账号持有者真实身份）
+    if has_direct_access_token(token) and not seed:
         return check_account_response
     else:
         check_account_str = check_account_response.body.decode('utf-8')
         check_account_info = json.loads(check_account_str)
         for key in check_account_info.get("accounts", {}).keys():
             account_id = check_account_info["accounts"][key]["account"]["account_id"]
-            globals.seed_map[token]["user_id"] = \
+            globals.seed_map[seed or token]["user_id"] = \
                 check_account_info["accounts"][key]["account"]["account_user_id"].split("__")[0]
             check_account_info["accounts"][key]["account"]["account_user_id"] = f"user-chatgpt__{account_id}"
         globals.persist_seed_map()
@@ -144,16 +146,21 @@ async def get_conversations(request: Request):
         limit = int(request.query_params.get("limit", 28))
         offset = int(request.query_params.get("offset", 0))
         is_archived = request.query_params.get("is_archived", None)
+        # 会话历史跟号走：只列出当前账号（current_account）的会话，切号后旧会话自动隐藏
+        current_account = globals.seed_map.get(token, {}).get("token", "")
         items = []
         for conversation_id in globals.seed_map.get(token, {}).get("conversations", []):
             conversation = globals.conversation_map.get(conversation_id, None)
-            if conversation:
-                if is_archived == "true":
-                    if conversation.get("is_archived", False):
-                        items.append(conversation)
-                else:
-                    if not conversation.get("is_archived", False):
-                        items.append(conversation)
+            if not conversation:
+                continue
+            if current_account and conversation.get("account") and conversation.get("account") != current_account:
+                continue
+            if is_archived == "true":
+                if conversation.get("is_archived", False):
+                    items.append(conversation)
+            else:
+                if not conversation.get("is_archived", False):
+                    items.append(conversation)
         items = items[int(offset):int(offset) + int(limit)]
         conversations = {
             "items": items,
@@ -214,7 +221,9 @@ async def patch_conversation(request: Request, conversation_id: str):
 @app.get("/backend-api/me")
 async def get_me(request: Request):
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if len(token) == 45 or token.startswith("eyJhbGciOi"):
+    seed = request.cookies.get("token", "").strip()
+    # 镜像用户会话（存在 seed cookie）绝不回传上游真实身份；只有直连 API 客户端才放行
+    if (len(token) == 45 or token.startswith("eyJhbGciOi")) and not seed:
         return await chatgpt_reverse_proxy(request, "backend-api/me")
     else:
         me = {

@@ -46,8 +46,12 @@ def _iso_expiry(exp: int) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(exp))
 
 
-def build_session(access_token: str) -> dict:
-    """从账号 access_token 合成 NextAuth session 对象。token 为空/无法解码时返回 {}。"""
+def build_session(access_token: str, anonymize: bool = True) -> dict:
+    """从账号 access_token 合成 NextAuth session 对象。token 为空/无法解码时返回 {}。
+
+    anonymize=True 时用通用身份（name="ChatGPT"、email 置空）替换真实身份，只保留
+    planType / account.id，避免账号持有者身份泄漏给镜像用户。
+    """
     if not access_token:
         return {}
     claims = decode_jwt_payload(access_token)
@@ -62,8 +66,12 @@ def build_session(access_token: str) -> dict:
     account_id = auth.get("chatgpt_account_id") or ""
     plan_type = auth.get("chatgpt_plan_type") or "free"
     residency = auth.get("chatgpt_compute_residency") or "no_constraint"
-    name = profile.get("name") or ""
-    email = profile.get("email") or ""
+    if anonymize:
+        name = "ChatGPT"
+        email = ""
+    else:
+        name = profile.get("name") or ""
+        email = profile.get("email") or ""
     amr = auth.get("amr") or []
 
     idp = "auth0"

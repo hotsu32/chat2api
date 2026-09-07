@@ -6,8 +6,81 @@ from fastapi import HTTPException
 
 import utils.configs as configs
 import utils.globals as globals
+import utils.store as store
 from chatgpt.refreshToken import rt2ac, sess2ac
 from utils.Logger import logger
+from utils.antiban import circuit as antiban_circuit
+
+
+def _account_is_usable(token: str) -> bool:
+    """号是否可用：非熔断死、非错误列表、非手动 disabled。"""
+    if not token:
+        return False
+    if antiban_circuit.is_token_dead(token):
+        return False
+    if token in globals.error_token_list:
+        return False
+    acct = store.get_account(token)
+    if acct and acct.get("status") == "disabled":
+        return False
+    return True
+
+
+def _account_tier(token: str):
+    """读取账号的 plan_type 等级（SQLite 真相源）。"""
+    if not token:
+        return None
+    acct = store.get_account(token)
+    return (acct or {}).get("plan_type")
+
+
+def _pick_healthy_account(tier=None):
+    """从等级号池挑一个健康账号；等级池空则回退任意健康账号。"""
+    tier = tier or "free"
+    candidates = store.get_account_by_plan(tier, status="healthy")
+    if candidates:
+        return random.choice(candidates)["token"]
+    candidates = store.get_healthy_accounts()
+    return random.choice(candidates)["token"] if candidates else ""
+
+
+def _resolve_seed_account(seed: str) -> str:
+    """粘性路由：seed 已绑定健康账号则复用，否则按等级分配/切换并写回。"""
+    entry = globals.seed_map.get(seed)
+    current = entry.get("token", "") if isinstance(entry, dict) else ""
+    if current and _account_is_usable(current):
+        return current  # 粘性绑定，号还健康
+
+    tier = entry.get("plan_type") if isinstance(entry, dict) else None
+    token = _pick_healthy_account(tier)
+    if not token:
+        return ""  # 号池耗尽
+
+    if isinstance(entry, dict):
+        entry["token"] = token
+    else:
+        globals.seed_map[seed] = {"token": token, "plan_type": tier or "free", "conversations": []}
+    assigned_tier = _account_tier(token) or tier or "free"
+    if isinstance(entry, dict):
+        entry["plan_type"] = assigned_tier
+    globals.persist_seed_map()
+    return token
+
+
+def switch_seed_account(seed: str) -> str:
+    """强制切换 seed 到同等级的健康账号（供 /api/switch-account 调用）。返回新账号 token 或 ""。"""
+    entry = globals.seed_map.get(seed)
+    tier = entry.get("plan_type") if isinstance(entry, dict) else None
+    token = _pick_healthy_account(tier)
+    if not token:
+        return ""
+    if isinstance(entry, dict):
+        entry["token"] = token
+        entry["plan_type"] = _account_tier(token) or tier or "free"
+    else:
+        globals.seed_map[seed] = {"token": token, "plan_type": tier or "free", "conversations": []}
+    globals.persist_seed_map()
+    return token
 
 
 def get_req_token(req_token, seed=None):
@@ -15,12 +88,7 @@ def get_req_token(req_token, seed=None):
         available_token_list = list(set(globals.token_list) - set(globals.error_token_list))
         length = len(available_token_list)
         if seed and length > 0:
-            if seed not in globals.seed_map.keys():
-                globals.seed_map[seed] = {"token": random.choice(available_token_list), "conversations": []}
-                globals.persist_seed_map()
-            else:
-                req_token = globals.seed_map[seed]["token"]
-            return req_token
+            return _resolve_seed_account(seed)
 
         if req_token in configs.authorization_list:
             if len(available_token_list) > 0:
