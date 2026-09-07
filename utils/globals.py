@@ -3,6 +3,7 @@ import os
 
 import utils.configs as configs
 import utils.store as store
+from gateway.identity import decode_account_identity
 from utils.Logger import logger
 
 DATA_FOLDER = "data"
@@ -220,3 +221,46 @@ def persist_routing_config():
             group_name=binding.get("group"),
             note=meta.get("note", binding.get("note", "")),
         )
+
+
+# --- tier identity (等级号池) --------------------------------------------------
+# Tokens whose plan_type/real_email/nickname have already been synced to accounts.
+# Guard avoids a decode + SQLite write on every request for Refresh/Session tokens.
+_plan_synced = set()
+
+
+def sync_account_plan(token, access_token=None):
+    """Decode a token's tier identity and write it to ``accounts`` (idempotent).
+
+    - AccessToken (``eyJ`` / ``fk-``): decoded directly from the token itself.
+    - Refresh/Session: decoded from a cached access_token in ``refresh_map`` or from
+      the freshly exchanged ``access_token`` passed in by ``verify_token``.
+
+    If no access token is available yet, does nothing; the next exchange retries.
+    """
+    if not token or token in _plan_synced:
+        return
+    ac = access_token
+    if not ac:
+        if token.startswith("eyJhbGciOi") or token.startswith("fk-"):
+            ac = token
+        else:
+            ac = (refresh_map.get(token, {}) or {}).get("token", "")
+    if not ac:
+        return
+    identity = decode_account_identity(ac)
+    if not identity:
+        return
+    _plan_synced.add(token)
+    store.upsert_account(
+        token,
+        plan_type=identity["plan_type"],
+        real_email=identity.get("real_email") or None,
+        nickname=identity.get("nickname") or None,
+    )
+
+
+# Eagerly tier AccessTokens (and Refresh/Session tokens with a cached access_token)
+# so the pool is classified before first use; the rest are lazily synced on exchange.
+for _t in token_list:
+    sync_account_plan(_t)

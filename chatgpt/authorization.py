@@ -52,6 +52,7 @@ async def verify_token(req_token):
     else:
         if req_token.startswith("eyJhbGciOi") or req_token.startswith("fk-"):
             access_token = req_token
+            globals.sync_account_plan(req_token)
             return access_token
         # SessionToken：带 sess- 前缀的 chatgpt.com __Secure-next-auth.session-token
         elif req_token.startswith("sess-"):
@@ -59,6 +60,7 @@ async def verify_token(req_token):
                 if req_token in globals.error_token_list:
                     raise HTTPException(status_code=401, detail="Error SessionToken")
                 access_token = await sess2ac(req_token, force_refresh=False)
+                globals.sync_account_plan(req_token, access_token)
                 return access_token
             except HTTPException as e:
                 raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -69,6 +71,7 @@ async def verify_token(req_token):
                     raise HTTPException(status_code=401, detail="Error RefreshToken")
 
                 access_token = await rt2ac(req_token, force_refresh=False)
+                globals.sync_account_plan(req_token, access_token)
                 return access_token
             except HTTPException as e:
                 raise HTTPException(status_code=e.status_code, detail=e.detail)

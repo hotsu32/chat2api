@@ -24,6 +24,24 @@ def decode_jwt_payload(token: str) -> dict:
         return {}
 
 
+def decode_account_identity(access_token: str) -> dict:
+    """解码账号的等级身份（plan_type / real_email / nickname），供号池归池用。
+
+    AccessToken 在启动时立即解码；Refresh/Session token 在首次换出 access_token 后
+    懒解码写回。返回空 dict 表示解码失败（token 非 JWT 或 payload 不可解析）。
+    """
+    claims = decode_jwt_payload(access_token)
+    if not claims:
+        return {}
+    auth = claims.get("https://api.openai.com/auth", {})
+    profile = claims.get("https://api.openai.com/profile", {})
+    return {
+        "plan_type": auth.get("chatgpt_plan_type") or "unknown",
+        "real_email": profile.get("email") or "",
+        "nickname": profile.get("name") or "",
+    }
+
+
 def _iso_expiry(exp: int) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(exp))
 

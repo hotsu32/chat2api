@@ -220,6 +220,28 @@ def list_accounts() -> List[Dict[str, Any]]:
         return []
 
 
+def get_account_by_plan(plan_type: str, status: Optional[str] = "healthy") -> List[Dict[str, Any]]:
+    """Return full account rows for a tier, filtered by status (None = any)."""
+    try:
+        with _connect() as conn:
+            if status:
+                rows = conn.execute(
+                    f"SELECT {', '.join(_ACCOUNT_SELECT_COLS)} FROM accounts "
+                    "WHERE plan_type=? AND status=? ORDER BY rowid",
+                    (plan_type, status),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT {', '.join(_ACCOUNT_SELECT_COLS)} FROM accounts "
+                    "WHERE plan_type=? ORDER BY rowid",
+                    (plan_type,),
+                ).fetchall()
+            return [_account_row_to_dict(r, _ACCOUNT_SELECT_COLS) for r in rows]
+    except Exception as e:
+        logger.error(f"[store] get_account_by_plan error: {e}")
+        return []
+
+
 def upsert_account(token: str, **fields: Any) -> None:
     """Partial upsert. Only non-None whitelisted fields are written; updated_at bumped."""
     if not token:
