@@ -19,6 +19,7 @@ from utils.Logger import logger
 from utils.configs import api_prefix, scheduled_refresh, history_disabled, enable_session_sticky
 from utils.retry import async_retry
 from utils import antiban
+from utils import fleet_health
 from utils.antiban import circuit as antiban_circuit
 
 scheduler = AsyncIOScheduler()
@@ -193,7 +194,7 @@ async def app_start():
         )
 
     # Antiban 自愈定时任务
-    from utils.configs import enable_antiban, circuit_bucket_heal_minutes
+    from utils.configs import enable_antiban, circuit_bucket_heal_minutes, circuit_dead_account_recheck_hours
     if enable_antiban:
         scheduler.add_job(
             id='antiban_heal',
@@ -201,6 +202,15 @@ async def app_start():
             trigger='interval',
             minutes=max(int(circuit_bucket_heal_minutes), 5),
         )
+
+    # Fleet 健康检查：周期探活每个账号，写 accounts.status 三态。
+    # 复用 circuit_dead_account_recheck_hours 作为探活间隔（现配置原本零引用）。
+    scheduler.add_job(
+        id='fleet_health_check',
+        func=fleet_health.check_all_accounts,
+        trigger='interval',
+        hours=max(int(circuit_dead_account_recheck_hours), 1),
+    )
 
     if scheduled_refresh:
         scheduler.add_job(id='refresh', func=refresh_all_tokens, trigger='cron', hour=3, minute=0, day='*/2',
@@ -212,6 +222,9 @@ async def app_start():
         scheduler.start()
     elif enable_session_sticky:
         # 仅 session_sticky 启用时，scheduler 也要启动以执行 cleanup
+        scheduler.start()
+    else:
+        # 仅健康检查启用时，也需要把 scheduler 跑起来
         scheduler.start()
 
 
