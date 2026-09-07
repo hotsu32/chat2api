@@ -55,11 +55,14 @@ async def chatgpt_html(request: Request):
         logger.warning(f"[chatgpt_html] resolve seed account failed: {e}")
         access_token = ""
     session = build_session(access_token)
+    if not session:
+        # 种子账号无法解析（无绑定账号 / token 失效）时不下发官网 live 模板，
+        # 否则会把模板里账号持有者（owner）的 client-bootstrap 身份原样泄漏给镜像用户。
+        return await login_html(request)
 
     # 官网最新 logged_in 版 HTML（client-bootstrap 里是 owner 身份，重写为种子账号身份）
     html = await get_frontend_template()
-    if session:
-        html = _rewrite_client_bootstrap(html, session)
+    html = _rewrite_client_bootstrap(html, session)
 
     # 清空本地存储，避免不同用户间的前端状态串扰
     clear_script = "<script>localStorage.clear();</script>"

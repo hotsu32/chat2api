@@ -45,6 +45,20 @@ def has_direct_access_token(token: str) -> bool:
     return len(token) == 45 or token.startswith("eyJhbGciOi")
 
 
+# 账号对象里会暴露持有者真实身份的字段 → 匿名化值。
+# 仅用于 /backend-api/accounts/check 的 account 对象（此处字段语义明确，无歧义）。
+_ACCOUNT_IDENTITY_FIELDS = {
+    "account_email": "",
+    "account_name": "ChatGPT",
+    "email": "",
+    "name": "ChatGPT",
+    "first_name": "ChatGPT",
+    "last_name": "",
+    "phone_number": "",
+    "picture": "",
+}
+
+
 @app.get("/backend-api/accounts/check/v4-2023-04-27")
 async def check_account(request: Request):
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
@@ -56,11 +70,16 @@ async def check_account(request: Request):
     else:
         check_account_str = check_account_response.body.decode('utf-8')
         check_account_info = json.loads(check_account_str)
+        seed_entry = globals.seed_map.setdefault(seed or token, {})
         for key in check_account_info.get("accounts", {}).keys():
-            account_id = check_account_info["accounts"][key]["account"]["account_id"]
-            globals.seed_map[seed or token]["user_id"] = \
-                check_account_info["accounts"][key]["account"]["account_user_id"].split("__")[0]
-            check_account_info["accounts"][key]["account"]["account_user_id"] = f"user-chatgpt__{account_id}"
+            account = check_account_info["accounts"][key]["account"]
+            account_id = account.get("account_id")
+            seed_entry["user_id"] = account.get("account_user_id", "").split("__")[0]
+            account["account_user_id"] = f"user-chatgpt__{account_id}"
+            # 抹除 account 对象内其余 owner 标识字段，避免持有者真实身份泄漏给镜像用户
+            for field, value in _ACCOUNT_IDENTITY_FIELDS.items():
+                if field in account:
+                    account[field] = value
         globals.persist_seed_map()
         return check_account_info
 
@@ -177,15 +196,25 @@ async def get_conversations(request: Request):
 @app.get("/backend-api/conversation/{conversation_id}")
 async def update_conversation(request: Request, conversation_id: str):
     token = resolve_seed_token(request)
+    seed = request.cookies.get("token", "").strip()
+    # 直连 API 客户端（无 seed cookie + 直连 access token）放行上游
+    is_direct = has_direct_access_token(token) and not seed
+    if not is_direct:
+        # 镜像用户：归属校验必须发生在代理之前，未归属的会话一律 404（防跨 seed 越权）；
+        # 用 .get 消除缺 seed 时的 KeyError。
+        entry = globals.seed_map.get(seed or token) or {}
+        if conversation_id not in entry.get("conversations", []):
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
     conversation_details_response = await chatgpt_reverse_proxy(request,
                                                                 f"backend-api/conversation/{conversation_id}")
-    if len(token) == 45 or token.startswith("eyJhbGciOi"):
+    if is_direct:
         return conversation_details_response
     else:
         conversation_details_str = conversation_details_response.body.decode('utf-8')
         conversation_details = json.loads(conversation_details_str)
-        if conversation_id in globals.seed_map[token][
-            "conversations"] and conversation_id in globals.conversation_map:
+        entry = globals.seed_map.get(seed or token) or {}
+        if conversation_id in entry.get("conversations", []) and conversation_id in globals.conversation_map:
             globals.conversation_map[conversation_id]["title"] = conversation_details.get("title", None)
             globals.conversation_map[conversation_id]["is_archived"] = conversation_details.get("is_archived",
                                                                                                 False)
@@ -201,16 +230,23 @@ async def update_conversation(request: Request, conversation_id: str):
 @app.patch("/backend-api/conversation/{conversation_id}")
 async def patch_conversation(request: Request, conversation_id: str):
     token = resolve_seed_token(request)
+    seed = request.cookies.get("token", "").strip()
+    is_direct = has_direct_access_token(token) and not seed
+    if not is_direct:
+        entry = globals.seed_map.get(seed or token) or {}
+        if conversation_id not in entry.get("conversations", []):
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
     patch_response = (await chatgpt_reverse_proxy(request, f"backend-api/conversation/{conversation_id}"))
-    if len(token) == 45 or token.startswith("eyJhbGciOi"):
+    if is_direct:
         return patch_response
     else:
         data = await request.json()
-        if conversation_id in globals.seed_map[token][
-            "conversations"] and conversation_id in globals.conversation_map:
+        entry = globals.seed_map.get(seed or token) or {}
+        if conversation_id in entry.get("conversations", []) and conversation_id in globals.conversation_map:
             if not data.get("is_visible", True):
                 globals.conversation_map.pop(conversation_id)
-                globals.seed_map[token]["conversations"].remove(conversation_id)
+                entry["conversations"].remove(conversation_id)
                 globals.persist_seed_map()
             else:
                 globals.conversation_map[conversation_id].update(data)
@@ -229,7 +265,7 @@ async def get_me(request: Request):
         me = {
             "object": "user",
             "id": "org-chatgpt",
-            "email": "chatgpt@openai.com",
+            "email": "",
             "name": "ChatGPT",
             "picture": "https://cdn.auth0.com/avatars/ai.png",
             "created": int(time.time()),
@@ -700,8 +736,12 @@ if no_sentinel:
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"])
 async def reverse_proxy(request: Request, path: str):
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    seed = request.cookies.get("token", "").strip()
     normalized_path = "/" + path.lstrip("/")
-    if len(token) != 45 and not token.startswith("eyJhbGciOi"):
+    # 镜像用户（存在 seed cookie）或非直连 access token 一律封禁；
+    # 仅真正「无 seed cookie + 直连 access token」的客户端放行（否则浏览器带号池
+    # accessToken 时会被误判为直连而绕过 403）。
+    if seed or not has_direct_access_token(token):
         for banned_path in banned_paths:
             if re.match(banned_path, path):
                 raise HTTPException(status_code=403, detail="Forbidden")

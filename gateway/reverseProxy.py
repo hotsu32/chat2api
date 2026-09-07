@@ -37,6 +37,34 @@ def _usage_kind(path: str):
     return None
 
 
+# 通用反代里 JSON 载荷中会暴露账号持有者真实身份的字段 → 匿名化值。
+# 注意：通用反代无法穷举所有身份字段，这里是「定向缓解 + 残余风险已文档化」，非全量脱敏。
+_GENERIC_IDENTITY_FIELDS = {
+    "account_email": "",
+    "account_name": "ChatGPT",
+    "email": "",
+    "name": "ChatGPT",
+    "first_name": "ChatGPT",
+    "last_name": "",
+    "phone_number": "",
+    "picture": "",
+}
+
+
+def _scrub_identity_fields(node):
+    """递归把 dict 中命中 _GENERIC_IDENTITY_FIELDS 的键原地替换为匿名值。"""
+    if isinstance(node, dict):
+        for key in list(node.keys()):
+            if key in _GENERIC_IDENTITY_FIELDS:
+                node[key] = _GENERIC_IDENTITY_FIELDS[key]
+            else:
+                _scrub_identity_fields(node[key])
+    elif isinstance(node, list):
+        for item in node:
+            _scrub_identity_fields(item)
+    return node
+
+
 headers_reject_list = [
     "x-real-ip",
     "x-forwarded-for",
@@ -314,6 +342,9 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         # 会话隔离：账号身份以 `token` cookie（SeedToken）为准，而非浏览器 Authorization 头里的
         # client-bootstrap JWT（那是账号持有者抓 HTML 时泄漏的凭据，会导致所有用户串号到同一账号）。
         seed_token = resolve_seed_token(request)
+        # 原始 seed cookie（不含 Authorization 回退）：用于判断「镜像用户 vs 直连 API 客户端」，
+        # 决定 catch-all JSON 是否做身份脱敏。
+        seed_cookie = request.cookies.get("token", "").strip()
         req_token = await get_real_req_token(seed_token)
         access_token = await verify_token(req_token)
         if access_token:
@@ -433,6 +464,16 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                                    )
                     if base_url == "https://web-sandbox.oaiusercontent.com":
                         content = content.replace("/assets", "/sandbox/assets")
+                    # 定向脱敏：镜像用户（有 seed cookie）访问 backend-api JSON 时，抹除已知身份字段，
+                    # 防止 catch-all 透传把账号持有者真实身份（email/name/phone 等）泄漏给镜像用户。
+                    if seed_cookie and "backend-api/" in path and "application/json" in r.headers.get("content-type", ""):
+                        try:
+                            payload = json.loads(content)
+                            _scrub_identity_fields(payload)
+                            content = json.dumps(payload, ensure_ascii=False)
+                        except (ValueError, TypeError):
+                            # 非合法 JSON（如 HTML 片段）跳过脱敏，保持原样透传
+                            pass
                     rheaders = dict(r.headers)
                     content_type = rheaders.get("content-type", "")
                     cache_control = rheaders.get("cache-control", "")
