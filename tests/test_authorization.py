@@ -39,8 +39,8 @@ def test_account_is_usable(db):
     store.upsert_account("disabled-1", plan_type="plus", status="disabled")
     assert auth._account_is_usable("healthy-1") is True
     assert auth._account_is_usable("disabled-1") is False
-    # A token with no account row is not *explicitly* unusable (default-usable contract).
-    assert auth._account_is_usable("missing") is True
+    # A token with no account row is unusable (default-unusable: a dangling binding must fail over).
+    assert auth._account_is_usable("missing") is False
 
 
 def test_account_tier(db):
@@ -83,6 +83,8 @@ def test_resolve_seed_account_new_user(db, monkeypatch):
     token = auth._resolve_seed_account("seed-new")
     assert token == "plus-1"
     assert globals.seed_map["seed-new"]["token"] == "plus-1"
+    # assigned account tier is written back to the new user (not left as "free").
+    assert globals.seed_map["seed-new"]["plan_type"] == "plus"
 
 
 def test_switch_seed_account(db, monkeypatch):
@@ -92,6 +94,16 @@ def test_switch_seed_account(db, monkeypatch):
     monkeypatch.setattr(auth.random, "choice", _pick_max_token)
     assert auth.switch_seed_account("seed-a") == "plus-2"
     assert globals.seed_map["seed-a"]["token"] == "plus-2"
+
+
+def test_switch_seed_account_new_user(db, monkeypatch):
+    store.upsert_account("plus-1", plan_type="plus", status="healthy")
+    monkeypatch.setattr(auth.random, "choice", _pick_max_token)
+    token = auth.switch_seed_account("seed-new")
+    assert token == "plus-1"
+    assert globals.seed_map["seed-new"]["token"] == "plus-1"
+    # assigned account tier is written back even for a brand-new user.
+    assert globals.seed_map["seed-new"]["plan_type"] == "plus"
 
 
 @pytest.mark.asyncio

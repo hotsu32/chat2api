@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from utils import configs
 from utils.Logger import logger
+from utils.token_type import detect_token_type
 
 DATA_FOLDER = "data"
 
@@ -44,21 +45,6 @@ ACCOUNT_COLUMNS = {
     "proxy_name", "proxy_url", "group_name", "impersonate", "user_agent", "note",
     "refresh_info", "fingerprint", "last_health_check", "created_at", "updated_at",
 }
-
-
-def _detect_token_type(token: str) -> str:
-    """Mirror of utils.routing.detect_token_type (kept local to avoid circular import)."""
-    if not token:
-        return "Unknown"
-    if token.startswith("sess-"):
-        return "SessionToken"
-    if token.startswith("eyJhbGciOi") or token.startswith("fk-"):
-        return "AccessToken"
-    if token.startswith("rt_") and len(token) >= 60:
-        return "RefreshToken"
-    if len(token) == 45:
-        return "RefreshToken"
-    return "CustomToken"
 
 
 def _db_path() -> str:
@@ -570,7 +556,7 @@ def migrate(
                     """,
                     (
                         token,
-                        _detect_token_type(token),
+                        detect_token_type(token),
                         "unhealthy" if token in error_set else "healthy",
                         binding.get("proxy_name"),
                         binding.get("proxy_url") or fp.get("proxy_url"),
@@ -594,7 +580,7 @@ def migrate(
                         (token, token_type, status, created_at, updated_at)
                     VALUES (?, ?, 'unhealthy', ?, ?)
                     """,
-                    (token, _detect_token_type(token), now, now),
+                    (token, detect_token_type(token), now, now),
                 )
 
             # users + conversations from seed_map / conversation_map.

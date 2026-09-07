@@ -33,7 +33,7 @@
 - 合成 token 只含假身份（`owner@example.com` 等），不使用真实 `data/token.txt`。
 - 测试不使用真实账号、不直连 chatgpt.com。
 
-## 3. 已实现测试矩阵（46 用例）
+## 3. 已实现测试矩阵（48 用例）
 
 ### 3.1 `tests/test_identity.py` — 身份合成（R1/R3/R4）
 
@@ -63,6 +63,7 @@
 ### 3.4 `tests/test_routing_helpers.py` — 路由辅助（R1/掩码）
 
 - `detect_token_type` 全矩阵（Access `eyJ`/`fk-`、Refresh 45/`rt_≥60`、Session `sess-`、Custom、空）。
+- `detect_token_type` 单一来源：`routing.detect_token_type is store.detect_token_type`（锁定无镜像副本）。
 - `mask_token`（≤12 原样，否则 `前6…后4`）。
 - `format_refresh_time`（None/0 → `-`，时间戳 → ISO Z）。
 - `build_group_assignments` 分组建表。
@@ -70,10 +71,10 @@
 
 ### 3.5 `tests/test_authorization.py` — 车队核心（F1/F2）
 
-- `_account_is_usable`：healthy/disabled/无账号行三态。
+- `_account_is_usable`：healthy/disabled/无账号行三态（无账号行 = 不可用，悬空绑定 fail-over）。
 - `_account_tier` / `_pick_healthy_account`（含等级池空 → 任意健康号回退）。
-- `_resolve_seed_account`：**粘性复用**；绑死号 → **同等级切换**；新用户分配。
-- `switch_seed_account` 强制切换。
+- `_resolve_seed_account`：**粘性复用**；绑死号 → **同等级切换**；新用户分配（`assigned_tier` 回写）。
+- `switch_seed_account` 强制切换（含新用户 `assigned_tier` 回写）。
 - `verify_token`（AccessToken 路径）：原样返回 + `sync_account_plan` 落库 `plan_type`；空 token（无 `AUTHORIZATION`）→ `None`。
 
 ### 3.6 `tests/test_mock_upstream.py` — E2E harness 契约
@@ -92,7 +93,7 @@ uv pip install --python .venv/bin/python -r requirements-dev.txt
 .venv/bin/pytest -v tests/test_store.py   # 单文件
 ```
 
-预期：`46 passed`，无 warning。失败即回归。
+预期：`48 passed`，无 warning。失败即回归。
 
 ## 5. 黄金路径端到端（手动验收）
 
@@ -144,13 +145,15 @@ sqlite3 data/chat2api.db "select account, count(*) from usage_events group by ac
 
 ## 8. 验收门（Definition of Done）
 
-- [ ] `pytest` 全绿（当前 46 passed，0 warning）。
+- [ ] `pytest` 全绿（当前 48 passed，0 warning）。
 - [ ] `git status` 无 secrets 变更，无 `data/` 改动。
 - [ ] 黄金路径 E1/E2/E3 三场景有实际命令输出。
 - [ ] 每层关键用例均有断言代码（非口头描述）。
 
-## 9. 测试过程中观察到的行为（待确认，非本次修复范围）
+## 9. 测试过程中观察到的行为（已修复，2026-09-07）
 
-1. **`_account_is_usable` 对「无账号行」返回可用**：`store.get_account(token)` 为 `None` 时不判定不可用，仅 dead/error/disabled 三态判不可用。已在 `test_account_is_usable` 锁定该契约。若希望「未知 token 默认不可用」需改产品语义。
-2. **新用户 `_resolve_seed_account` 不写回真实等级**：`entry` 为 `None` 时 seed_map 写入 `plan_type="free"`，但分配的账号可能是 plus；`assigned_tier` 回写分支因 `entry` 仍为 `None` 而跳过。下次切换会按 free 池选号。建议后续确认「新用户默认 free」是否为预期，否则需回写 `assigned_tier`。
-3. **`detect_token_type` 双份实现**：`utils/routing.py` 与 `utils/store.py::_detect_token_type`（镜像）存在漂移风险，建议后续统一到单一来源。
+1. **`_account_is_usable` 对「无账号行」返回可用** → **已改为默认不可用**。`store.get_account(token)` 为 `None` 时判定不可用，悬空绑定会触发 fail-over 重新选号。锁定于 `test_account_is_usable`（`missing` → `False`）。
+2. **新用户 `_resolve_seed_account` 不写回真实等级** → **已修复**。`assigned_tier` 提前计算并回写进新用户分支；`switch_seed_account` 同款遗漏一并修复。锁定于 `test_resolve_seed_account_new_user` / `test_switch_seed_account_new_user`（`plan_type == "plus"`）。
+3. **`detect_token_type` 双份实现** → **已重构为单一来源**。新增 `utils/token_type.py`，`utils/routing` 与 `utils/store` 统一 import 同一函数，删除 `store._detect_token_type` 镜像。锁定于 `test_detect_token_type_single_source`（`routing.detect_token_type is store.detect_token_type`）。
+
+> 注：`utils/token_parser.py::_classify` 是另一套返回词汇（`session/access/refresh/unknown`）的导入期分类器，职责不同，未并入；其注释声明「与 detect_token_type 规则保持一致」，如需同样收敛为单一来源可另议。

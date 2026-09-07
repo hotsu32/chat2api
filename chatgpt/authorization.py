@@ -13,7 +13,7 @@ from utils.antiban import circuit as antiban_circuit
 
 
 def _account_is_usable(token: str) -> bool:
-    """号是否可用：非熔断死、非错误列表、非手动 disabled。"""
+    """号是否可用：非熔断死、非错误列表、非无账号行、非手动 disabled。"""
     if not token:
         return False
     if antiban_circuit.is_token_dead(token):
@@ -21,7 +21,9 @@ def _account_is_usable(token: str) -> bool:
     if token in globals.error_token_list:
         return False
     acct = store.get_account(token)
-    if acct and acct.get("status") == "disabled":
+    if not acct:
+        return False
+    if acct.get("status") == "disabled":
         return False
     return True
 
@@ -56,13 +58,12 @@ def _resolve_seed_account(seed: str) -> str:
     if not token:
         return ""  # 号池耗尽
 
-    if isinstance(entry, dict):
-        entry["token"] = token
-    else:
-        globals.seed_map[seed] = {"token": token, "plan_type": tier or "free", "conversations": []}
     assigned_tier = _account_tier(token) or tier or "free"
     if isinstance(entry, dict):
+        entry["token"] = token
         entry["plan_type"] = assigned_tier
+    else:
+        globals.seed_map[seed] = {"token": token, "plan_type": assigned_tier, "conversations": []}
     globals.persist_seed_map()
     return token
 
@@ -74,11 +75,12 @@ def switch_seed_account(seed: str) -> str:
     token = _pick_healthy_account(tier)
     if not token:
         return ""
+    assigned_tier = _account_tier(token) or tier or "free"
     if isinstance(entry, dict):
         entry["token"] = token
-        entry["plan_type"] = _account_tier(token) or tier or "free"
+        entry["plan_type"] = assigned_tier
     else:
-        globals.seed_map[seed] = {"token": token, "plan_type": tier or "free", "conversations": []}
+        globals.seed_map[seed] = {"token": token, "plan_type": assigned_tier, "conversations": []}
     globals.persist_seed_map()
     return token
 

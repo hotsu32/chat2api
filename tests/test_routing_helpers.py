@@ -3,6 +3,7 @@ import pytest
 
 import utils.globals as globals
 import utils.routing as routing
+import utils.store as store
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +38,11 @@ def _reset_globals(db):
 ])
 def test_detect_token_type(token, expected):
     assert routing.detect_token_type(token) == expected
+
+
+def test_detect_token_type_single_source():
+    # routing and store must expose the same function object (no mirrored copy).
+    assert routing.detect_token_type is store.detect_token_type
 
 
 def test_mask_token():
