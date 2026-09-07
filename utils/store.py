@@ -494,6 +494,45 @@ def query_usage(since: int = 0) -> List[Dict[str, Any]]:
         return []
 
 
+def add_usage_events(events: List[tuple]) -> None:
+    """Batch-insert usage events (seed, account, kind, created_at)."""
+    if not events:
+        return
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            conn.executemany(
+                "INSERT INTO usage_events (seed, account, kind, created_at) VALUES (?, ?, ?, ?)",
+                events,
+            )
+    except Exception as e:
+        logger.error(f"[store] add_usage_events error: {e}")
+
+
+def query_usage_count(seed: Optional[str] = None, account: Optional[str] = None,
+                      since: int = 0) -> int:
+    """Aggregated usage count (per seed or per account, or total when both empty)."""
+    try:
+        with _connect() as conn:
+            if seed:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM usage_events WHERE seed=? AND created_at>=?",
+                    (seed, since),
+                ).fetchone()
+            elif account:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM usage_events WHERE account=? AND created_at>=?",
+                    (account, since),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM usage_events WHERE created_at>=?", (since,),
+                ).fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        logger.error(f"[store] query_usage_count error: {e}")
+        return 0
+
+
 # --------------------------------------------------------- migration / full load
 
 def migrate(

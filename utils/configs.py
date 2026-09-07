@@ -166,6 +166,8 @@ session_trim_to_last_user = is_true(os.getenv('SESSION_TRIM_TO_LAST_USER', True)
 # ========================= Fleet (车队管理) =========================
 # 账号域统一 SQLite 存储（token/seed_map/conversation_map/refresh_map/fp_map/routing_config）
 fleet_db_path = os.getenv('FLEET_DB_PATH', os.path.join('data', 'chat2api.db'))
+# 用量统计内存计数 → usage_events 落库间隔（秒）
+usage_flush_interval_seconds = int(os.getenv('USAGE_FLUSH_INTERVAL_SECONDS', 60))
 
 with open('version.txt') as f:
     version = f.read().strip()

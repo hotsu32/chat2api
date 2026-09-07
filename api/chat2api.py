@@ -20,6 +20,7 @@ from utils.configs import api_prefix, scheduled_refresh, history_disabled, enabl
 from utils.retry import async_retry
 from utils import antiban
 from utils import fleet_health
+from utils import usage
 from utils.antiban import circuit as antiban_circuit
 
 scheduler = AsyncIOScheduler()
@@ -210,6 +211,15 @@ async def app_start():
         func=fleet_health.check_all_accounts,
         trigger='interval',
         hours=max(int(circuit_dead_account_recheck_hours), 1),
+    )
+
+    # 用量统计：内存计数周期落库 usage_events（避免反代热路径每请求写 SQLite）。
+    from utils.configs import usage_flush_interval_seconds
+    scheduler.add_job(
+        id='usage_flush',
+        func=usage.flush_usage,
+        trigger='interval',
+        seconds=max(int(usage_flush_interval_seconds), 15),
     )
 
     if scheduled_refresh:

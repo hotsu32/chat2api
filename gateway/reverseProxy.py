@@ -16,12 +16,25 @@ from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import chatgpt_base_url_list, sentinel_proxy_url_list, force_no_history, file_host, voice_host, accept_language
 from gateway.frontend_sync import get_session_cookie
+from utils.usage import record_usage
 
 
 def generate_current_time():
     current_time = datetime.now(timezone.utc)
     formatted_time = current_time.isoformat(timespec='microseconds').replace('+00:00', 'Z')
     return formatted_time
+
+
+def _usage_kind(path: str):
+    """Coarse usage category for a proxied path; None for non-usage traffic (assets/session)."""
+    p = path.lower()
+    if "conversation" in p:
+        return "conversation"
+    if "images/generations" in p:
+        return "image"
+    if "audio/speech" in p:
+        return "audio"
+    return None
 
 
 headers_reject_list = [
@@ -366,6 +379,8 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                 request.method, f"{base_url}/{path}", params=params, headers=headers,
                 cookies=request_cookies, data=data, max_attempts=max_attempts, client_factory=_make_client,
             )
+            # 用量统计：成功发起上游请求后计数（内存），周期 flush 落库
+            record_usage(seed_token, req_token, _usage_kind(path))
             background = BackgroundTask(client.close)
             if r.status_code == 307 or r.status_code == 302 or r.status_code == 301:
                 return Response(status_code=307,
