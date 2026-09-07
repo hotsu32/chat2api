@@ -59,8 +59,7 @@ def get_routing_config():
 def save_routing_config(config):
     config["updated_at"] = utc_now()
     globals.routing_config = config
-    with open(globals.ROUTING_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    globals.persist_routing_config()
 
 
 def resolve_group_name(config, proxy_name, proxy_url):
@@ -140,8 +139,7 @@ def sync_bindings_to_fp(bindings):
         globals.fp_map[token] = fp
     if changed:
         logger.info("Routing bindings synced to fp_map.json")
-    with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-        json.dump(globals.fp_map, f, indent=2, ensure_ascii=False)
+    globals.persist_fp_map()
 
 
 def update_single_binding(token, proxy_name, proxy_url, group_name=None):
@@ -224,8 +222,7 @@ def remove_account_binding(token):
 
     if token in globals.fp_map:
         globals.fp_map.pop(token, None)
-        with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-            json.dump(globals.fp_map, f, indent=2, ensure_ascii=False)
+        globals.persist_fp_map()
 
     return removed_binding
 

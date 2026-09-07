@@ -82,8 +82,7 @@ async def set_seedtoken(request: Request, credentials: HTTPAuthorizationCredenti
     else:
         globals.seed_map[seed]["token"] = token
 
-    with open(globals.SEED_MAP_FILE, "w", encoding="utf-8") as f:
-        json.dump(globals.seed_map, f, indent=4)
+    globals.persist_seed_map()
 
     return {"status": "success", "message": "Token updated successfully"}
 
@@ -98,8 +97,7 @@ async def delete_seedtoken(request: Request, credentials: HTTPAuthorizationCrede
 
         if seed == "clear":
             globals.seed_map.clear()
-            with open(globals.SEED_MAP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.seed_map, f, indent=4)
+            globals.persist_seed_map()
             return {"status": "success", "message": "All seeds deleted successfully"}
 
         if not seed:
@@ -109,8 +107,7 @@ async def delete_seedtoken(request: Request, credentials: HTTPAuthorizationCrede
             raise HTTPException(status_code=404, detail=f"Seed '{seed}' not found")
         del globals.seed_map[seed]
 
-        with open(globals.SEED_MAP_FILE, "w", encoding="utf-8") as f:
-            json.dump(globals.seed_map, f, indent=4)
+        globals.persist_seed_map()
 
         return {
             "status": "success",

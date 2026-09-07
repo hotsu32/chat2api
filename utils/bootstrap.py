@@ -57,9 +57,7 @@ def initialize_tokens():
             seen.add(token)
 
     globals.token_list[:] = normalized
-    with open(globals.TOKENS_FILE, "w", encoding="utf-8") as f:
-        for token in normalized:
-            f.write(token + "\n")
+    globals.persist_token_list()
     logger.info(f"Bootstrap tokens initialized: {len(normalized)} accounts")
     return True
 

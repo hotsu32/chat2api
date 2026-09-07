@@ -163,6 +163,10 @@ session_lc_field = os.getenv('SESSION_LC_FIELD', 'librechat_conversation_id')
 # 命中映射时是否把 messages[] 截短到最后一条 user message（依赖 ChatGPT 服务端续接历史，省 token）
 session_trim_to_last_user = is_true(os.getenv('SESSION_TRIM_TO_LAST_USER', True))
 
+# ========================= Fleet (车队管理) =========================
+# 账号域统一 SQLite 存储（token/seed_map/conversation_map/refresh_map/fp_map/routing_config）
+fleet_db_path = os.getenv('FLEET_DB_PATH', os.path.join('data', 'chat2api.db'))
+
 with open('version.txt') as f:
     version = f.read().strip()
 

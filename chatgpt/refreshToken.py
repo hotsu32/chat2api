@@ -25,14 +25,11 @@ _session_key_lock = asyncio.Lock()
 
 
 def persist_refresh_map():
-    with open(globals.REFRESH_MAP_FILE, "w", encoding="utf-8") as f:
-        json.dump(globals.refresh_map, f, indent=4, ensure_ascii=False)
+    globals.persist_refresh_map()
 
 
 def persist_error_tokens():
-    with open(globals.ERROR_TOKENS_FILE, "w", encoding="utf-8") as f:
-        for token in globals.error_token_list:
-            f.write(token + "\n")
+    globals.persist_error_tokens()
 
 
 def _decode_jwt_exp(jwt_token):

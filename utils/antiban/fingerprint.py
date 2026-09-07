@@ -253,8 +253,7 @@ def _derive_nav_platform(fp):
 
 def _persist_fp() -> None:
     with _write_lock:
-        with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-            json.dump(globals.fp_map, f, indent=4, ensure_ascii=False)
+        globals.persist_fp_map()
 
 
 def ensure_extended(token: str) -> Dict:

@@ -59,8 +59,7 @@ async def check_account(request: Request):
             globals.seed_map[token]["user_id"] = \
                 check_account_info["accounts"][key]["account"]["account_user_id"].split("__")[0]
             check_account_info["accounts"][key]["account"]["account_user_id"] = f"user-chatgpt__{account_id}"
-        with open(globals.SEED_MAP_FILE, "w", encoding="utf-8") as f:
-            json.dump(globals.seed_map, f, indent=4)
+        globals.persist_seed_map()
         return check_account_info
 
 
@@ -188,8 +187,7 @@ async def update_conversation(request: Request, conversation_id: str):
             globals.conversation_map[conversation_id]["gizmo_id"] = conversation_details.get("gizmo_id", None)
             globals.conversation_map[conversation_id]["async_status"] = conversation_details.get("async_status",
                                                                                                  None)
-            with open(globals.CONVERSATION_MAP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.conversation_map, f, indent=4)
+            globals.persist_conversation_map()
         return conversation_details_response
 
 
@@ -206,12 +204,10 @@ async def patch_conversation(request: Request, conversation_id: str):
             if not data.get("is_visible", True):
                 globals.conversation_map.pop(conversation_id)
                 globals.seed_map[token]["conversations"].remove(conversation_id)
-                with open(globals.SEED_MAP_FILE, "w", encoding="utf-8") as f:
-                    json.dump(globals.seed_map, f, indent=4)
+                globals.persist_seed_map()
             else:
                 globals.conversation_map[conversation_id].update(data)
-            with open(globals.CONVERSATION_MAP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.conversation_map, f, indent=4)
+            globals.persist_conversation_map()
         return patch_response
 
 

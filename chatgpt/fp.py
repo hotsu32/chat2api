@@ -149,23 +149,19 @@ def get_fp(req_token):
         if bound_proxy:
             fp["proxy_url"] = bound_proxy
             globals.fp_map[req_token] = fp
-            with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.fp_map, f, indent=4, ensure_ascii=False)
+            globals.persist_fp_token(req_token)
         elif "proxy_url" in fp.keys() and (fp["proxy_url"] is None or fp["proxy_url"] not in configs.proxy_url_list):
             fp["proxy_url"] = random.choice(configs.proxy_url_list) if configs.proxy_url_list else None
             globals.fp_map[req_token] = fp
-            with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.fp_map, f, indent=4, ensure_ascii=False)
+            globals.persist_fp_token(req_token)
         if "user-agent" in fp.keys():
             fp["impersonate"] = select_impersonate(fp["user-agent"])
             globals.fp_map[req_token] = fp
-            with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.fp_map, f, indent=4, ensure_ascii=False)
+            globals.persist_fp_token(req_token)
         elif globals.impersonate_list and "impersonate" in fp.keys() and fp["impersonate"] not in globals.impersonate_list:
             fp["impersonate"] = globals.impersonate_list[-1]
             globals.fp_map[req_token] = fp
-            with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.fp_map, f, indent=4)
+            globals.persist_fp_token(req_token)
         # 老 fp 迁移：补齐 oai-session-id 与高熵 sec-ch-ua-* 头（旧账号也能享受加固）
         _migrated = False
         if "oai-session-id" not in fp:
@@ -188,8 +184,7 @@ def get_fp(req_token):
                 _migrated = True
         if _migrated:
             globals.fp_map[req_token] = fp
-            with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.fp_map, f, indent=4, ensure_ascii=False)
+            globals.persist_fp_token(req_token)
         # 严格指纹绑定：开启后绝不因 user_agents_list 变化而漂移 UA，保留历史画像
         if (not (configs.enable_antiban and configs.strict_ip_binding)
                 and configs.user_agents_list
@@ -207,8 +202,7 @@ def get_fp(req_token):
             fp["user-agent"] = picked_ua
             fp["impersonate"] = select_impersonate(picked_ua)
             globals.fp_map[req_token] = fp
-            with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.fp_map, f, indent=4)
+            globals.persist_fp_token(req_token)
         fp = {k.lower(): v for k, v in fp.items()}
         return fp
     else:
@@ -262,6 +256,5 @@ def get_fp(req_token):
             return fp
         else:
             globals.fp_map[req_token] = fp
-            with open(globals.FP_FILE, "w", encoding="utf-8") as f:
-                json.dump(globals.fp_map, f, indent=4, ensure_ascii=False)
+            globals.persist_fp_token(req_token)
             return fp

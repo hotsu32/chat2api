@@ -17,8 +17,7 @@ def get_req_token(req_token, seed=None):
         if seed and length > 0:
             if seed not in globals.seed_map.keys():
                 globals.seed_map[seed] = {"token": random.choice(available_token_list), "conversations": []}
-                with open(globals.SEED_MAP_FILE, "w") as f:
-                    json.dump(globals.seed_map, f, indent=4)
+                globals.persist_seed_map()
             else:
                 req_token = globals.seed_map[seed]["token"]
             return req_token

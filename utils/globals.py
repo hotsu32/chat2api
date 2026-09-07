@@ -2,6 +2,7 @@ import json
 import os
 
 import utils.configs as configs
+import utils.store as store
 from utils.Logger import logger
 
 DATA_FOLDER = "data"
@@ -46,122 +47,176 @@ impersonate_list = [
 if not os.path.exists(DATA_FOLDER):
     os.makedirs(DATA_FOLDER)
 
-if os.path.exists(REFRESH_MAP_FILE):
-    with open(REFRESH_MAP_FILE, "r") as f:
+
+def _load_json(path, default):
+    if os.path.exists(path):
         try:
-            refresh_map = json.load(f)
-        except:
-            refresh_map = {}
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default
+    return default
+
+
+def _load_lines(path):
+    result = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip() and not line.startswith("#"):
+                        result.append(line.strip())
+        except Exception:
+            pass
+    return result
+
+
+# --- orthogonal subsystems: JSON (unchanged, NOT part of the account domain) ---
+wss_map = _load_json(WSS_MAP_FILE, {})
+antiban_bucket = _load_json(ANTIBAN_BUCKET_FILE, {"buckets": {}, "account_index": {}})
+antiban_bucket.setdefault("buckets", {})
+antiban_bucket.setdefault("account_index", {})
+antiban_geo_cache = _load_json(ANTIBAN_GEO_FILE, {})
+antiban_dead_tokens = _load_json(ANTIBAN_DEAD_FILE, {})
+account_warnings = _load_json(ACCOUNT_WARNINGS_FILE, {})
+
+# --- account domain: SQLite-backed (single source of truth) ---
+store.init_db()
+if store.is_migrated():
+    _loaded = store.load_all()
+    token_list = _loaded["token_list"]
+    error_token_list = _loaded["error_token_list"]
+    refresh_map = _loaded["refresh_map"]
+    fp_map = _loaded["fp_map"]
+    routing_config = _loaded["routing_config"]
+    seed_map = _loaded["seed_map"]
+    conversation_map = _loaded["conversation_map"]
 else:
-    refresh_map = {}
-
-if os.path.exists(WSS_MAP_FILE):
-    with open(WSS_MAP_FILE, "r") as f:
-        try:
-            wss_map = json.load(f)
-        except:
-            wss_map = {}
-else:
-    wss_map = {}
-
-if os.path.exists(FP_FILE):
-    with open(FP_FILE, "r", encoding="utf-8") as f:
-        try:
-            fp_map = json.load(f)
-        except:
-            fp_map = {}
-else:
-    fp_map = {}
-
-if os.path.exists(ROUTING_CONFIG_FILE):
-    with open(ROUTING_CONFIG_FILE, "r", encoding="utf-8") as f:
-        try:
-            routing_config = json.load(f)
-        except:
-            routing_config = {}
-else:
-    routing_config = {}
-
-if os.path.exists(SEED_MAP_FILE):
-    with open(SEED_MAP_FILE, "r") as f:
-        try:
-            seed_map = json.load(f)
-        except:
-            seed_map = {}
-else:
-    seed_map = {}
-
-if os.path.exists(CONVERSATION_MAP_FILE):
-    with open(CONVERSATION_MAP_FILE, "r") as f:
-        try:
-            conversation_map = json.load(f)
-        except:
-            conversation_map = {}
-else:
-    conversation_map = {}
-
-# Antiban 冷启动加载（骨架：无数据时保持默认空结构）
-if os.path.exists(ANTIBAN_BUCKET_FILE):
-    with open(ANTIBAN_BUCKET_FILE, "r", encoding="utf-8") as f:
-        try:
-            antiban_bucket = json.load(f)
-            antiban_bucket.setdefault("buckets", {})
-            antiban_bucket.setdefault("account_index", {})
-        except:
-            antiban_bucket = {"buckets": {}, "account_index": {}}
-
-if os.path.exists(ANTIBAN_GEO_FILE):
-    with open(ANTIBAN_GEO_FILE, "r", encoding="utf-8") as f:
-        try:
-            antiban_geo_cache = json.load(f)
-        except:
-            antiban_geo_cache = {}
-
-if os.path.exists(ANTIBAN_DEAD_FILE):
-    with open(ANTIBAN_DEAD_FILE, "r", encoding="utf-8") as f:
-        try:
-            antiban_dead_tokens = json.load(f)
-        except:
-            antiban_dead_tokens = {}
-
-if os.path.exists(ACCOUNT_WARNINGS_FILE):
-    with open(ACCOUNT_WARNINGS_FILE, "r", encoding="utf-8") as f:
-        try:
-            account_warnings = json.load(f)
-        except:
-            account_warnings = {}
-
-if os.path.exists(TOKENS_FILE):
-    with open(TOKENS_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip() and not line.startswith("#"):
-                token_list.append(line.strip())
-else:
-    with open(TOKENS_FILE, "w", encoding="utf-8") as f:
-        pass
-
-if os.path.exists(ERROR_TOKENS_FILE):
-    with open(ERROR_TOKENS_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip() and not line.startswith("#"):
-                error_token_list.append(line.strip())
-else:
-    with open(ERROR_TOKENS_FILE, "w", encoding="utf-8") as f:
-        pass
+    # First boot: JSON files are the one-shot migration source.
+    refresh_map = _load_json(REFRESH_MAP_FILE, {})
+    fp_map = _load_json(FP_FILE, {})
+    routing_config = _load_json(ROUTING_CONFIG_FILE, {})
+    seed_map = _load_json(SEED_MAP_FILE, {})
+    conversation_map = _load_json(CONVERSATION_MAP_FILE, {})
+    token_list = _load_lines(TOKENS_FILE)
+    error_token_list = _load_lines(ERROR_TOKENS_FILE)
+    store.migrate(token_list, error_token_list, seed_map, conversation_map,
+                  refresh_map, fp_map, routing_config)
 
 if token_list:
     logger.info(f"Token list count: {len(token_list)}, Error token list count: {len(error_token_list)}")
     logger.info("-" * 60)
 
 
+# ---------------------------------------------------------------------------
+# Write-through persist helpers. The in-memory structures above remain the
+# working cache; these push changes into SQLite (the durable truth).
+# ---------------------------------------------------------------------------
+
 def persist_token_list():
-    """全量重写 data/token.txt（用于 cookie 滚动续期后同步磁盘）。"""
-    with open(TOKENS_FILE, "w", encoding="utf-8") as f:
-        for t in token_list:
-            f.write(t + "\n")
+    """Authoritative sync of accounts.token + status from token_list/error_token_list."""
+    err = set(error_token_list)
+    live = set(token_list) | err
+    for t in token_list:
+        store.upsert_account(t, status="unhealthy" if t in err else "healthy")
+    for t in err:
+        if t not in token_list:
+            store.upsert_account(t, status="unhealthy")
+    for a in store.list_accounts():
+        if a["token"] not in live:
+            store.delete_account(a["token"])
+
+
+def persist_error_tokens():
+    """Authoritative status sync from error_token_list (mark error tokens unhealthy,
+    recovered tokens healthy)."""
+    err = set(error_token_list)
+    for t in token_list:
+        store.upsert_account(t, status="unhealthy" if t in err else "healthy")
+    for t in err:
+        if t not in token_list:
+            store.upsert_account(t, status="unhealthy")
+
+
+def persist_refresh_map():
+    """Sync refresh_info JSON blobs from refresh_map."""
+    for t, meta in refresh_map.items():
+        store.upsert_account(t, refresh_info=json.dumps(meta, ensure_ascii=False))
 
 
 def persist_fp_map():
-    """全量重写 data/fp_map.json。"""
-    with open(FP_FILE, "w", encoding="utf-8") as f:
-        json.dump(fp_map, f, indent=2, ensure_ascii=False)
+    """Sync fingerprint JSON blobs from fp_map (full; cold path)."""
+    for t, fp in fp_map.items():
+        store.upsert_account(
+            t,
+            fingerprint=json.dumps(fp, ensure_ascii=False),
+            impersonate=fp.get("impersonate"),
+            user_agent=fp.get("user-agent"),
+            proxy_url=fp.get("proxy_url"),
+        )
+
+
+def persist_fp_token(token):
+    """Sync a single token's fingerprint (hot path: fp.py per-request)."""
+    fp = fp_map.get(token)
+    if fp is None:
+        return
+    store.upsert_account(
+        token,
+        fingerprint=json.dumps(fp, ensure_ascii=False),
+        impersonate=fp.get("impersonate"),
+        user_agent=fp.get("user-agent"),
+        proxy_url=fp.get("proxy_url"),
+    )
+
+
+def persist_seed_map():
+    """Sync users (seed -> current_account); delete users no longer in seed_map."""
+    known = set()
+    for seed, entry in seed_map.items():
+        if isinstance(entry, dict):
+            known.add(seed)
+            store.upsert_user(seed, current_account=entry.get("token", ""))
+    for u in store.list_users():
+        if u["seed"] not in known:
+            store.delete_user(u["seed"])
+
+
+def persist_conversation(seed, conv_id):
+    """Sync a single conversation (targeted; used by reverseProxy.save_conversation)."""
+    c = conversation_map.get(conv_id, {}) or {}
+    entry = seed_map.get(seed)
+    account = entry.get("token", "") if isinstance(entry, dict) else None
+    store.upsert_conversation(
+        conv_id, seed, account, c.get("title"), c.get("create_time"), c.get("update_time")
+    )
+
+
+def persist_conversation_map():
+    """Authoritative rebuild of the conversations table from seed_map + conversation_map."""
+    rows = []
+    for seed, entry in seed_map.items():
+        if not isinstance(entry, dict):
+            continue
+        account = entry.get("token", "")
+        for conv_id in entry.get("conversations", []):
+            c = conversation_map.get(conv_id, {}) or {}
+            rows.append((conv_id, seed, account, c.get("title"), c.get("create_time"), c.get("update_time")))
+    store.replace_conversations(rows)
+
+
+def persist_routing_config():
+    """Sync proxies table + accounts proxy/group/note columns from routing_config."""
+    cfg = routing_config or {}
+    store.save_proxies(cfg.get("proxies", []))
+    bindings = cfg.get("bindings", {}) or {}
+    account_meta = cfg.get("account_meta", {}) or {}
+    for token, binding in bindings.items():
+        meta = account_meta.get(token, {}) or {}
+        store.upsert_account(
+            token,
+            proxy_name=binding.get("proxy_name"),
+            proxy_url=binding.get("proxy_url"),
+            group_name=binding.get("group"),
+            note=meta.get("note", binding.get("note", "")),
+        )

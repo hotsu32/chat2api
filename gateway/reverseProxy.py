@@ -202,10 +202,8 @@ def save_conversation(token, conversation_id, title=None):
     else:
         globals.seed_map[token]["conversations"].remove(conversation_id)
         globals.seed_map[token]["conversations"].insert(0, conversation_id)
-    with open(globals.CONVERSATION_MAP_FILE, "w", encoding="utf-8") as f:
-        json.dump(globals.conversation_map, f, indent=4)
-    with open(globals.SEED_MAP_FILE, "w", encoding="utf-8") as f:
-        json.dump(globals.seed_map, f, indent=4)
+    globals.persist_conversation(token, conversation_id)
+    globals.persist_seed_map()
     if title:
         logger.info(f"Conversation ID: {conversation_id}, Title: {title}")
 

@@ -380,9 +380,7 @@ async def routing_admin_import_accounts(request: Request):
             updated.append(token)
 
     if added:
-        with open(globals.TOKENS_FILE, "a", encoding="utf-8") as f:
-            for token in added:
-                f.write(token + "\n")
+        globals.persist_token_list()
 
     config = get_routing_config()
     if proxy_url and not proxy_name:
@@ -461,20 +459,14 @@ async def routing_admin_delete_account(request: Request):
         raise HTTPException(status_code=404, detail="token not found")
 
     globals.token_list[:] = [item for item in globals.token_list if item != token]
-    with open(globals.TOKENS_FILE, "w", encoding="utf-8") as f:
-        for item in globals.token_list:
-            f.write(item + "\n")
-
     remove_account_binding(token)
     if token in globals.refresh_map:
         globals.refresh_map.pop(token, None)
-        with open(globals.REFRESH_MAP_FILE, "w", encoding="utf-8") as f:
-            json.dump(globals.refresh_map, f, indent=4, ensure_ascii=False)
+        globals.persist_refresh_map()
     if token in globals.error_token_list:
         globals.error_token_list[:] = [item for item in globals.error_token_list if item != token]
-        with open(globals.ERROR_TOKENS_FILE, "w", encoding="utf-8") as f:
-            for item in globals.error_token_list:
-                f.write(item + "\n")
+        globals.persist_error_tokens()
+    globals.persist_token_list()
 
     return JSONResponse(
         {
@@ -955,8 +947,7 @@ async def routing_admin_harvester_import_cookie(request: Request):
     # 写入 token 池
     if storage_key not in globals.token_list:
         globals.token_list.append(storage_key)
-        with open(globals.TOKENS_FILE, "a", encoding="utf-8") as f:
-            f.write(storage_key + "\n")
+        globals.persist_token_list()
 
     # 绑定代理 / 备注
     proxy_url = ""
@@ -1136,8 +1127,7 @@ async def _harvester_import_rt(sess, refresh_token: str) -> None:
     # 加到 globals.token_list + token.txt
     if refresh_token not in globals.token_list:
         globals.token_list.append(refresh_token)
-        with open(globals.TOKENS_FILE, "a", encoding="utf-8") as f:
-            f.write(refresh_token + "\n")
+        globals.persist_token_list()
 
     # 绑定代理 / 备注
     proxy_url = ""

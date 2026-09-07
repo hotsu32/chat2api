@@ -370,8 +370,7 @@ async def upload_post(text: str = Form(...)):
     for line in lines:
         if line.strip() and not line.startswith("#"):
             globals.token_list.append(line.strip())
-            with open(globals.TOKENS_FILE, "a", encoding="utf-8") as f:
-                f.write(line.strip() + "\n")
+    globals.persist_token_list()
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
     tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
@@ -381,8 +380,7 @@ async def upload_post(text: str = Form(...)):
 async def clear_tokens():
     globals.token_list.clear()
     globals.error_token_list.clear()
-    with open(globals.TOKENS_FILE, "w", encoding="utf-8") as f:
-        pass
+    globals.persist_token_list()
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
     tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
@@ -398,8 +396,7 @@ async def error_tokens():
 async def add_token(token: str):
     if token.strip() and not token.startswith("#"):
         globals.token_list.append(token.strip())
-        with open(globals.TOKENS_FILE, "a", encoding="utf-8") as f:
-            f.write(token.strip() + "\n")
+        globals.persist_token_list()
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
     tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
@@ -409,9 +406,7 @@ async def add_token(token: str):
 async def clear_seed_tokens():
     globals.seed_map.clear()
     globals.conversation_map.clear()
-    with open(globals.SEED_MAP_FILE, "w", encoding="utf-8") as f:
-        f.write("{}")
-    with open(globals.CONVERSATION_MAP_FILE, "w", encoding="utf-8") as f:
-        f.write("{}")
+    globals.persist_seed_map()
+    globals.persist_conversation_map()
     logger.info(f"Seed token count: {len(globals.seed_map)}")
     return {"status": "success", "seed_tokens_count": len(globals.seed_map)}
