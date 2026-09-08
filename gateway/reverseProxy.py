@@ -259,7 +259,7 @@ async def content_generator(r, token, history=True):
         try:
             if history and (len(token) != 45 and not token.startswith("eyJhbGciOi")) and (not conversation_id or not title):
                 chat_chunk = chunk.decode('utf-8')
-                if not conversation_id or not title and chat_chunk.startswith("event: delta\n\ndata: {"):
+                if (not conversation_id or not title) and chat_chunk.startswith("event: delta\n\ndata: {"):
                     chunk_data = chat_chunk[19:]
                     conversation_id = json.loads(chunk_data).get("v").get("conversation_id")
                     if conversation_id:
@@ -284,9 +284,7 @@ async def content_generator(r, token, history=True):
                         title = json.loads(chunk_data).get("title")
                         if title:
                             save_conversation(token, conversation_id, title)
-        except Exception as e:
-            # logger.error(e)
-            # logger.error(chunk.decode('utf-8'))
+        except Exception:
             pass
         yield chunk
 

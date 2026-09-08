@@ -32,7 +32,6 @@ banned_paths = [
     "backend-api/user_system_messages",
     "backend-api/memories",
     "backend-api/settings/clear_account_user_memory",
-    "backend-api/conversations/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
     "backend-api/accounts/mfa_info",
     "backend-api/accounts/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/invites",
     "admin",

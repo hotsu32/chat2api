@@ -269,10 +269,7 @@ async def f_conversation(request: Request):
     logger.info(f"[f_conversation] upstream status={r.status_code} ct={content_type}")
 
     async def _filter_gen():
-        _count = 0
-        _forwarded = 0
         async for _chunk in content_generator(r, token, True):
-            _count += 1
             _s = _chunk.decode("utf-8", errors="replace")
             if _s.startswith("data: {"):
                 try:
@@ -288,9 +285,7 @@ async def f_conversation(request: Request):
                             continue
                 except Exception:
                     pass
-            _forwarded += 1
             yield _chunk
-        logger.info(f"[f_conversation] total={_count} forwarded={_forwarded}")
 
     if "stream" in content_type or "text/event-stream" in content_type:
         response = StreamingResponse(
