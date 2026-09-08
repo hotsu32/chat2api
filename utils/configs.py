@@ -191,6 +191,13 @@ fleet_db_path = os.getenv('FLEET_DB_PATH', os.path.join('data', 'chat2api.db'))
 # 用量统计内存计数 → usage_events 落库间隔（秒）
 usage_flush_interval_seconds = int(os.getenv('USAGE_FLUSH_INTERVAL_SECONDS', 60))
 
+# ---- 用户侧 SaaS（Stage 1 注册/登录；Stage 0 档位）----
+user_session_secret = os.getenv('USER_SESSION_SECRET', '').strip()
+user_session_max_age = int(os.getenv('USER_SESSION_MAX_AGE', 8 * 3600))
+user_session_cookie = 'user_session'
+user_csrf_cookie = 'user_csrf'
+require_email_verification = is_true(os.getenv('REQUIRE_EMAIL_VERIFICATION', False))
+
 with open('version.txt') as f:
     version = f.read().strip()
 
@@ -258,4 +265,7 @@ if enable_session_sticky:
     logger.info("SESSION_TTL_DAYS:      " + str(session_ttl_days))
     logger.info("SESSION_LC_FIELD:      " + str(session_lc_field))
     logger.info("SESSION_TRIM_TO_LAST_USER: " + str(session_trim_to_last_user))
+logger.info("--------------------- User SaaS --------------------------")
+logger.info("USER_SESSION_SECRET: " + str(bool(user_session_secret)))
+logger.info("REQUIRE_EMAIL_VERIFICATION: " + str(require_email_verification))
 logger.info("-" * 60)

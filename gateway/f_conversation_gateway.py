@@ -19,6 +19,7 @@ from chatgpt.authorization import get_req_token, verify_token
 from chatgpt.fp import get_fp
 from chatgpt.proofofWork import get_config, get_answer_token, get_requirements_token
 from gateway.reverseProxy import content_generator, headers_accept_list, resolve_seed_token
+from utils.tiers import enforce_tier
 from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import (
@@ -237,6 +238,13 @@ async def f_conversation(request: Request):
         data = json.dumps(body).encode("utf-8")
     except Exception:
         pass
+
+    # 档位执行（Stage 2）：模型门禁 + 额度上限（无 user_auth 行 fail-open）。
+    try:
+        _f_model = body.get("model")
+    except Exception:
+        _f_model = None
+    enforce_tier(token, _f_model)
 
     params = dict(request.query_params)
     request_cookies = dict(request.cookies)

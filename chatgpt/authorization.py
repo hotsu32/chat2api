@@ -36,25 +36,47 @@ def _account_tier(token: str):
     return (acct or {}).get("plan_type")
 
 
-def _pick_healthy_account(tier=None):
-    """从等级号池挑一个健康账号；等级池空则回退任意健康账号。"""
-    tier = tier or "free"
-    candidates = store.get_account_by_plan(tier, status="healthy")
-    if candidates:
-        return random.choice(candidates)["token"]
+def _seed_plan_types(seed: str):
+    """半专属分池：user.tier → account.plan_type 号组范围。无 user_auth 行返回 None（回落旧行为）。"""
+    try:
+        from utils.tiers import resolve_user_tier, tier_account_plan_types
+        tier_id = resolve_user_tier(seed)
+        if not tier_id:
+            return None
+        return tier_account_plan_types(tier_id) or None
+    except Exception:
+        return None
+
+
+def _pick_healthy_account(tier=None, plan_types=None):
+    """从等级号池挑一个健康账号；等级池空则回退任意健康账号。
+
+    plan_types（account.plan_type 集合）优先于 tier：供 user.tier → 号组 的半专属分池。
+    """
+    if plan_types:
+        candidates: list = []
+        for pt in plan_types:
+            candidates.extend(store.get_account_by_plan(pt, status="healthy"))
+        if candidates:
+            return random.choice(candidates)["token"]
+    else:
+        tier = tier or "free"
+        candidates = store.get_account_by_plan(tier, status="healthy")
+        if candidates:
+            return random.choice(candidates)["token"]
     candidates = store.get_healthy_accounts()
     return random.choice(candidates)["token"] if candidates else ""
 
 
 def _resolve_seed_account(seed: str) -> str:
-    """粘性路由：seed 已绑定健康账号则复用，否则按等级分配/切换并写回。"""
+    """粘性路由：seed 已绑定健康账号则复用，否则按 user.tier 号组分配/切换并写回。"""
     entry = globals.seed_map.get(seed)
     current = entry.get("token", "") if isinstance(entry, dict) else ""
     if current and _account_is_usable(current):
         return current  # 粘性绑定，号还健康
 
     tier = entry.get("plan_type") if isinstance(entry, dict) else None
-    token = _pick_healthy_account(tier)
+    token = _pick_healthy_account(tier, _seed_plan_types(seed))
     if not token:
         return ""  # 号池耗尽
 
@@ -69,10 +91,10 @@ def _resolve_seed_account(seed: str) -> str:
 
 
 def switch_seed_account(seed: str) -> str:
-    """强制切换 seed 到同等级的健康账号（供 /api/switch-account 调用）。返回新账号 token 或 ""。"""
+    """强制切换 seed 到同号组的健康账号（供 /api/switch-account 调用）。返回新账号 token 或 ""。"""
     entry = globals.seed_map.get(seed)
     tier = entry.get("plan_type") if isinstance(entry, dict) else None
-    token = _pick_healthy_account(tier)
+    token = _pick_healthy_account(tier, _seed_plan_types(seed))
     if not token:
         return ""
     assigned_tier = _account_tier(token) or tier or "free"

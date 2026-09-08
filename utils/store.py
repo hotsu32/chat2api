@@ -129,6 +129,28 @@ def init_db() -> None:
                         created_at INTEGER
                     );
 
+                    CREATE TABLE IF NOT EXISTS user_auth (
+                        email         TEXT PRIMARY KEY,
+                        password_hash TEXT,
+                        seed          TEXT,
+                        tier_id       TEXT,
+                        status        TEXT NOT NULL DEFAULT 'active',
+                        created_at    INTEGER,
+                        updated_at    INTEGER
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_user_auth_seed ON user_auth(seed);
+
+                    CREATE TABLE IF NOT EXISTS orders (
+                        order_id   TEXT PRIMARY KEY,
+                        email      TEXT,
+                        tier_id    TEXT,
+                        amount     TEXT,
+                        status     TEXT NOT NULL DEFAULT 'pending',
+                        created_at INTEGER,
+                        updated_at INTEGER
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_orders_email ON orders(email);
+
                     CREATE TABLE IF NOT EXISTS meta (
                         key   TEXT PRIMARY KEY,
                         value TEXT
@@ -340,6 +362,166 @@ def list_users() -> List[Dict[str, Any]]:
             } for r in rows]
     except Exception as e:
         logger.error(f"[store] list_users error: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------- user_auth
+
+_USER_AUTH_COLUMNS = {
+    "password_hash", "seed", "tier_id", "status",
+}
+
+
+def get_user_auth(email: str) -> Optional[Dict[str, Any]]:
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT email, password_hash, seed, tier_id, status, created_at, updated_at "
+                "FROM user_auth WHERE email=?",
+                (email,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "email": row[0], "password_hash": row[1], "seed": row[2],
+                "tier_id": row[3], "status": row[4], "created_at": row[5], "updated_at": row[6],
+            }
+    except Exception as e:
+        logger.error(f"[store] get_user_auth error: {e}")
+        return None
+
+
+def get_user_auth_by_seed(seed: str) -> Optional[Dict[str, Any]]:
+    if not seed:
+        return None
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT email, password_hash, seed, tier_id, status, created_at, updated_at "
+                "FROM user_auth WHERE seed=?",
+                (seed,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "email": row[0], "password_hash": row[1], "seed": row[2],
+                "tier_id": row[3], "status": row[4], "created_at": row[5], "updated_at": row[6],
+            }
+    except Exception as e:
+        logger.error(f"[store] get_user_auth_by_seed error: {e}")
+        return None
+
+
+def upsert_user_auth(email: str, **fields: Any) -> None:
+    """Partial upsert of a user_auth row. Whitelisted columns; updated_at bumped."""
+    if not email:
+        return
+    cols = [c for c in fields if c in _USER_AUTH_COLUMNS and fields[c] is not None]
+    if not cols:
+        return
+    now = int(time.time())
+    cols.append("updated_at")
+    values = [fields[c] if c != "updated_at" else now for c in cols]
+    col_sql = ", ".join(cols)
+    val_sql = ", ".join("?" for _ in cols)
+    upd_sql = ", ".join(f"{c}=excluded.{c}" for c in cols)
+    sql = (
+        f"INSERT INTO user_auth (email, {col_sql}) VALUES (?, {val_sql}) "
+        f"ON CONFLICT(email) DO UPDATE SET {upd_sql}"
+    )
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            conn.execute(sql, [email] + values)
+    except Exception as e:
+        logger.error(f"[store] upsert_user_auth error: {e}")
+
+
+def list_user_auth() -> List[Dict[str, Any]]:
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT email, seed, tier_id, status, created_at, updated_at "
+                "FROM user_auth ORDER BY rowid"
+            ).fetchall()
+            return [{
+                "email": r[0], "seed": r[1], "tier_id": r[2], "status": r[3],
+                "created_at": r[4], "updated_at": r[5],
+            } for r in rows]
+    except Exception as e:
+        logger.error(f"[store] list_user_auth error: {e}")
+        return []
+
+
+# ------------------------------------------------------------------------ orders
+
+def create_order(order_id: str, email: str, tier_id: str, amount: str,
+                 status: str = "pending") -> None:
+    if not order_id:
+        return
+    now = int(time.time())
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            conn.execute(
+                "INSERT INTO orders (order_id, email, tier_id, amount, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (order_id, email, tier_id, amount, status, now, now),
+            )
+    except Exception as e:
+        logger.error(f"[store] create_order error: {e}")
+
+
+def get_order(order_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT order_id, email, tier_id, amount, status, created_at, updated_at "
+                "FROM orders WHERE order_id=?",
+                (order_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "order_id": row[0], "email": row[1], "tier_id": row[2], "amount": row[3],
+                "status": row[4], "created_at": row[5], "updated_at": row[6],
+            }
+    except Exception as e:
+        logger.error(f"[store] get_order error: {e}")
+        return None
+
+
+def update_order_status(order_id: str, status: str) -> None:
+    if not order_id:
+        return
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            conn.execute(
+                "UPDATE orders SET status=?, updated_at=? WHERE order_id=?",
+                (status, int(time.time()), order_id),
+            )
+    except Exception as e:
+        logger.error(f"[store] update_order_status error: {e}")
+
+
+def list_orders(email: Optional[str] = None) -> List[Dict[str, Any]]:
+    try:
+        with _connect() as conn:
+            if email:
+                rows = conn.execute(
+                    "SELECT order_id, email, tier_id, amount, status, created_at, updated_at "
+                    "FROM orders WHERE email=? ORDER BY rowid DESC",
+                    (email,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT order_id, email, tier_id, amount, status, created_at, updated_at "
+                    "FROM orders ORDER BY rowid DESC"
+                ).fetchall()
+            return [{
+                "order_id": r[0], "email": r[1], "tier_id": r[2], "amount": r[3],
+                "status": r[4], "created_at": r[5], "updated_at": r[6],
+            } for r in rows]
+    except Exception as e:
+        logger.error(f"[store] list_orders error: {e}")
         return []
 
 

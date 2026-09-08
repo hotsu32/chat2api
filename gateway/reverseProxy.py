@@ -17,6 +17,7 @@ from utils.Logger import logger
 from utils.configs import chatgpt_base_url_list, sentinel_proxy_url_list, force_no_history, file_host, voice_host, accept_language
 from gateway.frontend_sync import get_session_cookie
 from utils.usage import record_usage
+from utils.tiers import enforce_tier
 
 
 def generate_current_time():
@@ -389,6 +390,15 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                 req_json["history_and_training_disabled"] = True
                 data = json.dumps(req_json).encode("utf-8")
 
+        # 档位执行（Stage 2）：对 SaaS 注册用户（有 user_auth 行）执行模型门禁 + 额度上限。
+        # 运营者 seed / 直传 token 无 user_auth 行 → fail-open 不设限。超限抛 403/429 向上返回。
+        _chat_model = None
+        if path.endswith("backend-api/conversation") or path.endswith("backend-alt/conversation"):
+            try:
+                _chat_model = (json.loads(data) or {}).get("model")
+            except Exception:
+                _chat_model = None
+        enforce_tier(seed_token, _chat_model)
 
         if "backend-api/sentinel/chat-requirements" in path and sentinel_proxy_url_list:
             sentinel_proxy_url = random.choice(sentinel_proxy_url_list).replace("{}", session_id) if sentinel_proxy_url_list else None

@@ -48,6 +48,14 @@ def user_usage(seed, since=0) -> int:
     return store.query_usage_count(seed=seed, since=since)
 
 
+def user_usage_total(seed, since=0) -> int:
+    """落库 + 未 flush 的内存 pending 之和（额度执行的准确读数）。"""
+    db = store.query_usage_count(seed=seed, since=since)
+    with _lock:
+        pending = sum(1 for s, _a, _k, t in _pending if s == seed and t >= since)
+    return db + pending
+
+
 def account_usage(account, since=0) -> int:
     """Aggregated usage count for an account."""
     return store.query_usage_count(account=account, since=since)
