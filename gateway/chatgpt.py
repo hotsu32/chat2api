@@ -1,5 +1,6 @@
 import json
 import re
+import uuid
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse
@@ -20,17 +21,79 @@ _CLIENT_BOOTSTRAP_RE = re.compile(
 )
 
 
-def _rewrite_client_bootstrap(html: str, session: dict) -> str:
-    """把 client-bootstrap 的 session 重写为种子账号身份，替换掉 owner 的身份/凭据。"""
-    bootstrap = json.dumps(
-        {"authStatus": "logged_in", "session": session},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    # 脚本内转义 < > &，避免破坏 <script> 边界 / HTML 解析
-    bootstrap = bootstrap.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+def _stable_device_id(user_id: str, salt: str) -> str:
+    """按种子用户派生稳定 device id，替换 statsig 里 owner 的设备指纹。"""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"chat2api:{salt}:{user_id}"))
 
+
+def _sanitize_statsig_payload(payload: str, session: dict) -> str:
+    """statsigPayload 内嵌 owner 的 user 对象（userID/email/account_id/设备 ID），
+    替换为种子账号身份；gate/config 评估值保持不变（服务端已预评估，客户端不重评）。
+    解析失败原样返回——其中只有弱分析属性，无凭据。"""
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return payload
+    user = data.get("user")
+    if not isinstance(user, dict):
+        return payload
+
+    su = session.get("user") or {}
+    account = session.get("account") or {}
+    user_id = su.get("id") or ""
+    account_id = account.get("id") or ""
+    plan_type = account.get("planType") or "free"
+
+    user["userID"] = user_id
+    user["email"] = su.get("email") or ""
+    custom_ids = user.get("customIDs")
+    if isinstance(custom_ids, dict):
+        for k in ("account_id", "workspace_id"):
+            if k in custom_ids:
+                custom_ids[k] = account_id
+        for k in ("stableID", "WebAnonymousCookieID", "DeviceId"):
+            if k in custom_ids:
+                custom_ids[k] = _stable_device_id(user_id, k)
+    custom = user.get("custom")
+    if isinstance(custom, dict):
+        if "account_user_id" in custom:
+            custom["account_user_id"] = user_id
+        if "account_id" in custom:
+            custom["account_id"] = account_id
+        if "plan_type" in custom:
+            custom["plan_type"] = plan_type
+        if "is_paid" in custom:
+            custom["is_paid"] = plan_type not in ("free", "")
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _rewrite_client_bootstrap(html: str, session: dict) -> str:
+    """把 client-bootstrap 的身份字段替换为种子账号身份，保留其余全部启动配置。
+
+    client-bootstrap 不是一小段身份凭据，而是前端应用的完整启动状态（statsigPayload
+    特性开关约 477KB、sessionId、entryContext、cluster、locale 等 40+ 键，共约 510KB，
+    占整页 90%）。整体替换会让前端启动时 JSON.parse(undefined) 崩溃、页面只剩裸壳。
+    因此只外科手术式覆盖身份/凭据字段：session 换成种子账号合成 session、user 同步覆盖、
+    statsigPayload 内嵌的 owner userID/email/account_id/设备 ID 脱敏后保留。
+    解析失败时回退整体替换——宁可页面降级，也不能把 owner 凭据原样下发。
+    """
+    _bs = chr(92)  # 反斜杠，用于拼出脚本内 unicode 转义序列
     def _repl(m):
+        try:
+            data = json.loads(m.group(2))
+            data["authStatus"] = "logged_in"
+            data["session"] = session
+            data["user"] = session.get("user") or {}
+            sp = data.get("statsigPayload")
+            if isinstance(sp, str) and sp:
+                data["statsigPayload"] = _sanitize_statsig_payload(sp, session)
+            bootstrap = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+        except Exception as e:
+            logger.warning(f"[chatgpt_html] bootstrap parse failed; fallback full replace: {e}")
+            bootstrap = json.dumps({"authStatus": "logged_in", "session": session}, ensure_ascii=False)
+        # 脚本内转义 < > &，避免破坏 <script> 边界 / HTML 解析
+        bootstrap = bootstrap.replace("&", _bs + "u0026").replace("<", _bs + "u003c").replace(">", _bs + "u003e")
         return m.group(1) + bootstrap + m.group(3)
 
     html, n = _CLIENT_BOOTSTRAP_RE.subn(_repl, html, count=1)

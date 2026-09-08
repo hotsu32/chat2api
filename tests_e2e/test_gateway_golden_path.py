@@ -28,16 +28,37 @@ def test_root_without_seed_serves_login(client):
 
 def test_seed_visit_rewrites_client_bootstrap_identity(client, monkeypatch, seed_user, seed_account,
                                                        make_access_token):
+    import json as _json
+    import re as _re
+
     tok = make_access_token(account_id="acc-e1", plan_type="plus")
     seed_account(tok)
     seed_user("seed-e1", tok, plan_type="plus")
 
-    # 用 canned 官网 HTML（含 owner 身份的 client-bootstrap）替代真实抓取，避免网络。
+    # 用 canned 官网 HTML 替代真实抓取，避免网络。client-bootstrap 里嵌入 owner 身份的
+    # session + statsigPayload（含 owner userID/email/customIDs），并带非身份键 sessionId，
+    # 用于验证「外科手术式保留启动配置、仅脱敏身份」而非整体替换。
+    _statsig = _json.dumps({
+        "feature_gates": {"gate_a": {"value": True}, "gate_b": {"value": False}},
+        "user": {
+            "userID": "user-OWNERLEAK",
+            "email": "owner@example.com",
+            "customIDs": {"account_id": "acc-OWNERLEAK", "DeviceId": "dev-OWNERLEAK"},
+            "custom": {"account_id": "acc-OWNERLEAK", "plan_type": "plus", "is_paid": True},
+        },
+    })
+    _bootstrap = _json.dumps({
+        "authStatus": "logged_in",
+        "sessionId": "sid-preserve-me",
+        "session": {"user": {"name": "Owner Real", "email": "owner@example.com"}},
+        "statsigPayload": _statsig,
+    })
+
     async def _fake_template():
         return (
             "<html><head></head><body>"
             '<script type="application/json" id="client-bootstrap" nonce="x">'
-            '{"authStatus":"logged_in","session":{"user":{"name":"Owner Real","email":"owner@example.com"}}}'
+            + _bootstrap +
             "</script>"
             "</body></html>"
         )
@@ -47,11 +68,36 @@ def test_seed_visit_rewrites_client_bootstrap_identity(client, monkeypatch, seed
     resp = client.get("/", cookies={"token": "seed-e1"})
     assert resp.status_code == 200
     assert resp.cookies.get("token") == "seed-e1"
-    # 重写后注入的是匿名身份，而非 owner 身份
-    assert b'"name":"ChatGPT"' in resp.content
-    assert b'"email":""' in resp.content
+
+    # 解析下发页面里的 client-bootstrap 做字段级断言
+    m = _re.search(
+        r'<script type="application/json" id="client-bootstrap"[^>]*>(.*?)</script>',
+        resp.content.decode("utf-8"), _re.DOTALL)
+    assert m, "client-bootstrap tag missing from served page"
+    data = _json.loads(m.group(1))
+
+    # 非身份启动配置被保留（整体替换会丢掉它们）
+    assert data["sessionId"] == "sid-preserve-me"
+    sp = _json.loads(data["statsigPayload"])
+    assert sp["feature_gates"]["gate_a"]["value"] is True  # 特性开关保留
+
+    # 身份脱敏：session / statsig 内都不含 owner 痕迹
+    assert data["session"]["user"]["name"] == "ChatGPT"
+    assert data["session"]["user"]["email"] == ""
+    assert data["session"]["account"]["planType"] == "plus"
+    assert data["session"]["account"]["id"] == "acc-e1"
+    assert sp["user"]["userID"] != "user-OWNERLEAK"
+    assert sp["user"]["email"] == ""
+    assert sp["user"]["customIDs"]["account_id"] == "acc-e1"
+    assert sp["user"]["customIDs"]["DeviceId"] != "dev-OWNERLEAK"
+    assert sp["user"]["custom"]["account_id"] == "acc-e1"
+    assert sp["user"]["custom"]["plan_type"] == "plus"
+    assert sp["user"]["custom"]["is_paid"] is True
+
+    # 原文层面：owner 身份字串不出现在页面任何位置
     assert b"Owner Real" not in resp.content
     assert b"owner@example.com" not in resp.content
+    assert b"OWNERLEAK" not in resp.content
 
 
 def test_auth_session_returns_anonymized_session(client, seed_user, seed_account, make_access_token):

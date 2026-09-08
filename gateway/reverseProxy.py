@@ -306,11 +306,14 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
 
         params = dict(request.query_params)
         request_cookies = dict(request.cookies)
+        # 静态资源（cdn/assets）走匿名公网 CDN，携带凭据反而触发 CDN 鉴权 403
+        is_static_asset = "cdn/" in path or "assets/" in path
         # 注入账号持有者的 session cookie（__Secure-next-auth.session-token / cf_clearance / oai-did），
         # 镜像用户浏览器没有这些 cookie，需由网关注入，chatgpt.com 才能正确认证
         # 例外：estuary/content 等 sig 签名端点，sig 本身已自足；注入 session cookie 会让上游
         # 拿签名与会话做一致性校验而冲突，返回 500（实测不带 cookie 时返回 200 image/png）。
-        if "estuary" not in path:
+        # 例外：静态资源也不注入——CDN 对带 session cookie 的请求直接 403。
+        if "estuary" not in path and not is_static_asset:
             try:
                 for _k, _v in (p.split("=", 1) for p in get_session_cookie().split("; ") if "=" in p):
                     request_cookies[_k] = _v
@@ -328,7 +331,7 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         }
 
         base_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
-        if "cdn/" in path or "assets/" in path:
+        if is_static_asset:
             base_url = "https://cdn.oaistatic.com"
             # 官网新版前端资源路径带 /cdn/ 前缀（/cdn/assets/xxx），cdn 上实际是 /assets/xxx
             path = path.replace("cdn/", "", 1)
@@ -342,14 +345,21 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
 
         # 会话隔离：账号身份以 `token` cookie（SeedToken）为准，而非浏览器 Authorization 头里的
         # client-bootstrap JWT（那是账号持有者抓 HTML 时泄漏的凭据，会导致所有用户串号到同一账号）。
-        seed_token = resolve_seed_token(request)
+        # 静态资源早退：跳过 seed 解析与 Authorization 注入，匿名直连 CDN
         # 原始 seed cookie（不含 Authorization 回退）：用于判断「镜像用户 vs 直连 API 客户端」，
         # 决定 catch-all JSON 是否做身份脱敏。
-        seed_cookie = request.cookies.get("token", "").strip()
-        req_token = await get_real_req_token(seed_token)
-        access_token = await verify_token(req_token)
-        if access_token:
-            headers.update({"authorization": f"Bearer {access_token}"})
+        if is_static_asset:
+            seed_token = ""
+            seed_cookie = request.cookies.get("token", "").strip()
+            req_token = ""
+            access_token = None
+        else:
+            seed_token = resolve_seed_token(request)
+            seed_cookie = request.cookies.get("token", "").strip()
+            req_token = await get_real_req_token(seed_token)
+            access_token = await verify_token(req_token)
+            if access_token:
+                headers.update({"authorization": f"Bearer {access_token}"})
         fp = get_fp(req_token).copy()
 
         session_id = hashlib.md5(req_token.encode()).hexdigest()

@@ -78,8 +78,7 @@ $ .venv/bin/pytest tests_e2e/
 ## 真号冒烟（Stage 5 收口，本地无网络依赖）
 
 用 3 个真实账号（1 free + 2 plus）跑 `smoke_real_accounts.py`（plan_type 全读自 SQLite 真相源，
-落盘副作用全部 stub 为 no-op，可重复、不污染库/文件）。真实 OpenAI 往返探活因代理
-`127.0.0.1:7899` 死节点被阻塞（见「未验证」）。
+落盘副作用全部 stub 为 no-op，可重复、不污染库/文件）。真实 OpenAI 往返探活已跑通（见下）。
 
 ```bash
 $ .venv/bin/python smoke_real_accounts.py
@@ -96,9 +95,28 @@ SUMMARY: total=18 pass=18 fail=0
 （剔除熔断 dead / error / disabled），三处分支（plan_types / tier / 全局回退）全部覆盖。
 回归测试 `tests_e2e/test_user_saas.py::test_failover_skips_marked_dead_account` 锁定该行为。
 
+## 真实 OpenAI 往返探活（已验证，2026-09-08）
+
+代理 `127.0.0.1:7899` 实际是 **FlClash（追云加速 / ZY.app）** 的 mixed-port，非 Clash Verge。
+当前选中节点 = `美国05【vip1】`（读自 FlClash `database.sqlite` 的 `selected_map`），
+`cdn-cgi/trace` 显示 exit `colo=LAX` / `loc=US`。FlClash 的 `external-controller` 为空
+（无 HTTP 控制面），故节点无法用 REST 枚举/切换；Clash Verge（`verge-mihomo`，控制面 9097）
+是另一个独立 App，其节点 delay-test 全 503（状态坏），与 chat2api 无关。
+
+```bash
+$ .venv/bin/python - <<'PY'   # 用真实 access token 走代理打 /backend-api/me（token 全程 mask 不回显）
+... GET https://chatgpt.com/backend-api/me  via proxy http://127.0.0.1:7899
+[plan=free  tok=eyJhbGci...NffQ] status=200 cloudflare_challenge=False email='gmail.com' name=y
+[plan=plus  tok=eyJhbGci...579Q] status=200 cloudflare_challenge=False email='gmail.com' name=y
+[plan=plus  tok=eyJhbGci...hr0g] status=200 cloudflare_challenge=False email='gmail.com' name=y
+```
+
+3/3 真实账号（1 free + 2 plus）`/backend-api/me` 返回 200、`name` 存在、无 Cloudflare 挑战，
+证明账号凭据仍有效 + 当前 VPN 节点通过 Cloudflare 风控。
+
 ## 验证状态
 
 - [x] Verified：B6 5 例 + B7 3 例 + B8 3 例 + B9 5 例全绿 + 48 单测 + 63 e2e 无回归
 - [x] Verified：真号冒烟 18/18（导入落库 + plan_type 正确 + free/plus 不串池 + 模拟封禁 failover + 并发分层 + 指纹稳定）
-- [ ] Unverified：真实 OpenAI 往返探活（代理 `127.0.0.1:7899` 节点死，SSL_ERROR_SYSCALL；需用户修复 VPN 后重跑）
+- [x] Verified：真实 OpenAI 往返探活 —— `GET /backend-api/me` 经代理 `127.0.0.1:7899`（FlClash 追云加速，节点 `美国05【vip1】`，exit colo=LAX）3/3 账号（1 free + 2 plus）返回 200，无 Cloudflare 挑战
 - [ ] Needs User：并发默认值（5/10）、降智阈值（3）/冷却（1800s）、IPQS 阈值（80）是否合意
