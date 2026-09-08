@@ -3,7 +3,7 @@ import re
 import uuid
 
 from fastapi import Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app import app
 from chatgpt.authorization import verify_token
@@ -108,7 +108,8 @@ async def chatgpt_html(request: Request):
     if not token:
         token = request.cookies.get("token")
     if not token:
-        return await login_html(request)
+        # 无身份 -> 进入 demo 选择页（free/plus 分组入口）；运营者 RT/AT 登录走 /login
+        return RedirectResponse(url="/demo", status_code=302)
 
     # 会话隔离：解析 SeedToken -> 账号 access_token，合成该账号的 session 身份
     try:

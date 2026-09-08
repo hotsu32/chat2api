@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>选择分组 · ChatGPT 镜像 Demo</title>
+  <style>
+    :root { --fg:#0f172a; --muted:#64748b; --border:#e2e8f0; --accent:#10a37f; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+           color:var(--fg); background:#fff; -webkit-font-smoothing:antialiased; }
+    .wrap { max-width:820px; margin:0 auto; padding:72px 20px; }
+    .hero { text-align:center; margin-bottom:48px; }
+    .hero h1 { font-size:40px; letter-spacing:-0.03em; margin:0 0 14px; line-height:1.1; }
+    .hero p { color:var(--muted); font-size:17px; margin:0 auto; max-width:520px; line-height:1.6; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:20px; }
+    .plan { border:1px solid var(--border); border-radius:18px; padding:30px; display:flex; flex-direction:column; }
+    .plan.hot { border-color:var(--accent); box-shadow:0 0 0 3px rgba(16,163,127,.10); }
+    .tag { align-self:flex-start; font-size:12px; font-weight:600; padding:4px 10px; border-radius:999px;
+           background:#f1f5f9; color:var(--muted); margin-bottom:14px; }
+    .tag.hot { background:rgba(16,163,127,.12); color:var(--accent); }
+    .plan .name { font-size:22px; font-weight:700; letter-spacing:-0.02em; }
+    .plan .desc { color:var(--muted); font-size:14px; margin:6px 0 22px; line-height:1.5; }
+    .field { margin-bottom:14px; }
+    .field label { display:block; font-size:13px; font-weight:500; color:var(--muted); margin-bottom:7px; }
+    .field input { width:100%; padding:12px 14px; border-radius:10px; border:1px solid var(--border);
+                   font-size:14px; color:var(--fg); background:#f8fafc; font-family:ui-monospace,Menlo,monospace; }
+    .field input:focus { outline:none; border-color:var(--accent); background:#fff; box-shadow:0 0 0 3px rgba(16,163,127,.12); }
+    .enter { margin-top:auto; }
+    .btn { display:block; width:100%; text-align:center; padding:13px 0; border-radius:12px; font-weight:600;
+           font-size:16px; border:none; cursor:pointer; transition:filter .15s ease; }
+    .btn-primary { background:var(--accent); color:#fff; }
+    .btn-primary:hover { filter:brightness(1.05); }
+    .btn-ghost { background:#fff; color:var(--fg); border:1px solid var(--border); }
+    .btn-ghost:hover { background:#f8fafc; }
+    .foot { text-align:center; color:var(--muted); font-size:13px; margin-top:52px; }
+    .foot a { color:var(--accent); text-decoration:none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <h1>选择一个分组开始</h1>
+      <p>填入对应 Token 进入号组即可对话。Free 组与 Plus 组走各自号池，互不串号。</p>
+    </div>
+
+    <div class="grid">
+      <div class="plan">
+        <span class="tag">免费</span>
+        <div class="name">Free 组</div>
+        <p class="desc">引流层 · 共享免费号池 · 日常对话够用。</p>
+        <div class="field">
+          <label for="token-free">Token</label>
+          <input id="token-free" value="{{ tokens['free'] }}" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="enter">
+          <button class="btn btn-ghost" onclick="enter('free')">进入 Free 组</button>
+        </div>
+      </div>
+
+      <div class="plan hot">
+        <span class="tag hot">Plus</span>
+        <div class="name">Plus 组</div>
+        <p class="desc">付费稳定层 · 专属 plus 号池 · 更稳更快。</p>
+        <div class="field">
+          <label for="token-plus">Token</label>
+          <input id="token-plus" value="{{ tokens['plus'] }}" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="enter">
+          <button class="btn btn-primary" onclick="enter('plus')">进入 Plus 组</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="foot">托管镜像 · 号池由平台运营 · 匿名隔离会话 · <a href="/landing">了解更多</a> · <a href="/login">运营者登录</a></div>
+  </div>
+
+  <script>
+    function enter(kind) {
+      var v = document.getElementById('token-' + kind).value.trim();
+      if (!v) { return; }
+      window.location.href = '/?token=' + encodeURIComponent(v);
+    }
+  </script>
+</body>
+</html>

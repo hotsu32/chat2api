@@ -50,6 +50,7 @@ if enable_gateway:
     import gateway.account
     import gateway.user
     import gateway.landing
+    import gateway.demo
     import gateway.backend
 else:
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"])

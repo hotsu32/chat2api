@@ -20,10 +20,12 @@ def _mask(token):
 # E1  first visit -> login -> assign -> anonymized identity
 # ---------------------------------------------------------------------------
 
-def test_root_without_seed_serves_login(client):
+def test_root_without_seed_redirects_to_demo(client):
     resp = client.get("/")
     assert resp.status_code == 200
-    assert b"RefreshToken" in resp.content  # login page, not the owner live template
+    assert any(r.status_code == 302 for r in resp.history)  # redirect to demo, not the owner live template
+    assert b"RefreshToken" not in resp.content  # demo selection page, not the login page
+    assert b"Free" in resp.content and b"Plus" in resp.content  # free/plus group entries
 
 
 def test_seed_visit_rewrites_client_bootstrap_identity(client, monkeypatch, seed_user, seed_account,
