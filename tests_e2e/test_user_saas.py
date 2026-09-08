@@ -62,12 +62,15 @@ def test_tier_catalog_enumerates_group_models_quota():
 def test_tier_account_plan_types_and_model_gate():
     assert tiers.tier_account_plan_types("free") == ["free"]
     assert "plus" in tiers.tier_account_plan_types("pro")
-    assert tiers.tier_allows_model("free", "gpt-4o-mini") is True
-    assert tiers.tier_allows_model("free", "o3") is False
-    assert tiers.tier_allows_model("plus", "o3") is True
+    assert tiers.tier_allows_model("free", "gpt-5-5") is True
+    assert tiers.tier_allows_model("free", "gpt-5-5-thinking") is False  # plus 专属
+    assert tiers.tier_allows_model("plus", "gpt-5-5-thinking") is True
+    # auto（默认自动选型）始终放行
+    assert tiers.tier_allows_model("free", "auto") is True
+    assert tiers.tier_allows_model("plus", "auto") is True
     # 未知档位 / 空模型 fail-open
     assert tiers.tier_allows_model("free", "") is True
-    assert tiers.tier_allows_model("nope", "o3") is True
+    assert tiers.tier_allows_model("nope", "gpt-5-5-thinking") is True
 
 
 def test_resolve_user_tier_none_without_user_auth():
@@ -132,7 +135,7 @@ def test_free_tier_blocks_premium_model(client, seed_account, make_access_token)
     _make_user("seed-gate", "gate@example.com", tier_id="free")
 
     resp = client.post(
-        "/backend-api/conversation", cookies={"token": "seed-gate"}, json={"model": "o3"}
+        "/backend-api/conversation", cookies={"token": "seed-gate"}, json={"model": "gpt-5-5-thinking"}
     )
     assert resp.status_code == 403
 
@@ -148,7 +151,7 @@ def test_free_tier_quota_exceeded_returns_429(client, seed_account, make_access_
         store.add_usage_event(seed, tok, "conversation")
 
     resp = client.post(
-        "/backend-api/conversation", cookies={"token": seed}, json={"model": "gpt-4o-mini"}
+        "/backend-api/conversation", cookies={"token": seed}, json={"model": "gpt-5-5"}
     )
     assert resp.status_code == 429
 

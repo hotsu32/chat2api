@@ -24,6 +24,10 @@ from typing import Any, Dict, List, Optional
 from utils.Logger import logger
 
 # 内嵌默认档位（缺失 data/tiers.json 时的回落；也是测试/冒烟的无文件基线）。
+# models 白名单与真实 2026 ChatGPT 型号 slug 对齐（2026-09-08 实测 /backend-api/models）：
+#   free 号:  gpt-5-5 / gpt-5-6 / 各 mini / research / auto
+#   plus 号:  额外有 instant / thinking / *-wm 系列
+# auto 由 tier_allows_model 单独放行，不写进白名单。
 _DEFAULT_TIERS: Dict[str, Dict[str, Any]] = {
     "free": {
         "label": "免费",
@@ -32,7 +36,12 @@ _DEFAULT_TIERS: Dict[str, Dict[str, Any]] = {
         "quota_limit": 50,
         "quota_period": "day",
         "concurrency": "shared",
-        "models": ["gpt-5-mini", "gpt-4o-mini", "o4-mini"],
+        "models": [
+            "gpt-5-5", "gpt-5-6",
+            "gpt-5-3-mini", "gpt-5-5-mini", "gpt-5-6-mini",
+            "gpt-5-4-t-mini", "gpt-5-6-t-mini", "gpt-5-6-t-mini-mini",
+            "research",
+        ],
     },
     "plus": {
         "label": "Plus",
@@ -42,8 +51,11 @@ _DEFAULT_TIERS: Dict[str, Dict[str, Any]] = {
         "quota_period": "day",
         "concurrency": "few_shared",
         "models": [
-            "gpt-5-5", "gpt-5", "gpt-5-thinking", "gpt-4o", "o4-mini",
-            "o3", "o3-deep-research", "gpt-4o-mini",
+            "gpt-5-5", "gpt-5-5-instant", "gpt-5-6", "gpt-5-6-instant",
+            "gpt-5-5-thinking", "gpt-5-6-thinking",
+            "gpt-5.5-wm", "gpt-5.6-sol-wm", "gpt-5.6-terra-wm", "gpt-5.6-luna-wm", "gpt-6-astra-wm",
+            "gpt-5-3-mini", "gpt-5-5-mini", "gpt-5-6-mini", "gpt-5-4-t-mini", "gpt-5-6-t-mini",
+            "research",
         ],
     },
     "pro": {
@@ -54,9 +66,11 @@ _DEFAULT_TIERS: Dict[str, Dict[str, Any]] = {
         "quota_period": "day",
         "concurrency": "exclusive",
         "models": [
-            "gpt-5-5", "gpt-5-pro", "gpt-5-thinking", "o3-pro", "gpt-5",
-            "o3", "o3-deep-research", "o4-mini-deep-research",
-            "gpt-4o-deep-research", "deep-research", "gpt-4o",
+            "gpt-5-5", "gpt-5-5-instant", "gpt-5-6", "gpt-5-6-instant",
+            "gpt-5-5-thinking", "gpt-5-6-thinking",
+            "gpt-5.5-wm", "gpt-5.6-sol-wm", "gpt-5.6-terra-wm", "gpt-5.6-luna-wm", "gpt-6-astra-wm",
+            "gpt-5-3-mini", "gpt-5-5-mini", "gpt-5-6-mini", "gpt-5-4-t-mini", "gpt-5-6-t-mini",
+            "research",
         ],
     },
 }
@@ -123,8 +137,11 @@ def tier_account_plan_types(tier_id: str) -> List[str]:
 
 
 def tier_allows_model(tier_id: str, model: str) -> bool:
-    """模型门禁：model 为空（未知/无模型）时放行（交由上游/号本身约束）。"""
+    """模型门禁：model 为空（未知/无模型）或 ``auto``（默认「自动选型」，由账号/上游
+    决定具体型号）时放行；其余按档位白名单精确匹配。"""
     if not model:
+        return True
+    if model == "auto":
         return True
     tier = get_tier(tier_id)
     if not tier:
