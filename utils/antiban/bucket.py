@@ -5,6 +5,7 @@
   2. 桶可在状态 healthy/degraded/dead 间切换，桶内账号一律跟随桶，不会在运行时被重分配；
   3. 分配策略：新账号选择"已有账号最少 & healthy"的桶，容量上限由 BUCKET_MAX_ACCOUNTS_PER_IP 控制；
   4. routing.py 的 bindings 作为桶的唯一数据源；antiban_bucket.json 只保存运行期状态（last_request_at、status）。
+  5. 半专属分池：桶按账号 plan_type 定型（free 池 / plus 池分列），新账号只进同档或未定型桶，绝不跨档混池。
 """
 
 import json
@@ -39,6 +40,25 @@ def _bucket_id_for_proxy(proxy_url: str) -> str:
     return f"bkt::{proxy_url}"
 
 
+def _account_plan_type(token: str) -> Optional[str]:
+    """解析账号 plan_type（free/plus/...）；解析失败返回 None（不强制分区，回落未定型桶）。"""
+    try:
+        from utils import store as _store
+        acct = _store.get_account(token)
+        return (acct or {}).get("plan_type")
+    except Exception:
+        return None
+
+
+def _ip_blocked(proxy_url: Optional[str]) -> bool:
+    """IP 信誉前置过滤（惰性导入 iprep，fail-open）。已知黑 IP 的桶跳过。"""
+    try:
+        from utils.antiban import iprep
+        return iprep.is_blocked(proxy_url)
+    except Exception:
+        return False
+
+
 def _sync_from_routing() -> None:
     """把 routing_config.json 中已存在的 bindings 吸收到桶里（幂等）。"""
     _ensure_structure()
@@ -61,10 +81,17 @@ def _sync_from_routing() -> None:
             "status": "healthy",
             "degraded_until": 0,
             "created_at": _now(),
+            "plan_type": None,
         })
         if token not in bucket["accounts"]:
             bucket["accounts"].append(token)
             changed = True
+        # 半专属分池：未定型桶从首个账号反推档位（防 legacy 混档桶继续混入新号）
+        if not bucket.get("plan_type") and bucket["accounts"]:
+            inferred = _account_plan_type(bucket["accounts"][0])
+            if inferred:
+                bucket["plan_type"] = inferred
+                changed = True
         if globals.antiban_bucket["account_index"].get(token) != bucket_id:
             globals.antiban_bucket["account_index"][token] = bucket_id
             changed = True
@@ -73,8 +100,11 @@ def _sync_from_routing() -> None:
         logger.info(f"[antiban] synced {len(bindings)} routing bindings into buckets")
 
 
-def _pick_least_loaded_healthy() -> Optional[Tuple[str, Dict]]:
-    """返回 (bucket_id, bucket) 中账号最少且 healthy、未满的桶。"""
+def _pick_least_loaded_healthy(plan_type: Optional[str] = None) -> Optional[Tuple[str, Dict]]:
+    """返回 (bucket_id, bucket)：账号最少、healthy、未满、且档位匹配（或未定型）的桶。
+
+    plan_type 为 None 时不设档位过滤（向后兼容：旧桶/未知档号均开放）。
+    """
     cap = configs.bucket_max_accounts_per_ip
     candidates = []
     for bucket_id, bucket in globals.antiban_bucket["buckets"].items():
@@ -82,6 +112,13 @@ def _pick_least_loaded_healthy() -> Optional[Tuple[str, Dict]]:
             continue
         size = len(bucket.get("accounts", []))
         if size >= cap:
+            continue
+        # 半专属分池：桶已定型为某档时只接受同档账号；未定型（plan_type 为 None）对任意档开放
+        bucket_tier = bucket.get("plan_type")
+        if plan_type and bucket_tier and bucket_tier != plan_type:
+            continue
+        # IP 信誉前置过滤：已知黑 IP（数据中心/垃圾/高欺诈）的桶跳过
+        if _ip_blocked(bucket.get("proxy_url")):
             continue
         candidates.append((size, bucket_id, bucket))
     if not candidates:
@@ -92,7 +129,7 @@ def _pick_least_loaded_healthy() -> Optional[Tuple[str, Dict]]:
 
 
 def assign_account(token: str) -> Optional[str]:
-    """核心分配函数。已绑定 → 直接返回桶 id；未绑定 → 选最空 healthy 桶 & 写入 routing_config。"""
+    """核心分配函数。已绑定 → 直接返回桶 id；未绑定 → 选最空同档 healthy 桶 & 写入 routing_config。"""
     if not configs.enable_antiban or not token:
         return None
     _ensure_structure()
@@ -108,17 +145,21 @@ def assign_account(token: str) -> Optional[str]:
         if existing:
             return existing
 
-    pick = _pick_least_loaded_healthy()
+    plan_type = _account_plan_type(token)
+    pick = _pick_least_loaded_healthy(plan_type)
     if not pick:
-        # 所有桶都满了/不健康；严格模式拒绝漂移；宽松模式 → 拒绝分配让上游走默认
+        # 所有同档桶都满了/不健康；严格模式拒绝漂移；宽松模式 → 拒绝分配让上游走默认
         if configs.strict_ip_binding:
             logger.warning(
                 f"[antiban] no healthy bucket for token {token[:12]}... "
-                f"(strict_ip_binding=True); caller must handle"
+                f"(plan_type={plan_type}, strict_ip_binding=True); caller must handle"
             )
         return None
 
     bucket_id, bucket = pick
+    # 半专属分池：空桶首次被某档账号占用时定型为那档
+    if plan_type and not bucket.get("plan_type"):
+        bucket["plan_type"] = plan_type
     bucket["accounts"].append(token)
     bucket.setdefault("last_request_at", {})[token] = 0
     globals.antiban_bucket["account_index"][token] = bucket_id

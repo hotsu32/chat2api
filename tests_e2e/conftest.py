@@ -98,6 +98,7 @@ def _reset_state(tmp_path, monkeypatch):
     globals.antiban_bucket = {"buckets": {}, "account_index": {}}
     globals.antiban_geo_cache = {}
     globals.antiban_dead_tokens = {}
+    globals.antiban_iprep_cache = {}
     globals.account_warnings = {}
     globals._plan_synced = set()
     globals.count = 0

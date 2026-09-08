@@ -198,6 +198,9 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
             self.max_tokens = 2147483647
 
         await self.initialize_request_context()
+        # 每号并发上限：槽位未占用（超限且排队超时）→ 503 让上游 failover 到别的号
+        if self.antiban_ctx and self.antiban_ctx.enabled and not self.antiban_ctx.concurrency_acquired:
+            raise HTTPException(status_code=503, detail="Account concurrency limit reached")
         await get_dpl(self)
         await self.validate_model_access()
 
@@ -503,6 +506,11 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
             raise HTTPException(status_code=500, detail=str(e))
 
     async def close_client(self):
+        # 释放并发槽位（若已占用）；幂等，异常吞掉不影响客户端清理
+        try:
+            antiban.release_context(self.antiban_ctx)
+        except Exception:
+            pass
         if self.s:
             await self.s.close()
             del self.s

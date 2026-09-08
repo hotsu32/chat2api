@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from utils import configs
-from utils.antiban import account_risk, bucket, circuit, cooldown, fingerprint, geo
+from utils.antiban import account_risk, bucket, circuit, concurrency, cooldown, fingerprint, geo
 from utils.Logger import logger
 
 
@@ -24,6 +24,7 @@ class AntibanContext:
     tz_offset_min: Optional[int] = None
     fp_overrides: Dict[str, Any] = field(default_factory=dict)
     enabled: bool = False
+    concurrency_acquired: bool = False
 
 
 async def init() -> None:
@@ -69,6 +70,9 @@ async def acquire_context(req_token: Optional[str]) -> AntibanContext:
 
     # 冷却放行检查（PR-3 真正生效）
     await cooldown.wait_or_skip(ctx.token)
+
+    # 每号并发上限：占一个槽位；超上限且排队超时 → 标记未占用（由 ChatService 抛 503）
+    ctx.concurrency_acquired = await concurrency.acquire(ctx.token)
 
     # 熔断检查
     if not circuit.is_bucket_allowed(ctx.bucket_id):
@@ -123,3 +127,11 @@ def sniff_account_warning(ctx: AntibanContext, message: dict, raw_chunk: dict = 
     if not ctx or not ctx.enabled:
         return
     account_risk.sniff(ctx.token, message or {}, raw_chunk or {})
+
+
+def release_context(ctx: AntibanContext) -> None:
+    """释放请求持有的并发槽位（由 ChatService.close_client 调用）。幂等，同步非阻塞。"""
+    if not ctx or not ctx.enabled or not ctx.concurrency_acquired:
+        return
+    concurrency.release(ctx.token)
+    ctx.concurrency_acquired = False

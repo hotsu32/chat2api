@@ -10,7 +10,7 @@ import pytest
 
 import utils.configs as configs
 import utils.globals as globals
-from utils.antiban import bucket, circuit, cooldown, geo, guard
+from utils.antiban import account_risk, bucket, circuit, concurrency, cooldown, geo, guard, iprep
 
 
 @pytest.fixture(autouse=True)
@@ -21,6 +21,8 @@ def _reset_antiban_state():
     cooldown._account_locks.clear()
     circuit._account_backoff_level.clear()
     circuit._bucket_network_errors.clear()
+    concurrency._account_semaphores.clear()
+    concurrency._account_limits.clear()
     yield
 
 
@@ -244,3 +246,233 @@ async def test_report_error_and_success_route(monkeypatch):
     assert circuit._account_backoff_level.get("tok") == 1
     await guard.report_success(ctx)
     assert circuit._account_backoff_level.get("tok") is None
+
+
+# ---------------------------------------------------------------------------
+# B6 concurrency: per-account in-flight cap (acquire/release/tier/failover)
+# ---------------------------------------------------------------------------
+
+async def test_concurrency_acquire_release_and_cap(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "account_max_concurrency", 2)
+    monkeypatch.setattr(configs, "account_concurrency_wait_seconds", 0.05)
+
+    assert await concurrency.acquire("tok") is True
+    assert await concurrency.acquire("tok") is True
+    # 满：等 0.05s 仍无槽位 → False（failover 信号）
+    assert await concurrency.acquire("tok") is False
+
+    concurrency.release("tok")
+    assert await concurrency.acquire("tok") is True
+
+
+async def test_concurrency_release_idempotent(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    # 未占用就 release：不报错、不产生槽位泄漏
+    concurrency.release("tok-nonexistent")
+    assert await concurrency.acquire("tok-nonexistent") is True
+
+
+def test_concurrency_resolve_limit_persona(monkeypatch):
+    monkeypatch.setattr(configs, "account_max_concurrency", 5)
+    monkeypatch.setattr(configs, "free_account_max_concurrency", 10)
+    assert concurrency._resolve_limit("tok", persona="chatgpt-freeaccount") == 10
+    assert concurrency._resolve_limit("tok", persona="chatgpt-paid") == 5
+    assert concurrency._resolve_limit("tok") == 5
+
+
+def test_concurrency_resolve_limit_from_store_plan_type(monkeypatch):
+    monkeypatch.setattr(configs, "account_max_concurrency", 5)
+    monkeypatch.setattr(configs, "free_account_max_concurrency", 10)
+    import utils.store as store
+    monkeypatch.setattr(store, "get_account", lambda token: {"plan_type": "free"})
+    assert concurrency._resolve_limit("tok-free") == 10
+    monkeypatch.setattr(store, "get_account", lambda token: {"plan_type": "plus"})
+    assert concurrency._resolve_limit("tok-plus") == 5
+
+
+async def test_acquire_context_sets_concurrency_flag(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(bucket, "assign_account", lambda token: None)
+    monkeypatch.setattr(bucket, "get_bucket_proxy", lambda token: None)
+    monkeypatch.setattr(geo, "get_geo", lambda proxy_url: None)
+
+    ctx = await guard.acquire_context("tok-1")
+    assert ctx.concurrency_acquired is True
+    guard.release_context(ctx)
+    assert ctx.concurrency_acquired is False
+
+
+# ---------------------------------------------------------------------------
+# B7 降智联动：sniff 命中 → 冷却（软退避）/ 熔断（硬）
+# ---------------------------------------------------------------------------
+
+def _warning_message(text="unusual activity detected"):
+    return {"content": {"parts": [text]}, "author": {"role": "assistant"}}
+
+
+def test_sniff_hit_extends_cooldown(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "account_degraded_link_enabled", True)
+    monkeypatch.setattr(configs, "account_degraded_cooldown", 1800)
+    monkeypatch.setattr(configs, "account_degraded_mark_dead_threshold", 3)
+    monkeypatch.setattr(account_risk, "_persist", lambda: None)
+
+    account_risk.sniff("tok", _warning_message())
+    # 命中后：冷却被延长（软退避），未 mark_dead
+    assert cooldown.get_next_available("tok") > time.time()
+    assert circuit.is_token_dead("tok") is False
+
+
+def test_sniff_hit_threshold_marks_dead(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "account_degraded_link_enabled", True)
+    monkeypatch.setattr(configs, "account_degraded_mark_dead_threshold", 2)
+    monkeypatch.setattr(account_risk, "_persist", lambda: None)
+
+    account_risk.sniff("tok2", _warning_message())   # hit 1 → 冷却
+    assert circuit.is_token_dead("tok2") is False
+    account_risk.sniff("tok2", _warning_message())   # hit 2 >= 2 → mark_dead
+    assert circuit.is_token_dead("tok2") is True
+
+
+def test_sniff_link_disabled_only_records(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "account_degraded_link_enabled", False)
+    monkeypatch.setattr(account_risk, "_persist", lambda: None)
+
+    account_risk.sniff("tok3", _warning_message())
+    # Step B 关闭：只记录，不联动
+    assert "tok3" in globals.account_warnings
+    assert circuit.is_token_dead("tok3") is False
+    assert cooldown.get_next_available("tok3") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# B8 半专属分池：free/plus 不串池（桶按 plan_type 定型，跨档绝不混桶）
+# ---------------------------------------------------------------------------
+
+def test_assign_account_separates_free_plus(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "bucket_max_accounts_per_ip", 5)
+    globals.antiban_bucket["buckets"] = {
+        "bkt::p1": _bucket("http://p1"),
+        "bkt::p2": _bucket("http://p2"),
+    }
+    globals.antiban_bucket["account_index"] = {}
+    import utils.store as store
+    plan = {"tok-free": "free", "tok-plus": "plus"}
+    monkeypatch.setattr(store, "get_account", lambda token: {"plan_type": plan.get(token)})
+
+    b_free = bucket.assign_account("tok-free")
+    b_plus = bucket.assign_account("tok-plus")
+    assert b_free is not None and b_plus is not None
+    assert b_free != b_plus  # 半专属分池：不同档不落同一桶
+    # 桶各自定型为对应档
+    assert globals.antiban_bucket["buckets"][b_free]["plan_type"] == "free"
+    assert globals.antiban_bucket["buckets"][b_plus]["plan_type"] == "plus"
+
+
+def test_assign_account_skips_mismatched_empty_bucket(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "bucket_max_accounts_per_ip", 5)
+    globals.antiban_bucket["buckets"] = {
+        "bkt::p1": _bucket("http://p1"),
+        "bkt::p2": _bucket("http://p2"),
+    }
+    # p1 已定型 free（空但不可用于 plus），p2 未定型
+    globals.antiban_bucket["buckets"]["bkt::p1"]["plan_type"] = "free"
+    globals.antiban_bucket["account_index"] = {}
+    import utils.store as store
+    monkeypatch.setattr(store, "get_account", lambda token: {"plan_type": "plus"})
+
+    result = bucket.assign_account("tok-plus")
+    # 若无档位过滤，least-loaded 会选 p1（同 size 0 且排序靠前）；档位过滤强制落到 p2
+    assert result == "bkt::p2"
+    assert globals.antiban_bucket["buckets"]["bkt::p2"]["plan_type"] == "plus"
+
+
+def test_assign_account_rejects_cross_tier_when_no_matching(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "bucket_max_accounts_per_ip", 5)
+    globals.antiban_bucket["buckets"] = {
+        "bkt::p1": _bucket("http://p1"),
+    }
+    globals.antiban_bucket["buckets"]["bkt::p1"]["plan_type"] = "free"
+    globals.antiban_bucket["account_index"] = {}
+    import utils.store as store
+    monkeypatch.setattr(store, "get_account", lambda token: {"plan_type": "plus"})
+
+    # 只有 free 桶（未满），plus 号绝不跨档 → 拒绝分配
+    assert bucket.assign_account("tok-plus") is None
+
+
+# ---------------------------------------------------------------------------
+# B9 IP 信誉（IPQS 欺诈分 + ASN）：fail-open / 高欺诈判黑 / 数据中心开关 / 桶前置过滤
+# ---------------------------------------------------------------------------
+
+def test_iprep_fail_open_without_key(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "ipqs_api_key", "")
+    # 无 key：不做任何网络调用，直接放行（fail-open）
+    assert iprep.is_blocked("http://proxy.example:8080") is False
+
+
+def test_iprep_blocks_high_fraud(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "ipqs_api_key", "test-key")
+    monkeypatch.setattr(configs, "ipqs_fraud_threshold", 80)
+    monkeypatch.setattr(iprep, "_resolve_host", lambda host: "1.2.3.4")
+    monkeypatch.setattr(iprep, "_query_ipqs", lambda ip: {
+        "fraud_score": 90, "is_datacenter": False, "is_proxy": False,
+        "asn": 123, "isp": "x", "organization": "y",
+    })
+    monkeypatch.setattr(iprep, "_persist", lambda: None)
+    assert iprep.is_blocked("http://proxy.example:8080") is True
+
+
+def test_iprep_allows_clean(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "ipqs_api_key", "test-key")
+    monkeypatch.setattr(configs, "ipqs_fraud_threshold", 80)
+    monkeypatch.setattr(iprep, "_resolve_host", lambda host: "1.2.3.4")
+    monkeypatch.setattr(iprep, "_query_ipqs", lambda ip: {
+        "fraud_score": 10, "is_datacenter": False, "is_proxy": False,
+        "asn": 123, "isp": "x", "organization": "y",
+    })
+    monkeypatch.setattr(iprep, "_persist", lambda: None)
+    assert iprep.is_blocked("http://proxy.example:8080") is False
+
+
+def test_iprep_datacenter_blocked_only_when_enabled(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "ipqs_api_key", "test-key")
+    monkeypatch.setattr(configs, "ipqs_fraud_threshold", 80)
+    monkeypatch.setattr(iprep, "_resolve_host", lambda host: "1.2.3.4")
+    rep = {"fraud_score": 10, "is_datacenter": True, "is_proxy": False,
+           "asn": 123, "isp": "x", "organization": "y"}
+    monkeypatch.setattr(iprep, "_query_ipqs", lambda ip: dict(rep))
+    monkeypatch.setattr(iprep, "_persist", lambda: None)
+
+    monkeypatch.setattr(configs, "ipqs_block_datacenter", False)
+    assert iprep.is_blocked("http://dc.example:8080") is False
+    # 开关打开后（命中缓存、verdict 实时重算）→ 判黑
+    monkeypatch.setattr(configs, "ipqs_block_datacenter", True)
+    assert iprep.is_blocked("http://dc.example:8080") is True
+
+
+def test_assign_account_skips_ip_blocked_bucket(monkeypatch):
+    monkeypatch.setattr(configs, "enable_antiban", True)
+    monkeypatch.setattr(configs, "bucket_max_accounts_per_ip", 5)
+    globals.antiban_bucket["buckets"] = {
+        "bkt::p1": _bucket("http://blocked"),
+        "bkt::p2": _bucket("http://clean"),
+    }
+    globals.antiban_bucket["account_index"] = {}
+    # 只把 "http://blocked" 判黑，隔离桶层与 iprep 内部
+    monkeypatch.setattr(bucket, "_ip_blocked", lambda proxy_url: proxy_url == "http://blocked")
+
+    result = bucket.assign_account("tok-1")
+    assert result == "bkt::p2"
+
+

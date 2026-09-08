@@ -1,16 +1,15 @@
-"""账号风险嗅探（Step A：仅记录，不联动 dead/cooldown）。
+"""账号风险嗅探（Step A 记录 + Step B 联动）。
 
-目标：在流式响应中检测 ChatGPT 服务端下发的"账号使用异常"软警告，记录到
-data/account_warnings.json 供后续校准。命中后**不**修改 token 状态、**不**降级桶、
-**不**中断响应，只写日志 + 持久化。
+Step A（enable_antiban 开启即生效，仅记录）：在流式响应中检测 ChatGPT 服务端下发的
+"账号使用异常"软警告（降智/封控预警），记录到 data/account_warnings.json 供校准。
+命中后**不**中断响应。
+
+Step B（account_degraded_link_enabled 打开后生效）：命中后联动熔断/冷却——
+  累计命中 < account_degraded_mark_dead_threshold → extend_cooldown（软退避）；
+  累计命中 >= 阈值 → mark_dead（硬熔断，等待 circuit 的 recheck）。
+因 WARNING_PATTERNS 偏宽松（可能误判正常 system 提示），Step B 默认关闭，校准后再开。
 
 接入点：chatgpt/chatFormat.py 的 system 角色分支 + moderation 类型 chunk。
-
-校准建议：
-  1. 上线观察 3-7 天
-  2. 看 data/account_warnings.json 里的 snippet 是否都是真警告（避免误判正常 system 提示）
-  3. 根据真实样本调整 WARNING_PATTERNS / METADATA_FLAG_KEYS
-  4. 校准后再启用 Step B（联动 cooldown / mark_dead）
 """
 
 import json
@@ -130,6 +129,31 @@ def _match_text(text: str) -> Optional[str]:
     return None
 
 
+def _escalate(token: str, hit_count: int) -> None:
+    """Step B：降智命中 → 联动冷却/熔断。
+
+    hit_count < threshold → 延长冷却（软退避，暂避风头）；
+    hit_count >= threshold → mark_dead（硬熔断，等待 circuit 的 recheck）。
+    惰性导入避免与 guard 的循环依赖；异常吞掉，不打断响应流。
+    """
+    try:
+        from utils.antiban import circuit, cooldown
+        threshold = configs.account_degraded_mark_dead_threshold
+        if hit_count >= threshold:
+            circuit.mark_dead(token, "degraded_quality")
+            logger.error(
+                f"[account_risk] token={token[:12]}... degraded x{hit_count} >= {threshold} → mark_dead"
+            )
+        else:
+            cooldown.extend_cooldown(token, configs.account_degraded_cooldown)
+            logger.warning(
+                f"[account_risk] token={token[:12]}... degraded x{hit_count} < {threshold} "
+                f"→ extend_cooldown {configs.account_degraded_cooldown}s"
+            )
+    except Exception as e:
+        logger.error(f"[account_risk] escalate error (suppressed): {e}")
+
+
 def sniff(token: Optional[str], message: Dict[str, Any], raw_chunk: Optional[Dict[str, Any]] = None) -> None:
     """主入口：检查一条 SSE chunk 中的 message 是否含账号风险信号。
 
@@ -188,6 +212,10 @@ def sniff(token: Optional[str], message: Dict[str, Any], raw_chunk: Optional[Dic
             f"[account_risk] HIT token={token[:12]}... pattern={pattern_hit} "
             f"snippet={snippet[:120]!r}"
         )
+
+        # Step B: 降智命中 → 联动冷却/熔断（校准后启用，避免误杀）
+        if configs.account_degraded_link_enabled:
+            _escalate(token, len(bucket))
     except Exception as e:
         # 任何异常都不能影响主流程
         logger.error(f"[account_risk] sniff error (suppressed): {e}")

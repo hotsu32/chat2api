@@ -140,10 +140,32 @@ free_account_min_interval_seconds = int(os.getenv('FREE_ACCOUNT_MIN_INTERVAL_SEC
 account_cooldown_jitter = float(os.getenv('ACCOUNT_COOLDOWN_JITTER', 0.3))
 # 账号排队最长等待秒数；超过则返回 503 让上游切换
 account_max_wait_seconds = int(os.getenv('ACCOUNT_MAX_WAIT_SECONDS', 30))
+# 每号并发上限（出租率）：free 号多共享（廉价可弃），plus/paid 号少共享（保护）
+account_max_concurrency = int(os.getenv('ACCOUNT_MAX_CONCURRENCY', 5))
+free_account_max_concurrency = int(os.getenv('FREE_ACCOUNT_MAX_CONCURRENCY', 10))
+# 并发槽位排队最长等待秒数；超过则 503 让上游 failover
+account_concurrency_wait_seconds = float(os.getenv('ACCOUNT_CONCURRENCY_WAIT_SECONDS', 5))
+# 降智检测 Step B：命中软警告后是否联动冷却/熔断（校准后再开，避免误杀）
+account_degraded_link_enabled = is_true(os.getenv('ACCOUNT_DEGRADED_LINK_ENABLED', False))
+# 单次降智命中延长的冷却秒数
+account_degraded_cooldown = int(os.getenv('ACCOUNT_DEGRADED_COOLDOWN', 1800))
+# 累计命中达到该次数 → mark_dead（硬熔断，等待 recheck）
+account_degraded_mark_dead_threshold = int(os.getenv('ACCOUNT_DEGRADED_MARK_DEAD_THRESHOLD', 3))
 # Geo 查询服务提供商：ip-api | ipinfo
 ip_geo_provider = os.getenv('IP_GEO_PROVIDER', 'ip-api')
 # Geo 缓存 TTL（天）
 ip_geo_cache_ttl_days = int(os.getenv('IP_GEO_CACHE_TTL_DAYS', 30))
+# IP 信誉（IPQS）：欺诈分 + ASN，识别数据中心/垃圾 IP 前置过滤。缺 key 时 fail-open 不过滤。
+ipqs_api_key = os.getenv('IPQS_API_KEY', '').replace(' ', '')
+# 欺诈分 >= 该阈值 → 判黑，跳过该 IP 的桶
+ipqs_fraud_threshold = int(os.getenv('IPQS_FRAUD_THRESHOLD', 80))
+# 是否把数据中心 / 代理 IP 也判黑（默认关：数据中心代理是镜像的廉价默认，全拦会误伤存量部署）
+ipqs_block_datacenter = is_true(os.getenv('IPQS_BLOCK_DATACENTER', False))
+ipqs_block_proxy = is_true(os.getenv('IPQS_BLOCK_PROXY', False))
+# IPQS 查询超时（秒）
+ipqs_timeout_seconds = float(os.getenv('IPQS_TIMEOUT_SECONDS', 3))
+# IP 信誉缓存 TTL（天）
+ip_rep_cache_ttl_days = int(os.getenv('IP_REP_CACHE_TTL_DAYS', 7))
 # 熔断参数
 circuit_429_cooldown = int(os.getenv('CIRCUIT_429_COOLDOWN', 1800))
 circuit_403_cooldown = int(os.getenv('CIRCUIT_403_COOLDOWN', 3600))
@@ -222,7 +244,11 @@ logger.info("STRICT_IP_BINDING: " + str(strict_ip_binding))
 logger.info("BUCKET_MAX_ACCOUNTS_PER_IP: " + str(bucket_max_accounts_per_ip))
 logger.info("ACCOUNT_MIN_INTERVAL_SECONDS: " + str(account_min_interval_seconds))
 logger.info("ACCOUNT_MAX_WAIT_SECONDS:     " + str(account_max_wait_seconds))
+logger.info("ACCOUNT_MAX_CONCURRENCY:      " + str(account_max_concurrency))
+logger.info("FREE_ACCOUNT_MAX_CONCURRENCY: " + str(free_account_max_concurrency))
+logger.info("ACCOUNT_DEGRADED_LINK:       " + str(account_degraded_link_enabled))
 logger.info("IP_GEO_PROVIDER:   " + str(ip_geo_provider))
+logger.info("IPQS_ENABLED:      " + str(bool(ipqs_api_key)))
 logger.info("CIRCUIT_429_COOLDOWN: " + str(circuit_429_cooldown))
 logger.info("CIRCUIT_403_COOLDOWN: " + str(circuit_403_cooldown))
 logger.info("--------------------- Session Sticky -----------------------")

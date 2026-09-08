@@ -19,6 +19,8 @@ CONVERSATION_MAP_FILE = os.path.join(DATA_FOLDER, "conversation_map.json")
 ANTIBAN_BUCKET_FILE = os.path.join(DATA_FOLDER, "antiban_bucket.json")
 ANTIBAN_GEO_FILE = os.path.join(DATA_FOLDER, "antiban_geo.json")
 ANTIBAN_DEAD_FILE = os.path.join(DATA_FOLDER, "antiban_dead.json")
+# IP 信誉（IPQS 欺诈分 + ASN）缓存
+ANTIBAN_IPREP_FILE = os.path.join(DATA_FOLDER, "antiban_iprep.json")
 # 账号风险嗅探：仅记录命中的软警告，不立即标 dead（Step A：观察期，校准关键词）
 ACCOUNT_WARNINGS_FILE = os.path.join(DATA_FOLDER, "account_warnings.json")
 # Harvester 账号元数据（不含密码，仅 email+note+proxy_name+采集历史）
@@ -37,6 +39,7 @@ conversation_map = {}
 antiban_bucket = {"buckets": {}, "account_index": {}}
 antiban_geo_cache = {}
 antiban_dead_tokens = {}
+antiban_iprep_cache = {}
 # 账号风险嗅探：token -> [{hit_at, snippet, pattern, conversation_id}, ...]
 account_warnings = {}
 impersonate_list = [
@@ -79,6 +82,7 @@ antiban_bucket.setdefault("buckets", {})
 antiban_bucket.setdefault("account_index", {})
 antiban_geo_cache = _load_json(ANTIBAN_GEO_FILE, {})
 antiban_dead_tokens = _load_json(ANTIBAN_DEAD_FILE, {})
+antiban_iprep_cache = _load_json(ANTIBAN_IPREP_FILE, {})
 account_warnings = _load_json(ACCOUNT_WARNINGS_FILE, {})
 
 # --- account domain: SQLite-backed (single source of truth) ---
