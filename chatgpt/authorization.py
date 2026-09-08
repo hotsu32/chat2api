@@ -52,20 +52,28 @@ def _pick_healthy_account(tier=None, plan_types=None):
     """从等级号池挑一个健康账号；等级池空则回退任意健康账号。
 
     plan_types（account.plan_type 集合）优先于 tier：供 user.tier → 号组 的半专属分池。
+    候选额外经 _account_is_usable 过滤（剔除熔断 dead / error / disabled），
+    否则 mark_dead 只写 antiban_dead_tokens 不改 accounts.status，
+    failover 会把死号重选回来（见真号冒烟：60 采样命中死号 31 次）。
     """
+    def _usable(candidates):
+        return [c for c in candidates if _account_is_usable(c.get("token", ""))]
+
     if plan_types:
         candidates: list = []
         for pt in plan_types:
             candidates.extend(store.get_account_by_plan(pt, status="healthy"))
-        if candidates:
-            return random.choice(candidates)["token"]
+        usable = _usable(candidates)
+        if usable:
+            return random.choice(usable)["token"]
     else:
         tier = tier or "free"
         candidates = store.get_account_by_plan(tier, status="healthy")
-        if candidates:
-            return random.choice(candidates)["token"]
-    candidates = store.get_healthy_accounts()
-    return random.choice(candidates)["token"] if candidates else ""
+        usable = _usable(candidates)
+        if usable:
+            return random.choice(usable)["token"]
+    usable = _usable(store.get_healthy_accounts())
+    return random.choice(usable)["token"] if usable else ""
 
 
 def _resolve_seed_account(seed: str) -> str:

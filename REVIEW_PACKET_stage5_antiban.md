@@ -75,8 +75,30 @@ $ .venv/bin/pytest tests_e2e/
 - 数据中心默认不判黑（`ipqs_block_datacenter=False`），避免误伤数据中心代理存量部署；`fraud_score >= 阈值` 才是默认判黑条件。
 - ASN / ISP 仅落缓存供后续后台展示，本子项未接管理后台 UI。
 
+## 真号冒烟（Stage 5 收口，本地无网络依赖）
+
+用 3 个真实账号（1 free + 2 plus）跑 `smoke_real_accounts.py`（plan_type 全读自 SQLite 真相源，
+落盘副作用全部 stub 为 no-op，可重复、不污染库/文件）。真实 OpenAI 往返探活因代理
+`127.0.0.1:7899` 死节点被阻塞（见「未验证」）。
+
+```bash
+$ .venv/bin/python smoke_real_accounts.py
+SUMMARY: total=18 pass=18 fail=0
+# ① 导入落库 1 free + 2 plus  ② free/plus 分池不串桶 + 桶定型
+# ③ 模拟 plus 封禁 failover（60 采样命中死号 0 次）  ④ 并发分层 free=10/plus=5  ⑤ 指纹稳定不漂移
+```
+
+**冒烟揪出一个真 bug（已修）**：`_pick_healthy_account` 只按 `accounts.status="healthy"` 过滤，
+而 `mark_dead` 只写 `antiban_dead_tokens`（JSON）不改 `accounts.status`，导致封号后 failover
+会把死号重选回来（修前 60 采样命中死号 31 次，非「无感」）。
+
+修复：`chatgpt/authorization.py::_pick_healthy_account` 候选统一过 `_account_is_usable`
+（剔除熔断 dead / error / disabled），三处分支（plan_types / tier / 全局回退）全部覆盖。
+回归测试 `tests_e2e/test_user_saas.py::test_failover_skips_marked_dead_account` 锁定该行为。
+
 ## 验证状态
 
 - [x] Verified：B6 5 例 + B7 3 例 + B8 3 例 + B9 5 例全绿 + 48 单测 + 63 e2e 无回归
-- [ ] Unverified：真号冒烟（3 号在 Stage 5 收口时统一做）
+- [x] Verified：真号冒烟 18/18（导入落库 + plan_type 正确 + free/plus 不串池 + 模拟封禁 failover + 并发分层 + 指纹稳定）
+- [ ] Unverified：真实 OpenAI 往返探活（代理 `127.0.0.1:7899` 节点死，SSL_ERROR_SYSCALL；需用户修复 VPN 后重跑）
 - [ ] Needs User：并发默认值（5/10）、降智阈值（3）/冷却（1800s）、IPQS 阈值（80）是否合意

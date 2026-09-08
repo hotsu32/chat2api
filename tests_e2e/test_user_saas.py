@@ -181,6 +181,28 @@ def test_upgrade_tier_switches_pool_on_failover(client, seed_account, make_acces
     assert globals.seed_map["seed-up"]["token"] == tok_plus
 
 
+def test_failover_skips_marked_dead_account(client, seed_account, make_access_token):
+    # 回归：mark_dead 只写 antiban_dead_tokens（JSON），不改 accounts.status，
+    # 故 _pick_healthy_account 必须经 _account_is_usable 过滤，否则 failover 重选死号。
+    from utils.antiban import circuit
+    tok_dead = make_access_token(account_id="acc-plus-dead", plan_type="plus")
+    tok_live = make_access_token(account_id="acc-plus-live", plan_type="plus")
+    seed_account(tok_dead, plan_type="plus")
+    _make_user("seed-dead", "dead@example.com", tier_id="plus")
+
+    # 首次绑定：号池只有 tok_dead 一个 plus → 确定性绑定到 tok_dead
+    client.get("/api/auth/session", cookies={"token": "seed-dead"})
+    assert globals.seed_map["seed-dead"]["token"] == tok_dead
+
+    # 再放入第二个健康 plus 号，然后封禁 tok_dead
+    seed_account(tok_live, plan_type="plus")
+    circuit.mark_dead(tok_dead, "account_deactivated")
+
+    # failover 必须切到 tok_live，绝不重选死号 tok_dead
+    client.get("/api/auth/session", cookies={"token": "seed-dead"})
+    assert globals.seed_map["seed-dead"]["token"] == tok_live
+
+
 def test_operator_seed_not_limited_by_tier(client, seed_account, make_access_token):
     # 运营者 seed（无 user_auth 行）走旧主链路，不受档位/额度限制
     tok = make_access_token(account_id="acc-op", plan_type="plus")

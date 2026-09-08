@@ -34,6 +34,11 @@
 - [x] 只有其他档的桶时，绝不跨档分配 → 返回 `None`（拒绝）。
 - [x] `_sync_from_routing` 对 legacy 未定型桶按首个账号反推档位，防止历史混档桶继续混入新号。
 
+### C7 — 封禁 failover 不重选死号（真号冒烟揪出）
+- [x] `mark_dead` 后 `_pick_healthy_account` 经 `_account_is_usable` 过滤，绝不把死号重选回 seed。
+- [x] `_account_is_usable` 覆盖 dead / error_token_list / 无账号行 / disabled 四类不可用号。
+- [x] 回归测试 `test_failover_skips_marked_dead_account` 锁定（修前 60 采样命中死号 31 次）。
+
 ## 子项 ⑤ IP 信誉（IPQS 欺诈分 + ASN，DONE）
 
 ### C6 — IP 前置过滤（fail-open + 判黑）
