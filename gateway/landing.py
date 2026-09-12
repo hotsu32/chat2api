@@ -16,6 +16,8 @@ import utils.payment as payment
 import utils.plans as plans
 import utils.store as store
 from utils.tiers import list_tiers
+import utils.globals as globals
+from chatgpt.authorization import _resolve_seed_account
 
 
 @app.get("/landing", response_class=HTMLResponse)
@@ -25,6 +27,24 @@ async def landing_page(request: Request):
     return templates.TemplateResponse(
         "landing.html", {"request": request, "plans": featured, "tiers": list_tiers()}
     )
+
+
+@app.get("/try", response_class=HTMLResponse)
+async def core_try_page(request: Request):
+    """Local core-mirror selector; deliberately bypasses SaaS registration flows."""
+    entries = [
+        ("Free", "frontend-proof-free-1", "free"),
+        ("Plus 一", "frontend-proof-plus-2", "plus"),
+        ("Plus 二", "frontend-proof-plus-3", "plus"),
+        ("Pro 一", "frontend-proof-pro-1", "pro"),
+    ]
+    # Seed the Pro selector with a real healthy Pro account on first use. The
+    # alias is only a local routing handle and never exposes its credential.
+    entry = globals.seed_map.get("frontend-proof-pro-1")
+    if not isinstance(entry, dict) or not entry.get("token"):
+        globals.seed_map["frontend-proof-pro-1"] = {"token": "", "plan_type": "pro", "conversations": []}
+        _resolve_seed_account("frontend-proof-pro-1")
+    return templates.TemplateResponse("core_try.html", {"request": request, "entries": entries})
 
 
 @app.get("/api/tiers")
