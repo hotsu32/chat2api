@@ -5,6 +5,7 @@
 由服务端统一算 sentinel + PoW，转发到老接口 /backend-api/conversation。
 """
 import asyncio
+import copy
 import hashlib
 import json
 import random
@@ -265,6 +266,45 @@ async def f_conversation_prepare(request: Request):
     return {"conduit_token": token}
 
 
+_F_ONLY_FIELDS = (
+    "client_prepare_state", "supports_buffering", "enable_message_followups",
+    "force_parallel_switch", "local_function_names",
+    "paragen_cot_summary_display_override",
+)
+
+
+def rewrite_f_conversation_body(body: dict) -> dict:
+    """把 f/conversation 的请求体改写成老接口 /backend-api/conversation 格式。
+
+    不修改入参（调用方随后还要读 body["model"] 做档位执行），返回新 dict。
+
+    关键：``supported_encodings`` 必须原样透传。新版官网前端 POST f/conversation
+    时协商的是增量编码（``{"p": ..., "o": "append", "v": ...}``），它的渲染器只有
+    这条增量路径；一旦网关把该字段清空，上游改发整条 message 快照，前端就没有可
+    追加的东西，只能在终态 reconcile 一次——浏览器实测正是「流式 18 帧、DOM 直到
+    终态后才一次性出现全文」。证据见
+    tmp/agent-team/account-frontend/m2-streaming/gen-plus-shapes.json。
+    """
+    out = copy.deepcopy(body)
+    for _k in _F_ONLY_FIELDS:
+        out.pop(_k, None)
+    if out.get("parent_message_id") == "client-created-root":
+        out["parent_message_id"] = str(uuid.uuid4())
+    out["websocket_request_id"] = str(uuid.uuid4())
+    out.setdefault("force_paragen", False)
+    out.setdefault("force_rate_limit", False)
+    out.setdefault("reset_rate_limits", False)
+    out.setdefault("suggestions", [])
+    # 清理 messages 里的 f/ 特有字段，对齐老接口 conversation 格式
+    for _m in out.get("messages", []):
+        _m.pop("create_time", None)
+        _md = _m.get("metadata") or {}
+        _md.pop("submission_mode", None)
+        _md.pop("serialization_metadata", None)
+        _m["metadata"] = _md
+    return out
+
+
 @app.post("/backend-api/f/conversation")
 async def f_conversation(request: Request):
     """拦截 f/conversation：服务端 sentinel + 转发老接口 /backend-api/conversation。"""
@@ -331,28 +371,7 @@ async def f_conversation(request: Request):
     # 清理 f/ 特有字段，转成老接口 conversation 兼容格式
     data = await request.body()
     try:
-        body = json.loads(data)
-        for _k in (
-            "client_prepare_state", "supports_buffering", "enable_message_followups",
-            "force_parallel_switch", "local_function_names",
-            "paragen_cot_summary_display_override",
-        ):
-            body.pop(_k, None)
-        if body.get("parent_message_id") == "client-created-root":
-            body["parent_message_id"] = str(uuid.uuid4())
-        body["supported_encodings"] = []
-        body["websocket_request_id"] = str(uuid.uuid4())
-        body.setdefault("force_paragen", False)
-        body.setdefault("force_rate_limit", False)
-        body.setdefault("reset_rate_limits", False)
-        body.setdefault("suggestions", [])
-        # 清理 messages 里的 f/ 特有字段，对齐老接口 conversation 格式
-        for _m in body.get("messages", []):
-            _m.pop("create_time", None)
-            _md = _m.get("metadata") or {}
-            _md.pop("submission_mode", None)
-            _md.pop("serialization_metadata", None)
-            _m["metadata"] = _md
+        body = rewrite_f_conversation_body(json.loads(data))
         data = json.dumps(body).encode("utf-8")
     except Exception:
         pass
@@ -371,6 +390,26 @@ async def f_conversation(request: Request):
             if cl:
                 try:
                     await cl.close()
+                except Exception:
+                    pass
+
+    async def _release(c, cs, *, discard=False):
+        """Release the upstream response and its clients.
+
+        ``discard=True`` is for a stream that ended early (client disconnect,
+        upstream error): hard-close the session instead of pooling it.  That
+        is what makes the upstream observe the disconnect and stop generating
+        (measured: upstream raises ConnectionResetError and stops immediately).
+
+        Deliberately does *not* call ``r.aclose()`` first: curl_cffi's aclose
+        drains the remaining body rather than aborting it — measured 4.16s on a
+        stream that then delivered every remaining event, i.e. it neither frees
+        the connection promptly nor stops upstream generation.
+        """
+        for cl in (c, cs):
+            if cl:
+                try:
+                    await (cl.discard() if discard else cl.close())
                 except Exception:
                     pass
 
@@ -411,21 +450,50 @@ async def f_conversation(request: Request):
         # (partial), sticky-packet (multi-event) and multi-byte UTF-8
         # boundaries never let a filtered event through.  Re-wrapping it in
         # iter_sse_events_async here would just parse the same bytes twice.
-        async for event in content_generator(r, token, True):
-            # Each `event` is now exactly one SSE event (including its trailing
-            # blank line).  extract_data_json finds the data: field regardless
-            # of any leading event:/id:/retry: prefix lines, handles multiline
-            # events, and returns None for [DONE], comments, and non-JSON data.
-            _d = extract_data_json(event)
-            if _d is not None:
-                _t = _d.get("type", "message")
-                if _t == "resume_conversation_token":
-                    continue
-                if _t == "message":
-                    _role = (_d.get("message") or {}).get("author", {}).get("role")
-                    if _role in ("user", "system"):
+        completed = False
+        events = 0
+        try:
+            async for event in content_generator(r, token, True):
+                # Each `event` is now exactly one SSE event (including its trailing
+                # blank line).  extract_data_json finds the data: field regardless
+                # of any leading event:/id:/retry: prefix lines, handles multiline
+                # events, and returns None for [DONE], comments, and non-JSON data.
+                _d = extract_data_json(event)
+                if _d is not None:
+                    _t = _d.get("type", "message")
+                    if _t == "resume_conversation_token":
                         continue
-            yield event
+                    if _t == "message":
+                        _role = (_d.get("message") or {}).get("author", {}).get("role")
+                        if _role in ("user", "system"):
+                            continue
+                events += 1
+                yield event
+            completed = True
+        finally:
+            # The browser disconnecting (user hits stop, closes the tab,
+            # navigates away) makes Starlette cancel the body task, which
+            # closes this generator — the response's BackgroundTask never runs.
+            # Without releasing here the upstream keeps generating into a
+            # socket nobody reads: measured, a 60-event upstream sent 29 more
+            # events over 3s after the "cancel" and never saw a disconnect.
+            #
+            # A cut-short stream must be discarded, not pooled.  close() hands
+            # the session back to the shared pool with the abandoned response
+            # still attached, so the next turn for this account checks out a
+            # session that is still mid-stream.  discard() hard-closes, which
+            # is what makes the upstream observe the disconnect and stop.
+            await _release(client, clients, discard=not completed)
+            # Shape only: how the stream ended, how many events reached the
+            # browser, how long it ran.  No bodies, headers or query strings.
+            # This is the only authoritative record that a cancelled turn was
+            # actually torn down -- a browser-side observer cannot show it.
+            logger.info(f"[f_conversation] phase=stream_release "
+                        f"account={_anon(req_token)} "
+                        f"outcome={'complete' if completed else 'cancelled'} "
+                        f"released={'pooled' if completed else 'discarded'} "
+                        f"events={events} "
+                        f"elapsed_ms={int((time.monotonic() - started) * 1000)}")
 
     if "stream" in content_type or "text/event-stream" in content_type:
         # X-Accel-Buffering: no tells nginx not to buffer the SSE stream.
@@ -441,7 +509,9 @@ async def f_conversation(request: Request):
             status_code=r.status_code,
             headers=rheaders,
             media_type=content_type,
-            background=background,
+            # No background task here: _filter_gen's finally already releases
+            # on every exit path, including the client-disconnect cancellation
+            # that never reaches a response background task at all.
         )
         return response
     else:
