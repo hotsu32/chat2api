@@ -27,7 +27,6 @@ from app import app, templates
 import utils.configs as configs
 import utils.globals as globals
 import utils.mailer as mailer
-import utils.plans as plans
 import utils.ratelimit as ratelimit
 import utils.store as store
 from utils.Logger import logger
@@ -298,9 +297,8 @@ def _verify_csrf(request: Request, form_token: str) -> None:
 
 
 def _login_redirect(request: Request, email: str) -> RedirectResponse:
-    """登录/注册后跳转：有**未过期**套餐 → Dashboard；否则 → 超市选购。"""
-    target = "/dashboard" if plans.has_active_plan(email) else "/store"
-    resp = RedirectResponse(url=target, status_code=303)
+    """登录/注册后统一进入 Dashboard，由页面承载订阅空态或入口。"""
+    resp = RedirectResponse(url="/dashboard", status_code=303)
     _set_session_cookies(request, resp, email)
     return resp
 

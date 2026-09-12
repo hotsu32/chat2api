@@ -3,7 +3,7 @@
 页面：
   ``/store``      超市选购（三列点选 + 实时报价）
   ``/checkout``   结算确认（占位支付）
-  ``/dashboard``  套餐入口卡片（核心）
+  ``/dashboard``  登录后的控制台（套餐入口卡片 + 空态购买入口）
   ``/wallet``     钱包 / 账户（我的套餐 + 订单 + 兑换码 + 邀请）
   ``/usage``      使用记录
   ``/settings``   个人设置（改密 / 邀请码 / 退出）
@@ -305,9 +305,6 @@ async def dashboard_page(request: Request):
     if redirect:
         return redirect
     subs = _user_subscriptions(email)
-    # 无任何订阅 → 直接去超市选购（空态价值低，见 KIMI 产品 6）
-    if not subs:
-        return RedirectResponse(url="/store", status_code=303)
     return _render_with_csrf(
         request,
         "dashboard.html",

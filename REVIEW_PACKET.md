@@ -657,6 +657,103 @@ seed 轮换（`user_auth.seed` 终身不变、泄露后无补救）需要号池�
 | `utils/ratelimit.py` | 读路径不建条目、`_MAX_KEYS` 上限、按命中数淘汰、`_max_window` 自适应 | 限流 key 含用户提交的 email = 攻击者可控，限流器本身不能变成内存耗尽入口 |
 | `utils/store.py::upsert_user_auth` | 新增 `strict=` | 静默失败会让用户拿到指向不存在账号的 cookie |
 | `gateway/user.py` | `_DUMMY_HASH` | 「查无此人立刻返回」与「算 10 万轮」的耗时差就是免费的账号枚举接口 |
+
+## 14. 批次 B：使用记录与订单状态证据
+
+### 14.1 交付范围
+
+- `utils/store.py` 新增 `query_seed_usage_daily`，在 SQLite 侧按本地日期与 kind 聚合，避免页面读取 500 条明细后静默少算。
+- `utils/usage.py` 新增 `user_daily_usage`，在锁内快照未 flush 的 pending 并与落库聚合合并。
+- `gateway/saas.py::_usage_rows` 将原始 kind 映射为公开标签，并按日期与标签再次折叠；`/usage` 保持最近 30 天窗口。
+- `templates/usage.html` 使用记录表头改为「时间 / 类型 / 会话数」，订阅表的「套餐」表头保持不变。
+- `/checkout` 展示本人订单的 pending、paid、expired、failed 状态；订单归属不匹配时页面与无订单页面一致。
+- `tests_e2e/test_user_saas.py` 修正原始 303 与跟随后页面的测试契约，并新增 501 条聚合、未知类型折叠测试。
+
+### 14.2 验证命令与实际结果
+
+```text
+.venv/bin/python -m pytest tests -o addopts='' -q
+125 passed in 4.03s
+
+.venv/bin/python -m pytest tests_e2e -o addopts='' -q
+166 passed, 10 warnings in 62.75s
+
+.venv/bin/python -m pytest tests_e2e/test_user_saas.py -o addopts='' -q
+40 passed in 20.12s
+```
+
+10 条 warning 来自既有 `curl_cffi` 对 `__Secure-` cookie 的 `secure` 属性提示，不影响测试通过。
+
+### 14.3 Kimi 改后复审
+
+Kimi session：`session_28cdc7b7-1dd1-427b-a1ec-e611bd5c7f8b`。复审覆盖技术正确性、并发、权限、回归、边界，以及产品统计准确性、展示语义、订单流程。
+
+结论：**PASS，无 P0/P1/P2**。
+
+复审确认：
+
+- `strftime(..., 'unixepoch', 'localtime')` 与 pending 侧 `time.localtime()` 时区一致。
+- SQL 聚合没有 500 条明细限制，且同日未知 kind 会合并为一个「其他」行。
+- pending 读取持锁，订单与使用记录均按当前用户身份隔离。
+- 既有结算锁、mock 回调拒绝、下架套餐终态处理和回调幂等测试未回归。
+
+### 14.4 遗留项与回滚
+
+- P3：保留旧 `user_events` / `query_seed_usage` 接口；字段名 `plan` / `sessions` 与实际类型/次数语义略有遗留；flush 换出与落库之间有极短暂展示少算窗口。
+- P3：`query_seed_usage_daily(since=0)` 会聚合全表，当前调用方固定传最近 30 天窗口。
+- 待下一轮高风险确认：`checkout.html` 对 `failed` 订单仍与 `expired` 共用「重新下单」提示。该状态可能对应已付款但未发放的套餐，涉及支付补发流程，本轮未修改。
+- 回滚方式：恢复 `gateway/saas.py::_usage_rows` 使用旧 `usage.user_events`，删除新调用方即可；新增 store/usage 接口可保留，不涉及 schema 迁移。
+
 | `gateway/user.py` | forgot-password 账号级冷却 + 窗口跟随 token TTL | 只有 IP 桶时换 IP 即可邮件轰炸；窗口长于 TTL 会开出「已发送但无可用链接」的静默空窗 |
 | `templates/signin.html`、`_theme.css` | 被踢设备的 `notice` 文案 | 莫名跳回登录页会被当 bug 报上来，而那正是安全措施生效的时刻 |
 | `gateway/saas.py::_invite_code` | TODO 锚点 | 可预测邀请码在返利上线后 = 冒领接口；锚点留在代码里而非只在评审记录里 |
+
+## 15. 统一登录后进入 Dashboard
+
+### 15.1 产品决策与路由契约
+
+- 注册成功和登录成功不再按订阅状态分流，统一以 303 进入 `/dashboard`。
+- 已登录但从未购买套餐的用户停留在 Dashboard 空态；空态保留明确的 `/store` 入口。
+- 有效 paid 订单继续逐订单生成独立镜像入口，并展示套餐与到期信息。
+- 空态不渲染 `/?token=` 聊天入口；聊天能力仍由权益闸控制。
+- 匿名访问 Dashboard 仍以 303 跳转 `/signin`。
+
+### 15.2 实现范围
+
+| 文件 | 改动 | 原因 |
+|---|---|---|
+| `gateway/user.py::_login_redirect` | 无条件 303 到 `/dashboard`，移除不再使用的 `plans` import | 登录/注册后的用户旅程保持单一入口 |
+| `gateway/saas.py::dashboard_page` | 删除无订阅时 303 到 `/store` 的分支 | Dashboard 承载套餐卡片和未购买用户的空态 |
+| `gateway/saas.py` 模块说明 | 更新 Dashboard 的职责描述 | 让路由行为与维护文档一致 |
+| `tests_e2e/test_user_saas.py` | 新增登录无订阅、空态直访、匿名保护测试；收紧注册跳转断言 | 锁定统一落点、空态入口和 token 隔离契约 |
+
+### 15.3 验证命令与实际结果
+
+```text
+.venv/bin/python -m pytest tests -o addopts='' -q
+125 passed in 4.03s
+
+.venv/bin/python -m pytest tests_e2e -o addopts='' -q
+169 passed, 10 warnings in 64.20s
+
+.venv/bin/python -m pytest tests_e2e/test_user_saas.py -q
+43 passed
+```
+
+10 条 warning 为既有 `curl_cffi` 对 `__Secure-` cookie 的 `secure` 属性提示，不影响断言结果。
+
+### 15.4 Kimi 独立复审
+
+改前 brief：`KIMI_BRIEF_DASHBOARD_FLOW.md`；改后复审 session：`session_cdde6e7b-bdd1-482e-b721-8440625a0700`。
+
+结论：**PASS，无 P0/P1/P2**。复审确认以下行为同时成立：
+
+- 注册和登录的最终页面均为 `/dashboard`；无订阅用户直接访问该页返回 200 空态。
+- 空态存在 `/store` 入口且不存在 `/?token=`；匿名访问仍跳转 `/signin`。
+- 多个 paid 订单仍逐订单生成独立入口，既有聊天入口和权益闸未受影响。
+
+### 15.5 产品观察与回滚
+
+- 仅持有过期订单的用户仍看到续费卡而非从未购买的空态。这符合续费转化目标，但后续需明确产品文案中“订阅”是指历史订单还是当前有效权益。
+- 本版空态只提供 Store 入口。公告、推荐、用量摘要、余额和新手引导暂不加入，待用户研究或数据验证后逐项决策。
+- 回滚：恢复 `gateway/user.py::_login_redirect` 的订阅状态分流，并在 `dashboard_page` 恢复空订阅跳转 `/store`；本轮不涉及 schema、支付结算或权益闸变更。

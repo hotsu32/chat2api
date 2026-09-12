@@ -113,14 +113,50 @@ def test_resolve_user_tier_none_without_user_auth():
 # Stage 1 — 注册 / 登录 / seed 绑定
 # ---------------------------------------------------------------------------
 
+def test_signin_without_subscription_lands_on_dashboard(client):
+    """登录后即使没有订阅，也统一进入 Dashboard 空态。"""
+    _register(client, "dashboard-login@example.com", "password123")
+    csrf = client.cookies.get(configs.user_csrf_cookie) or ""
+    client.post("/signout", data={"csrf_token": csrf})
+
+    resp = _signin(client, "dashboard-login@example.com", "password123")
+    assert resp.status_code == 200
+    assert resp.history[-1].status_code == 303
+    assert resp.history[-1].headers["location"] == "/dashboard"
+    assert "Dashboard" in resp.text
+    assert "去超市选购" in resp.text
+
+
+def test_dashboard_without_subscription_stays_on_empty_state(client):
+    """已登录但无订阅时，直接访问 Dashboard 不再跳 Store。"""
+    _register(client, "dashboard-empty@example.com", "password123")
+
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    assert "Dashboard" in resp.text
+    assert 'href="/store"' in resp.text
+    assert "/?token=" not in resp.text
+
+
+def test_dashboard_requires_login(client):
+    """Dashboard 空态调整不能削弱未登录保护。"""
+    resp = client.get("/dashboard", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/signin"
+
+
 def test_register_creates_user_with_seed_but_no_entitlement(client, monkeypatch, seed_account, make_access_token):
     seed_account(make_access_token(account_id="acc-plus", plan_type="plus"), plan_type="plus")
     _fake_template(monkeypatch)
 
-    # register 成功 → 303 跳 /store（无套餐；注册不送额度）
+    # register 成功 → 303 跳 /dashboard（无套餐也保留在控制台）
     resp = _register(client, "alice@example.com", "password123")
     assert resp.status_code == 200
-    assert any(r.status_code == 303 for r in resp.history)
+    assert resp.history[-1].status_code == 303
+    assert resp.history[-1].headers["location"] == "/dashboard"
+    assert "Dashboard" in resp.text
+    assert "去超市选购" in resp.text
+    assert "/?token=" not in resp.text
 
     row = store.get_user_auth("alice@example.com")
     assert row is not None
