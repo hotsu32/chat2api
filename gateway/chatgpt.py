@@ -121,6 +121,16 @@ async def chatgpt_html(request: Request):
         # 套餐过期 / 未购买：入口直接拦掉，不渲染聊天页。
         # seed 是永久凭据，收藏了带 token 的链接也绕不过去。
         return RedirectResponse(url="/store?expired=1", status_code=302)
+    if token.startswith("frontend-proof-"):
+        # Trial aliases are explicit tier handles; repair stale sticky bindings
+        # before resolving the account so direct links behave like /try buttons.
+        from gateway.landing import ensure_core_trial_bindings
+        ensure_core_trial_bindings([
+            ("Free", "frontend-proof-free-1", "free"),
+            ("Plus 一", "frontend-proof-plus-2", "plus"),
+            ("Plus 二", "frontend-proof-plus-3", "plus"),
+            ("Pro 一", "frontend-proof-pro-1", "pro"),
+        ])
     return await _render_account_page(request, token)
 
 

@@ -38,13 +38,35 @@ async def core_try_page(request: Request):
         ("Plus 二", "frontend-proof-plus-3", "plus"),
         ("Pro 一", "frontend-proof-pro-1", "pro"),
     ]
-    # Seed the Pro selector with a real healthy Pro account on first use. The
-    # alias is only a local routing handle and never exposes its credential.
-    entry = globals.seed_map.get("frontend-proof-pro-1")
-    if not isinstance(entry, dict) or not entry.get("token"):
-        globals.seed_map["frontend-proof-pro-1"] = {"token": "", "plan_type": "pro", "conversations": []}
-        _resolve_seed_account("frontend-proof-pro-1")
+    # Trial aliases are tier-scoped handles.  Older runs may have sticky-bound
+    # a Plus alias to a Free account; verify the real account row before reuse.
+    # If it is missing or mismatched, clear only that alias and pick a healthy
+    # account from its declared tier.  The browser still receives only a seed.
+    ensure_core_trial_bindings(entries)
     return templates.TemplateResponse("core_try.html", {"request": request, "entries": entries})
+
+
+def ensure_core_trial_bindings(entries):
+    _taken = set()
+    for _label, _seed, _tier in entries:
+        entry = globals.seed_map.get(_seed)
+        current = store.get_account(entry.get("token", "")) if isinstance(entry, dict) else None
+        if current and current.get("plan_type") == _tier and entry.get("token") not in _taken:
+            _taken.add(entry["token"])
+            continue
+        candidates = [a for a in store.get_account_by_plan(_tier, status="healthy")
+                      if a.get("token") and a["token"] not in _taken]
+        if not candidates:
+            # Do not silently downgrade a requested tier to another account class.
+            globals.seed_map[_seed] = {"token": "", "plan_type": _tier, "conversations": []}
+            globals.persist_seed_map()
+            continue
+        chosen = candidates[0]["token"]
+        globals.seed_map[_seed] = {"token": chosen, "plan_type": _tier,
+                                   "conversations": (entry or {}).get("conversations", [])}
+        _taken.add(chosen)
+        globals.persist_seed_map()
+    return None
 
 
 @app.get("/api/tiers")
