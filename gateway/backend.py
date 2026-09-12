@@ -18,6 +18,7 @@ from chatgpt.fp import get_fp
 from chatgpt.proofofWork import get_answer_token, get_config, get_requirements_token
 from gateway.chatgpt import chatgpt_html
 from gateway.identity import build_session
+from gateway import resource_proxy
 from gateway.reverseProxy import chatgpt_reverse_proxy, content_generator, get_real_req_token, headers_reject_list, \
     headers_accept_list, resolve_seed_token
 from utils.Client import Client
@@ -432,6 +433,50 @@ async def get_me(request: Request):
 #             ]
 #         }
 #     return Response(content=json.dumps(system_hints, indent=4), media_type="application/json")
+
+
+@app.post("/backend-api/files")
+async def create_file_upload(request: Request):
+    """Create an upload slot, rewriting the upstream upload target to same-origin.
+
+    Upstream answers with an Azure Blob URL on ``sdmntpr*.oaiusercontent.com``
+    carrying a write-capable SAS signature.  Handing that to the browser sends the
+    upload PUT straight out of the user's machine, bypassing the gateway and the
+    account's bound egress proxy -- the one direction of the file flow that is not
+    mirrored, while ``download_url`` already is.  We swap it for an opaque
+    same-origin handle and do the PUT ourselves (see ``gateway.resource_proxy``).
+
+    Direct API clients (access token, no seed cookie) are not browsing the mirror
+    origin, so they keep the upstream URL untouched.
+    """
+    response = await chatgpt_reverse_proxy(request, "backend-api/files")
+    seed = request.cookies.get("token", "").strip()
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if has_direct_access_token(token) and not seed:
+        return response
+    if response.status_code != 200:
+        return response
+    try:
+        payload = json.loads(response.body)
+    except (ValueError, TypeError):
+        return response
+    upload_url = payload.get("upload_url")
+    if not isinstance(upload_url, str) or not upload_url:
+        return response
+
+    seed_token = resolve_seed_token(request)
+    req_token = await get_real_req_token(seed_token)
+    handle = resource_proxy.register_upload_url(upload_url, seed_token, req_token)
+    if handle is None:
+        # An upload host outside the known asset domains: leave it alone rather
+        # than silently breaking a flow we do not understand, but say so loudly.
+        logger.warning("[files] upload_url host not proxyable, passing through unrewritten")
+        return response
+    payload["upload_url"] = str(request.url.replace(
+        path=f"/backend-api/resource/upload/{handle}", query=""))
+    return JSONResponse(payload, status_code=response.status_code,
+                        background=response.background,
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.post("/backend-api/edge")
