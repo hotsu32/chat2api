@@ -468,10 +468,10 @@ async def create_file_upload(request: Request):
     req_token = await get_real_req_token(seed_token)
     handle = resource_proxy.register_upload_url(upload_url, seed_token, req_token)
     if handle is None:
-        # An upload host outside the known asset domains: leave it alone rather
-        # than silently breaking a flow we do not understand, but say so loudly.
-        logger.warning("[files] upload_url host not proxyable, passing through unrewritten")
-        return response
+        # Never expose an unknown signed upload target to the browser.  A new
+        # upstream asset host must be explicitly allowlisted and proxied first.
+        logger.error("[files] upload_url host not proxyable; refusing direct target")
+        return JSONResponse({"detail": "upload target unavailable"}, status_code=502)
     payload["upload_url"] = str(request.url.replace(
         path=f"/backend-api/resource/upload/{handle}", query=""))
     return JSONResponse(payload, status_code=response.status_code,
