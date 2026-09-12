@@ -5,13 +5,29 @@ import utils.resp_cache as resp_cache
 def test_cacheable_paths_and_methods():
     assert resp_cache.cacheable("backend-api/models", "GET") == 3600
     assert resp_cache.cacheable("backend-api/accounts/check/xyz", "GET") == 300
-    assert resp_cache.cacheable("backend-api/conversation/abc", "GET") == 30
     # non-GET never cached
     assert resp_cache.cacheable("backend-api/models", "POST") is None
     assert resp_cache.cacheable("backend-api/models", "PUT") is None
     # non-cacheable paths
     assert resp_cache.cacheable("backend-api/me", "GET") is None
     assert resp_cache.cacheable("backend-api/conversation", "GET") is None  # POST-only list endpoint
+
+
+def test_conversation_paths_are_never_cached():
+    """conversation/ 前缀下没有一条「短期内不变」的契约，整体不缓存。
+
+    stream_status / async-status 是活跃会话的进行中状态（真实浏览器基线里反复轮询），
+    会话详情在同一会话内也会随消息增长而变；旧的 30s TTL 会让这些动态响应变陈旧，
+    而按 conversation/{id} 的定向失效既覆盖不到全局状态路径，也挡不住活跃会话变更。
+    """
+    for path in (
+        "backend-api/conversation/abc",
+        "backend-api/conversation/abc/stream_status",
+        "backend-api/conversation/abc/async-status",
+        "backend-api/conversation/abc/textdocs",
+        "backend-api/conversation/init",
+    ):
+        assert resp_cache.cacheable(path, "GET") is None, path
 
 
 def test_cacheable_static_assets():

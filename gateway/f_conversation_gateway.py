@@ -32,6 +32,7 @@ from gateway.reverseProxy import (
     headers_accept_list,
     resolve_seed_token,
 )
+from gateway.sse_parser import extract_data_json
 from utils.tiers import enforce_tier
 from utils.Client import Client
 from utils.Logger import logger
@@ -405,27 +406,39 @@ async def f_conversation(request: Request):
                 f"elapsed_ms={int((time.monotonic() - started) * 1000)}")
 
     async def _filter_gen():
-        async for _chunk in content_generator(r, token, True):
-            _s = _chunk.decode("utf-8", errors="replace")
-            if _s.startswith("data: {"):
-                try:
-                    _d = json.loads(_s[6:])
-                    _t = _d.get("type", "message")
-                    # 老接口 conversation 会先返回 resume token + system/user 回显，
-                    # 过滤掉，只转发 assistant 回复（对齐 f/conversation 前端期望的流）
-                    if _t == "resume_conversation_token":
+        # content_generator already reassembles the transport into whole SSE
+        # events (and does the conversation_id/title tracking), so split-chunk
+        # (partial), sticky-packet (multi-event) and multi-byte UTF-8
+        # boundaries never let a filtered event through.  Re-wrapping it in
+        # iter_sse_events_async here would just parse the same bytes twice.
+        async for event in content_generator(r, token, True):
+            # Each `event` is now exactly one SSE event (including its trailing
+            # blank line).  extract_data_json finds the data: field regardless
+            # of any leading event:/id:/retry: prefix lines, handles multiline
+            # events, and returns None for [DONE], comments, and non-JSON data.
+            _d = extract_data_json(event)
+            if _d is not None:
+                _t = _d.get("type", "message")
+                if _t == "resume_conversation_token":
+                    continue
+                if _t == "message":
+                    _role = (_d.get("message") or {}).get("author", {}).get("role")
+                    if _role in ("user", "system"):
                         continue
-                    if _t == "message":
-                        _role = (_d.get("message") or {}).get("author", {}).get("role")
-                        if _role in ("user", "system"):
-                            continue
-                except Exception:
-                    pass
-            yield _chunk
+            yield event
 
     if "stream" in content_type or "text/event-stream" in content_type:
+        # X-Accel-Buffering: no tells nginx not to buffer the SSE stream.
+        # Without it, nginx holds all chunks until EOF and the browser only
+        # sees content at the terminal state — never during generation.
+        rheaders["x-accel-buffering"] = "no"
+        # StreamingResponse defaults to 200.  An upstream 403/429 that still
+        # carries text/event-stream would otherwise reach the browser as a
+        # successful but empty stream, which the UI renders as a silently
+        # truncated reply instead of an error.
         response = StreamingResponse(
             _filter_gen(),
+            status_code=r.status_code,
             headers=rheaders,
             media_type=content_type,
             background=background,

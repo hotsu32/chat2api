@@ -3,12 +3,14 @@
 Proves the page-load fix (the "conversation history / action buttons load slowly"
 symptom) at the route level, network-free:
 
-  - the first GET to a cacheable endpoint (models / accounts/check / conversation/{id})
-    hits the upstream once,
+  - the first GET to a cacheable endpoint (models / accounts/check) hits upstream once,
   - a repeat GET within TTL is served from cache (upstream NOT contacted again),
-  - posting a new message invalidates the conversation-detail cache so the next
-    GET refetches (fresh history).
+  - conversation/ GETs are NEVER cached: every repeat reaches upstream and returns the
+    current upstream body, because that prefix carries live state (stream_status /
+    async-status polling, details that grow as a turn streams).
 """
+import json
+
 import utils.globals as globals
 import utils.store as store
 import utils.resp_cache as resp_cache
@@ -16,6 +18,34 @@ import utils.resp_cache as resp_cache
 
 def _model_gets(records):
     return [r for r in records if r["method"] == "GET" and r["path"].split("?")[0] == "/backend-api/models"]
+
+
+def _conversation_gets(records, path):
+    return [r for r in records if r["method"] == "GET" and r["path"].split("?")[0] == path]
+
+
+def _changing_conversation_upstream(monkeypatch, mock_upstream):
+    """Make every conversation/ GET return a *different* body.
+
+    A stale cache is only observable when the upstream answer actually changes —
+    which is the real situation these paths are in (a streaming turn's status and
+    its growing detail change between two polls seconds apart).
+    """
+    handler_cls = mock_upstream.RequestHandlerClass
+    original = handler_cls.do_GET
+    state = {"tick": 0}
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/backend-api/conversation/"):
+            self._record()
+            state["tick"] += 1
+            self._json(200, {"path": path, "tick": state["tick"]})
+            return
+        original(self)
+
+    monkeypatch.setattr(handler_cls, "do_GET", do_GET)
+    return state
 
 
 def test_models_get_is_cached_across_requests(client, mock_upstream, seed_user, seed_account,
@@ -33,6 +63,28 @@ def test_models_get_is_cached_across_requests(client, mock_upstream, seed_user, 
     assert r2.status_code == 200
     assert r2.content == r1.content, "cache hit must return identical (scrubbed) body"
     assert len(_model_gets(mock_upstream.records)) == 1, "second GET must be served from cache, not upstream"
+
+
+def test_models_cache_is_isolated_per_account(client_factory, mock_upstream, seed_user,
+                                              seed_account, make_access_token):
+    """Cross-account isolation: one account's cached body must never serve another's."""
+    resp_cache.invalidate_all()
+    tok_a = make_access_token(account_id="acc-iso-a", plan_type="plus")
+    tok_b = make_access_token(account_id="acc-iso-b", plan_type="plus")
+    seed_account(tok_a)
+    seed_account(tok_b)
+    seed_user("seed-iso-a", tok_a, plan_type="plus")
+    seed_user("seed-iso-b", tok_b, plan_type="plus")
+
+    client_a, client_b = client_factory(), client_factory()
+    assert client_a.get("/backend-api/models", cookies={"token": "seed-iso-a"}).status_code == 200
+    assert len(_model_gets(mock_upstream.records)) == 1
+
+    # account B must NOT be served account A's cache entry -> its own upstream fetch
+    assert client_b.get("/backend-api/models", cookies={"token": "seed-iso-b"}).status_code == 200
+    gets = _model_gets(mock_upstream.records)
+    assert len(gets) == 2, "a second account must fetch its own copy, not reuse account A's cache"
+    assert gets[0]["authorization"] != gets[1]["authorization"], "each fetch carries its own account token"
 
 
 def test_accounts_check_get_is_cached(client, mock_upstream, seed_user, seed_account,
@@ -55,9 +107,11 @@ def test_accounts_check_get_is_cached(client, mock_upstream, seed_user, seed_acc
     assert len(hits) == 1, "accounts/check must be cached"
 
 
-def test_conversation_detail_cache_invalidated_on_new_message(client, mock_upstream, seed_user,
-                                                              seed_account, make_access_token):
+def test_conversation_detail_get_is_never_cached(client, mock_upstream, seed_user, seed_account,
+                                                 make_access_token, monkeypatch):
+    """An active conversation's detail grows while a turn streams — every GET must be fresh."""
     resp_cache.invalidate_all()
+    _changing_conversation_upstream(monkeypatch, mock_upstream)
     tok = make_access_token(account_id="acc-conv", plan_type="plus")
     seed_account(tok)
     seed_user("seed-conv", tok, plan_type="plus", conversations=["conv-1"])
@@ -69,28 +123,74 @@ def test_conversation_detail_cache_invalidated_on_new_message(client, mock_upstr
     detail = "/backend-api/conversation/conv-1"
     r1 = client.get(detail, cookies={"token": "seed-conv"})
     assert r1.status_code == 200
-    hits = [r for r in mock_upstream.records if r["method"] == "GET" and r["path"] == detail]
-    assert len(hits) == 1
+    assert len(_conversation_gets(mock_upstream.records, detail)) == 1
 
-    # repeat within TTL -> cached, upstream NOT contacted
     r2 = client.get(detail, cookies={"token": "seed-conv"})
     assert r2.status_code == 200
-    assert r2.content == r1.content
-    hits = [r for r in mock_upstream.records if r["method"] == "GET" and r["path"] == detail]
-    assert len(hits) == 1
-
-    # a new message records the conversation -> invalidates the detail cache -> refetch
-    from gateway.reverseProxy import save_conversation
-    save_conversation("seed-conv", "conv-1", "New Title")
-    r3 = client.get(detail, cookies={"token": "seed-conv"})
-    assert r3.status_code == 200
-    hits = [r for r in mock_upstream.records if r["method"] == "GET" and r["path"] == detail]
-    assert len(hits) == 2, "conversation detail must refetch after a new message"
+    assert len(_conversation_gets(mock_upstream.records, detail)) == 2, \
+        "repeat detail GET must reach upstream, not a 30s-stale cache"
+    assert json.loads(r2.content)["tick"] > json.loads(r1.content)["tick"], \
+        "the changed upstream body must be returned, not the first one"
 
 
-def test_patch_conversation_invalidates_detail_cache(client, mock_upstream, seed_user, seed_account,
-                                                     make_access_token):
+def test_conversation_status_paths_are_never_cached(client, mock_upstream, seed_user, seed_account,
+                                                    make_access_token, monkeypatch):
+    """stream_status / async-status / textdocs are polled repeatedly on a live turn.
+
+    The real-browser baseline shows GET conversation/{id}/stream_status called over and
+    over during one turn; caching it for 30s pins the UI to a status that is already gone.
+    """
     resp_cache.invalidate_all()
+    _changing_conversation_upstream(monkeypatch, mock_upstream)
+    tok = make_access_token(account_id="acc-status", plan_type="plus")
+    seed_account(tok)
+    seed_user("seed-status", tok, plan_type="plus", conversations=["conv-1"])
+    globals.conversation_map["conv-1"] = {
+        "id": "conv-1", "title": "T", "create_time": 1, "update_time": 1, "account": tok,
+    }
+
+    for suffix in ("stream_status", "async-status", "textdocs"):
+        path = f"/backend-api/conversation/conv-1/{suffix}"
+        bodies = []
+        for _ in range(3):
+            r = client.get(path, cookies={"token": "seed-status"})
+            assert r.status_code == 200
+            bodies.append(json.loads(r.content)["tick"])
+        assert len(_conversation_gets(mock_upstream.records, path)) == 3, \
+            f"every GET to {suffix} must reach upstream"
+        assert bodies == sorted(set(bodies)), \
+            f"{suffix} must return each fresh upstream body, never a repeated cached one"
+
+
+def test_conversation_init_is_never_cached(client, mock_upstream, seed_user, seed_account,
+                                           make_access_token, monkeypatch):
+    """conversation/init is a global (not per-conversation) path the old prefix also caught.
+
+    Per-conversation invalidation could never clear it, so it could go stale for 30s with
+    no way to flush it. It reaches the proxy only for a direct-access-token client (the
+    mirror route treats "init" as a conversation id and 404s it on ownership), so that is
+    the caller exercised here.
+    """
+    resp_cache.invalidate_all()
+    _changing_conversation_upstream(monkeypatch, mock_upstream)
+    tok = make_access_token(account_id="acc-init", plan_type="plus")
+    seed_account(tok)
+    store.upsert_account(tok, plan_type="plus", status="healthy")
+
+    path = "/backend-api/conversation/init"
+    headers = {"Authorization": f"Bearer {tok}"}
+    r1 = client.get(path, headers=headers)
+    r2 = client.get(path, headers=headers)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert len(_conversation_gets(mock_upstream.records, path)) == 2
+    assert json.loads(r2.content)["tick"] > json.loads(r1.content)["tick"]
+
+
+def test_patch_conversation_still_serves_fresh_detail(client, mock_upstream, seed_user, seed_account,
+                                                      make_access_token, monkeypatch):
+    """A rename must be visible on the next GET — trivially true with no detail cache."""
+    resp_cache.invalidate_all()
+    _changing_conversation_upstream(monkeypatch, mock_upstream)
     tok = make_access_token(account_id="acc-patch", plan_type="plus")
     seed_account(tok)
     seed_user("seed-patch", tok, plan_type="plus", conversations=["conv-1"])
@@ -99,23 +199,18 @@ def test_patch_conversation_invalidates_detail_cache(client, mock_upstream, seed
     }
 
     detail = "/backend-api/conversation/conv-1"
-    hits = lambda: [r for r in mock_upstream.records if r["method"] == "GET" and r["path"].split("?")[0] == detail]
-
     r1 = client.get(detail, cookies={"token": "seed-patch"})
     assert r1.status_code == 200
-    assert len(hits()) == 1
+    assert len(_conversation_gets(mock_upstream.records, detail)) == 1
 
-    r2 = client.get(detail, cookies={"token": "seed-patch"})
-    assert r2.status_code == 200
-    assert len(hits()) == 1, "repeat GET must hit cache"
-
-    # PATCH (rename/archive) mutates the conversation -> must invalidate the detail cache
     rp = client.patch(detail, json={"title": "Renamed", "is_visible": True}, cookies={"token": "seed-patch"})
     assert rp.status_code == 200
 
     r3 = client.get(detail, cookies={"token": "seed-patch"})
     assert r3.status_code == 200
-    assert len(hits()) == 2, "PATCH must invalidate the conversation detail cache"
+    assert len(_conversation_gets(mock_upstream.records, detail)) == 2
+    assert json.loads(r3.content)["tick"] > json.loads(r1.content)["tick"], \
+        "post-PATCH GET must reflect the current upstream state"
 
 
 def test_is_textual_content():

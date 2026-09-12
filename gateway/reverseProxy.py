@@ -17,6 +17,7 @@ from utils.Logger import logger
 from utils.configs import chatgpt_base_url_list, sentinel_proxy_url_list, force_no_history, file_host, voice_host, accept_language
 from gateway.frontend_sync import get_session_cookie, refresh_cached_frontend, FrontendSessionError
 from gateway.identity import decode_jwt_payload
+from gateway.sse_parser import extract_data_json, iter_sse_events_async
 from utils.usage import record_usage
 from utils.tiers import enforce_tier
 from utils import resp_cache
@@ -317,41 +318,48 @@ def save_conversation(token, conversation_id, title=None):
         logger.info(f"Conversation ID: {conversation_id}, Title: {title}")
 
 
+def _conversation_fields(payload):
+    """从一条已解析的 SSE data 载荷里取出 (conversation_id, title)。
+
+    上游有两种携带方式：首个事件的顶层键，以及 delta 事件 `v` 字典里的同名键。
+    """
+    conversation_id = payload.get("conversation_id")
+    title = payload.get("title")
+    v = payload.get("v")
+    if isinstance(v, dict):
+        conversation_id = conversation_id or v.get("conversation_id")
+        title = title or v.get("title")
+    return conversation_id, title
+
+
 async def content_generator(r, token, history=True):
+    """透传上游流，顺带记录会话 id/title。
+
+    按 SSE 事件边界重组后再解析：raw chunk 可能被 TCP 任意切分（半个事件、
+    粘包、UTF-8 多字节中间断开），按 chunk 前缀匹配会漏记或误记。事件本身原样
+    下发（注释、[DONE]、EOF 处的残缺事件都不改动）。
+    """
     conversation_id = None
     title = None
-    async for chunk in r.aiter_content():
-        try:
-            if history and (len(token) != 45 and not token.startswith("eyJhbGciOi")) and (not conversation_id or not title):
-                chat_chunk = chunk.decode('utf-8')
-                if (not conversation_id or not title) and chat_chunk.startswith("event: delta\n\ndata: {"):
-                    chunk_data = chat_chunk[19:]
-                    conversation_id = json.loads(chunk_data).get("v").get("conversation_id")
-                    if conversation_id:
+    track = history and len(token) != 45 and not token.startswith("eyJhbGciOi")
+    async for event in iter_sse_events_async(r.aiter_content()):
+        if track and (not conversation_id or not title):
+            try:
+                # 每个事件只解析一次，结果同时供顶层与 v 字典两种形态取值
+                payload = extract_data_json(event)
+                if payload is not None:
+                    event_cid, event_title = _conversation_fields(payload)
+                    if event_cid and not conversation_id:
+                        conversation_id = event_cid
                         save_conversation(token, conversation_id)
                         title = globals.conversation_map[conversation_id].get("title")
-                if chat_chunk.startswith("data: {"):
-                    if "\n\nevent: delta" in chat_chunk:
-                        index = chat_chunk.find("\n\nevent: delta")
-                        chunk_data = chat_chunk[6:index]
-                    elif "\n\ndata: {" in chat_chunk:
-                        index = chat_chunk.find("\n\ndata: {")
-                        chunk_data = chat_chunk[6:index]
-                    else:
-                        chunk_data = chat_chunk[6:]
-                    chunk_data = chunk_data.strip()
-                    if conversation_id is None:
-                        conversation_id = json.loads(chunk_data).get("conversation_id")
-                        if conversation_id:
-                            save_conversation(token, conversation_id)
-                            title = globals.conversation_map[conversation_id].get("title")
-                    if title is None:
-                        title = json.loads(chunk_data).get("title")
-                        if title:
-                            save_conversation(token, conversation_id, title)
-        except Exception:
-            pass
-        yield chunk
+                    # 没有 conversation_id 就落库会写出无主记录，必须先等到 id
+                    if event_title and not title and conversation_id:
+                        title = event_title
+                        save_conversation(token, conversation_id, title)
+            except Exception:
+                pass
+        yield event
 
 
 async def chatgpt_reverse_proxy(request: Request, path: str):
