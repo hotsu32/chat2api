@@ -50,6 +50,7 @@ if enable_gateway:
     import gateway.account
     import gateway.user
     import gateway.landing
+    import gateway.saas
     import gateway.demo
     import gateway.backend
 else:

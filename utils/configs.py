@@ -52,6 +52,10 @@ turnstile_solver_url = os.getenv('TURNSTILE_SOLVER_URL', None)
 
 history_disabled = is_true(os.getenv('HISTORY_DISABLED', True))
 pow_difficulty = os.getenv('POW_DIFFICULTY', '000032')
+# PoW 解算总预算（迭代次数上限）。默认 200 万：难度 000032 时失败率约 0.25%（原 50 万为 ~22%）
+pow_budget = int(os.getenv('POW_BUDGET', 2_000_000))
+# PoW 并行进程数；0 = 自动 min(cpu, 8)。多进程绕开 GIL，8 核下吞吐约 8x
+pow_workers = int(os.getenv('POW_WORKERS', 0))
 retry_times = int(os.getenv('RETRY_TIMES', 3))
 conversation_only = is_true(os.getenv('CONVERSATION_ONLY', False))
 enable_limit = is_true(os.getenv('ENABLE_LIMIT', True))
@@ -81,6 +85,12 @@ enable_gateway = is_true(os.getenv('ENABLE_GATEWAY', False))
 auto_seed = is_true(os.getenv('AUTO_SEED', True))
 force_no_history = is_true(os.getenv('FORCE_NO_HISTORY', False))
 no_sentinel = is_true(os.getenv('NO_SENTINEL', False))
+# f/conversation 的 sentinel chat-requirements token 有时效，缓存超时视为未命中重新解算
+# 0 = 不缓存（每次都重新解，最保守）；默认 300s 对齐 chat_token 的典型有效期
+sentinel_cache_ttl = int(os.getenv('SENTINEL_CACHE_TTL', 300))
+# 开启后 prepare 阶段 PoW 失败恢复 403 硬失败；默认降级继续（返回假 prepare_token + 不写缓存），
+# 避免纯 Python 解 PoW 约 22% 概率跑满预算失败时把 403 透传给前端
+sentinel_strict = is_true(os.getenv('SENTINEL_STRICT', False))
 init_tokens = os.getenv('INIT_TOKENS', '')
 init_proxies = os.getenv('INIT_PROXIES', '')
 init_group_size = int(os.getenv('INIT_GROUP_SIZE', 25))
@@ -198,6 +208,75 @@ user_session_cookie = 'user_session'
 user_csrf_cookie = 'user_csrf'
 require_email_verification = is_true(os.getenv('REQUIRE_EMAIL_VERIFICATION', False))
 
+# 信任 X-Forwarded-For 的反代 IP 白名单（逗号分隔，支持单 IP / CIDR）。
+# 空 = 谁的 XFF 都不信，一律用 TCP 对端 IP。
+#
+# 默认不信任是**故意**的：走 Nginx/CF 时忘了配，后果是所有用户共用反代出口 IP 一个
+# 限流桶 → 全员 429，上线第一天就会被发现；反过来默认信任，则任何人加一行
+# X-Forwarded-For 头就能把限流清零，而且无声无息。宁可选会响的那个失败方向。
+#
+# 与 ADMIN_TRUST_PROXY（布尔）的区别：那个只保护后台白名单，且后台本来就另有口令；
+# 这里保护的是面向公网的注册/登录限流，必须能指明「只信任哪台反代」。
+user_trusted_proxies_raw = os.getenv('USER_TRUSTED_PROXIES', '').replace(' ', '')
+user_trusted_proxies = [x for x in user_trusted_proxies_raw.split(',') if x]
+
+# ---- 注册后台服务：SMTP 邮件 / Turnstile 人机验证 / 注册限流 ----
+# 站点对外地址（邮件里的验证 / 重置链接用它拼绝对 URL）
+site_base_url = os.getenv('SITE_BASE_URL', 'http://127.0.0.1:5005').rstrip('/')
+
+# SMTP（邮箱验证 + 找回密码）。未配置时 mailer 降级为「只记日志不发信」，不崩。
+smtp_host = os.getenv('SMTP_HOST', '').strip()
+smtp_port = int(os.getenv('SMTP_PORT', 465))
+smtp_user = os.getenv('SMTP_USER', '').strip()
+smtp_password = os.getenv('SMTP_PASSWORD', '').strip()
+smtp_from = os.getenv('SMTP_FROM', '').strip()
+smtp_from_name = os.getenv('SMTP_FROM_NAME', 'Chat-Share').strip()
+smtp_ssl = is_true(os.getenv('SMTP_SSL', True))  # True=465 SSL；False=587 STARTTLS
+# False=不加密（仅本地测试 SMTP 捕获用）
+smtp_starttls = is_true(os.getenv('SMTP_STARTTLS', True))
+
+# Cloudflare Turnstile。未配置时注册跳过人机校验（dev / 未接入时）。
+turnstile_site_key = os.getenv('TURNSTILE_SITE_KEY', '').strip()
+turnstile_secret_key = os.getenv('TURNSTILE_SECRET_KEY', '').strip()
+
+# 同 IP 每小时注册上限（0 = 关闭限流）
+register_rate_limit = int(os.getenv('REGISTER_RATE_LIMIT', 5))
+# 登录失败限流：两个桶都要过。
+#  - IP 桶宽（同一出口 NAT 后面可能有很多正常用户，卡太死会误伤整栋楼）
+#  - 账号桶窄（针对单个账号的撞库，换 IP 也绕不过去）
+# 0 = 关闭对应的桶。
+signin_ip_rate_limit = int(os.getenv('SIGNIN_IP_RATE_LIMIT', 20))
+signin_email_rate_limit = int(os.getenv('SIGNIN_EMAIL_RATE_LIMIT', 5))
+signin_email_rate_window = int(os.getenv('SIGNIN_EMAIL_RATE_WINDOW', 15 * 60))
+# 验证 / 重置链接有效期（秒），默认 30 分钟
+email_token_ttl = int(os.getenv('EMAIL_TOKEN_TTL', 30 * 60))
+
+# 未配置 SMTP 时，是否把验证/重置链接直接渲染到页面上（本地开发用）。
+# 默认关：开着等于「知道任一已注册邮箱就能直接拿到它的重置链接」= 无条件账号接管。
+# 生产上 SMTP 配错/挂掉的那一刻，这个开关就是全站可接管的总闸。
+user_debug_links = is_true(os.getenv('USER_DEBUG_LINKS', False))
+
+# ---- 支付 ----
+# 支付渠道：留空 = 关闭下单（fail-closed，防止没接真支付时被白拿套餐）。
+# 目前可选：mock（演示，立即成功且不扣款，仅供本地联调）。
+payment_provider = os.getenv('PAYMENT_PROVIDER', '').strip().lower()
+# 未支付订单的保留时长（秒），超时视为废单，默认 30 分钟
+order_pending_ttl = int(os.getenv('ORDER_PENDING_TTL', 30 * 60))
+
+
+def smtp_configured() -> bool:
+    # 只要有 host 即视为已配置（本地 / 内网 SMTP 可能不需要认证）
+    return bool(smtp_host)
+
+
+def turnstile_enabled() -> bool:
+    return bool(turnstile_site_key and turnstile_secret_key)
+
+
+def sender_address() -> str:
+    return smtp_from or smtp_user
+
+
 with open('version.txt') as f:
     version = f.read().strip()
 
@@ -207,14 +286,14 @@ logger.info("-" * 60)
 logger.info("Environment variables:")
 logger.info("------------------------- Security -------------------------")
 logger.info("API_PREFIX:        " + str(api_prefix))
-logger.info("AUTHORIZATION:     " + str(authorization_list))
+logger.info("AUTHORIZATION:     " + str(len(authorization_list)) + " configured")
 logger.info("ADMIN_PASSWORD:    " + str(bool(admin_password)))
 logger.info("ADMIN_IP_WHITELIST:" + (f" {len(admin_ip_whitelist)} rule(s) [{'trust_proxy' if admin_trust_proxy else 'no_proxy'}]" if admin_ip_whitelist else " (disabled)"))
-logger.info("AUTH_KEY:          " + str(auth_key))
+logger.info("AUTH_KEY:          " + str(bool(auth_key)))
 logger.info("------------------------- Request --------------------------")
 logger.info("CHATGPT_BASE_URL:  " + str(chatgpt_base_url_list))
-logger.info("PROXY_URL:         " + str(proxy_url_list))
-logger.info("EXPORT_PROXY_URL:  " + str(export_proxy_url))
+logger.info("PROXY_URL:         " + str(len(proxy_url_list)) + " configured")
+logger.info("EXPORT_PROXY_URL:  " + str(bool(export_proxy_url)))
 logger.info("FILE_HOST:     " + str(file_host))
 logger.info("VOICE_HOST:    " + str(voice_host))
 logger.info("IMPERSONATE:       " + str(impersonate_list))
@@ -222,6 +301,8 @@ logger.info("USER_AGENTS:       " + str(user_agents_list))
 logger.info("---------------------- Functionality -----------------------")
 logger.info("HISTORY_DISABLED:  " + str(history_disabled))
 logger.info("POW_DIFFICULTY:    " + str(pow_difficulty))
+logger.info("POW_BUDGET:        " + str(pow_budget))
+logger.info("POW_WORKERS:       " + str(pow_workers))
 logger.info("RETRY_TIMES:       " + str(retry_times))
 logger.info("CONVERSATION_ONLY: " + str(conversation_only))
 logger.info("ENABLE_LIMIT:      " + str(enable_limit))
@@ -241,6 +322,8 @@ logger.info("------------------------- Gateway --------------------------")
 logger.info("ENABLE_GATEWAY:    " + str(enable_gateway))
 logger.info("AUTO_SEED:         " + str(auto_seed))
 logger.info("FORCE_NO_HISTORY: " + str(force_no_history))
+logger.info("SENTINEL_CACHE_TTL: " + str(sentinel_cache_ttl))
+logger.info("SENTINEL_STRICT:   " + str(sentinel_strict))
 logger.info("INIT_TOKENS:       " + str(bool(init_tokens)))
 logger.info("INIT_PROXIES:      " + str(bool(init_proxies)))
 logger.info("INIT_GROUP_SIZE:   " + str(init_group_size))
@@ -268,4 +351,6 @@ if enable_session_sticky:
 logger.info("--------------------- User SaaS --------------------------")
 logger.info("USER_SESSION_SECRET: " + str(bool(user_session_secret)))
 logger.info("REQUIRE_EMAIL_VERIFICATION: " + str(require_email_verification))
+logger.info("USER_TRUSTED_PROXIES: " + (f"{len(user_trusted_proxies)} rule(s)" if user_trusted_proxies else " (none, XFF ignored)"))
+logger.info("USER_DEBUG_LINKS:    " + str(user_debug_links))
 logger.info("-" * 60)

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}使用记录 · Chat-Share{% endblock %}
+{% block content %}
+<div class="mono-label">使用记录</div>
+<h1>使用记录</h1>
+<p class="lede">按最近 30 天的使用类型汇总，不展示内部账号信息。</p>
+
+{% if subscriptions %}
+<div class="section-label">当前套餐</div>
+<table class="table">
+  <thead><tr><th>套餐</th><th>有效期至</th><th>剩余</th><th>状态</th></tr></thead>
+  <tbody>
+    {% for sub in subscriptions %}
+    <tr>
+      <td>{{ sub.kicker }}</td>
+      <td class="num">{{ sub.expires_at }}</td>
+      <td class="num">{{ '剩 ' ~ sub.days_left ~ ' 天' if sub.healthy else '已过期' }}</td>
+      <td class="num">{{ '生效中' if sub.healthy else '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<div class="section-label">使用类型</div>
+{% if records %}
+<table class="table">
+  <thead><tr><th>时间</th><th>类型</th><th>会话数</th></tr></thead>
+  <tbody>
+    {% for r in records %}
+    <tr>
+      <td class="num">{{ r.at }}</td>
+      <td>{{ r.plan }}</td>
+      <td class="num">{{ r.sessions }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">还没有记录。进入一次聊天后，这里会出现你的使用轨迹。</div>
+{% endif %}
+{% endblock %}

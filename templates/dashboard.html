@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · Chat-Share{% endblock %}
+{% block content %}
+<div class="mono-label">Dashboard</div>
+<h1>你的套餐入口</h1>
+<p class="lede">点一下就进入聊天，全程不用记任何口令。</p>
+
+{% if subscriptions %}
+<div class="cards">
+  {% for sub in subscriptions %}
+  <div class="card">
+    <div class="plan-kicker">{{ sub.kicker }}</div>
+    <div class="plan-name">{{ sub.name }}</div>
+    <p class="plan-desc">{{ sub.desc }}</p>
+    <div class="plan-meta">
+      <span class="{{ 'ok' if sub.healthy else 'warn' }}"><span class="sq"></span>{{ sub.status_text }}</span>
+      <span>有效期至 {{ sub.expires_at }} · 剩 {{ sub.days_left }} 天</span>
+    </div>
+    {% if sub.healthy %}
+    <a class="plan-cta" href="/?token={{ seed }}">进入 ChatGPT <span class="arr">→</span></a>
+    {% else %}
+    <a class="plan-cta" href="{{ sub.renew_url }}">套餐已过期 · 去续费 <span class="arr">→</span></a>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty">还没有套餐。<a href="/store" style="color:#000;border-bottom:1px solid #000;text-decoration:none">去超市选购 →</a></div>
+{% endif %}
+
+<div class="foot-links">
+  <a class="btn btn-ghost" href="/usage">使用记录</a>
+  <a class="btn btn-ghost" href="/wallet">钱包 / 账户</a>
+</div>
+{% endblock %}

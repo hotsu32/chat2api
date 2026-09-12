@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Chat-Share{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>{% include "_theme.css" %}{% block extra_css %}{% endblock %}</style>
+</head>
+<body>
+  <div class="page">
+    <nav class="nav">
+      <a class="brand" href="/dashboard"><span class="mark"></span>Chat-Share</a>
+      <div class="nav-links">
+        <a href="/store" class="{% if nav_active == 'store' %}is-active{% endif %}">选购套餐</a>
+        <a href="/dashboard" class="{% if nav_active == 'dashboard' %}is-active{% endif %}">Dashboard</a>
+        <a href="/usage" class="{% if nav_active == 'usage' %}is-active{% endif %}">使用记录</a>
+        <a href="/wallet" class="{% if nav_active == 'wallet' %}is-active{% endif %}">钱包</a>
+        <a href="/settings" class="{% if nav_active == 'settings' %}is-active{% endif %}">设置</a>
+        {% if email %}<span class="nav-user">{{ email }}</span>{% endif %}
+        <form class="inline-form" method="post" action="/signout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="nav-signout" type="submit">退出</button>
+        </form>
+      </div>
+    </nav>
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

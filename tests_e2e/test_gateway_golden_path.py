@@ -10,6 +10,30 @@ Exercises the real FastAPI gateway routes against the loopback mock upstream:
 import utils.globals as globals
 import utils.store as store
 import utils.usage as usage
+import json
+import pytest
+
+
+@pytest.fixture
+def website_sessions(monkeypatch, tmp_path, make_access_token):
+    from gateway import frontend_sync as frontend
+    frontend.invalidate_frontend_cache()
+    monkeypatch.setattr(frontend, 'SESSION_ARCHIVE_DIR', tmp_path)
+    for account in ('acc-e1', 'acc-a', 'acc-b'):
+        (tmp_path / (account + '.json')).write_text(json.dumps({
+            'account': {'id': account}, 'sessionToken': 'test-' + account}))
+
+    def fetch(cookies, account_id, fingerprint, **kwargs):
+        assert cookies['__Secure-next-auth.session-token'] == 'test-' + account_id
+        session = {'user': {'name': 'Private owner', 'email': 'owner@example.test'},
+                   'account': {'id': account_id, 'planType': 'plus'},
+                   'accessToken': make_access_token(account_id=account_id),
+                   'sessionToken': 'PRIVATE-SESSION'}
+        return {'html': '<html></html>', 'session': session, 'cookies': cookies}
+
+    monkeypatch.setattr(frontend, '_fetch_official_html_sync', fetch)
+    yield
+    frontend.invalidate_frontend_cache()
 
 
 def _mask(token):
@@ -20,12 +44,13 @@ def _mask(token):
 # E1  first visit -> login -> assign -> anonymized identity
 # ---------------------------------------------------------------------------
 
-def test_root_without_seed_redirects_to_demo(client):
+def test_root_without_seed_redirects_to_dashboard(client):
     resp = client.get("/")
     assert resp.status_code == 200
-    assert any(r.status_code == 302 for r in resp.history)  # redirect to demo, not the owner live template
-    assert b"RefreshToken" not in resp.content  # demo selection page, not the login page
-    assert b"Free" in resp.content and b"Plus" in resp.content  # free/plus group entries
+    assert resp.history[0].status_code == 302
+    assert resp.history[0].headers['location'] == '/dashboard'
+    assert resp.url.path == '/signin'
+    assert b"client-bootstrap" not in resp.content
 
 
 def test_seed_visit_rewrites_client_bootstrap_identity(client, monkeypatch, seed_user, seed_account,
@@ -56,7 +81,8 @@ def test_seed_visit_rewrites_client_bootstrap_identity(client, monkeypatch, seed
         "statsigPayload": _statsig,
     })
 
-    async def _fake_template():
+    async def _fake_template(req_token, access_token, fingerprint):
+        assert req_token == tok and access_token == tok
         return (
             "<html><head></head><body>"
             '<script type="application/json" id="client-bootstrap" nonce="x">'
@@ -67,7 +93,7 @@ def test_seed_visit_rewrites_client_bootstrap_identity(client, monkeypatch, seed
 
     monkeypatch.setattr("gateway.chatgpt.get_frontend_template", _fake_template)
 
-    resp = client.get("/", cookies={"token": "seed-e1"})
+    resp = client.get("/?token=seed-e1")
     assert resp.status_code == 200
     assert resp.cookies.get("token") == "seed-e1"
 
@@ -102,7 +128,7 @@ def test_seed_visit_rewrites_client_bootstrap_identity(client, monkeypatch, seed
     assert b"OWNERLEAK" not in resp.content
 
 
-def test_auth_session_returns_anonymized_session(client, seed_user, seed_account, make_access_token):
+def test_auth_session_returns_anonymized_session(client, seed_user, seed_account, make_access_token, website_sessions):
     tok = make_access_token(account_id="acc-e1", plan_type="plus")
     seed_account(tok)
     seed_user("seed-e1", tok, plan_type="plus")
@@ -134,7 +160,7 @@ def test_account_status_masks_identity(client, seed_user, seed_account, make_acc
     assert data["identity"]["name"] == "ChatGPT"
 
 
-def test_auto_failover_on_disabled_account(client, seed_user, seed_account, make_access_token):
+def test_auto_failover_on_disabled_account(client, seed_user, seed_account, make_access_token, website_sessions):
     tok_a = make_access_token(account_id="acc-a")
     tok_b = make_access_token(account_id="acc-b")
     seed_account(tok_a, plan_type="plus")
@@ -237,3 +263,33 @@ def test_usage_counted_per_seed_and_account(client, seed_user, seed_account, mak
 def test_ces_short_circuit_returns_202(client):
     resp = client.get("/ces/telemetry/collect")
     assert resp.status_code == 202
+
+
+# ---------------------------------------------------------------------------
+# E4  frontend f/conversation: send a message -> streamed assistant reply
+# ---------------------------------------------------------------------------
+
+def test_f_conversation_streams_assistant_reply(client, seed_user, seed_account, make_access_token):
+    """发消息能回：POST /backend-api/f/conversation 走真实 gateway + mock 上游，
+    返回 text/event-stream 且包含 assistant 回复，而不是 500 或空流。"""
+    tok = make_access_token(account_id="acc-e4", plan_type="plus")
+    seed_account(tok)
+    seed_user("seed-e4", tok, plan_type="plus")
+
+    body = {
+        "model": "gpt-5-6",
+        "messages": [
+            {"id": "msg-u1", "author": {"role": "user"},
+             "content": {"content_type": "text", "parts": ["hello"]}},
+        ],
+        "conversation_id": "conv-e4",
+        "parent_message_id": "msg-u1",
+    }
+    resp = client.post(
+        "/backend-api/f/conversation", cookies={"token": "seed-e4"}, json=body
+    )
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers.get("content-type", "")
+    # 流式里回的是 assistant 回复（mock 上游固定回 "Hello, world"），且至少一条 assistant 帧
+    assert b"Hello, world" in resp.content
+    assert b'"role": "assistant"' in resp.content

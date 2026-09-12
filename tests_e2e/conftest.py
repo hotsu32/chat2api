@@ -61,6 +61,21 @@ os.environ["CONVERSATION_ONLY"] = "true"
 os.environ["NO_SENTINEL"] = "false"
 os.environ["CHECK_MODEL"] = "false"
 os.environ["CHATGPT_BASE_URL"] = ""
+os.environ["SMTP_HOST"] = ""
+os.environ["SMTP_USER"] = ""
+os.environ["SMTP_PASSWORD"] = ""
+# The developer .env carries real SMTP / Turnstile / verification settings; unless
+# they are pinned here, load_dotenv leaks them in and registration starts demanding
+# a live captcha + a mailbox round-trip that the suite cannot satisfy.
+os.environ["REQUIRE_EMAIL_VERIFICATION"] = "false"
+os.environ["TURNSTILE_SITE_KEY"] = ""
+os.environ["TURNSTILE_SECRET_KEY"] = ""
+os.environ["REGISTER_RATE_LIMIT"] = "0"
+# Checkout is fail-closed without a provider; the mock one keeps the purchase
+# path exercisable without any real money movement.
+os.environ["PAYMENT_PROVIDER"] = "mock"
+os.environ["PROXY_URL"] = ""
+os.environ["SENTINEL_PROXY_URL"] = ""
 os.environ["OPENAI_AUTH_TOKEN_URL"] = "https://auth.example/oauth/token"
 os.environ["OPENAI_AUTH_AUTHORIZE_URL"] = "https://auth.example/oauth/authorize"
 os.environ["OPENAI_AUTH_REDIRECT_URI"] = "http://localhost:1455/auth/callback"
@@ -70,6 +85,7 @@ os.environ["OPENAI_AUTH_SCOPE"] = "openid profile email offline_access"
 # Imported only after the env above is pinned (utils.configs reads env at import).
 import utils.configs as configs  # noqa: E402
 import utils.globals as globals  # noqa: E402
+import utils.ratelimit as ratelimit  # noqa: E402
 import utils.store as store  # noqa: E402
 import utils.usage as usage  # noqa: E402
 import app  # noqa: E402,F401  -- registers gateway routes (must be last)
@@ -104,6 +120,11 @@ def _reset_state(tmp_path, monkeypatch):
     globals.count = 0
 
     usage._pending = []
+
+    # Rate-limit counters live in a module-level dict, not the DB, so the per-test
+    # DB swap above does not clear them. Without this, the signin-throttle tests
+    # would poison every later test that signs in.
+    ratelimit.reset()
 
     # Route upstream to a blank list; the `client` fixture repoints it to the mock.
     configs.chatgpt_base_url_list[:] = []
@@ -213,13 +234,19 @@ class _RecordingHandler(http.server.BaseHTTPRequestHandler):
             "path": self.path,
             "authorization": self.headers.get("Authorization", ""),
             "cookie": self.headers.get("Cookie", ""),
+            # Full header set: the gateway is responsible for deciding the upstream
+            # identity (account id, origin, host, fingerprint), so tests must be able
+            # to assert on what actually left the process.
+            "headers": {key.lower(): value for key, value in self.headers.items()},
             "body": body,
         })
 
-    def _send(self, code, body, content_type="application/json"):
+    def _send(self, code, body, content_type="application/json", extra_headers=None):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -280,15 +307,19 @@ class _RecordingHandler(http.server.BaseHTTPRequestHandler):
         self._record(body)
         path = self.path.split("?")[0]
         if path == "/backend-api/conversation":
-            self._send(200, self.server.conversation_sse, "text/event-stream")
+            # curl_cffi transparently decompresses, so an upstream content-encoding
+            # must never be forwarded verbatim to the browser.
+            self._send(200, self.server.conversation_sse, "text/event-stream",
+                       self.server.conversation_headers)
         elif path == "/backend-api/sentinel/chat-requirements":
-            self._json(200, {
+            self._send(200, json.dumps({
                 "persona": "chatgpt-paid",
                 "arkose": {"required": False, "dx": None},
                 "turnstile": {"required": False},
                 "proofofwork": {"required": False, "difficulty": "000032", "seed": "seed", "type": "pow"},
                 "token": "sentinel-token-123",
-            })
+            }).encode("utf-8"), "application/json",
+                {"Set-Cookie": "oai-sc=sentinel-cookie-value; Path=/"})
         elif path == "/oauth/token":
             self._json(200, {
                 "refresh_token": "rt_" + "a" * 60,
@@ -299,12 +330,18 @@ class _RecordingHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._json(200, {})
 
+    def do_PATCH(self):
+        body = self._read_body()
+        self._record(body)
+        self._json(200, {})
+
 
 @pytest.fixture
 def mock_upstream():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RecordingHandler)
     server.records = []
     server.conversation_sse = _sse_body("Hello, world")
+    server.conversation_headers = {}
     server.url = f"http://127.0.0.1:{server.server_address[1]}"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -320,6 +357,21 @@ def client(mock_upstream):
     # NOTE: `app` is the module; the FastAPI instance is `app.app` (app.py:20).
     configs.chatgpt_base_url_list[:] = [mock_upstream.url]
     return TestClient(app.app)
+
+
+@pytest.fixture
+def client_factory(mock_upstream):
+    """Build additional TestClients, each with its own cookie jar.
+
+    Needed to model "two devices, one account": session revocation can only be
+    observed when the stale cookie lives somewhere the acting request cannot touch.
+    """
+    configs.chatgpt_base_url_list[:] = [mock_upstream.url]
+
+    def _make():
+        return TestClient(app.app)
+
+    return _make
 
 
 # ---------------------------------------------------------------------------

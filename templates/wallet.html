@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}钱包 / 账户 · Chat-Share{% endblock %}
+{% block content %}
+<div class="mono-label">钱包 / 账户</div>
+<h1>钱包</h1>
+<p class="lede">你的套餐、订单与兑换都在这里。</p>
+
+<div class="section-label">我的套餐</div>
+{% if subscriptions %}
+<table class="table">
+  <thead><tr><th>套餐</th><th>有效期至</th><th>状态</th><th></th></tr></thead>
+  <tbody>
+    {% for sub in subscriptions %}
+    <tr>
+      <td>{{ sub.kicker }}</td>
+      <td class="num">{{ sub.expires_at }}</td>
+      <td>{{ '生效中' if sub.healthy else '已过期' }}</td>
+      <td style="text-align:right">
+        {% if sub.healthy %}
+        <a class="btn btn-sm btn-ghost" href="/?token={{ seed }}">进入</a>
+        {% else %}
+        <a class="btn btn-sm btn-ghost" href="{{ sub.renew_url }}">续费</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">还没有套餐。<a href="/store" style="color:#000">去超市选购 →</a></div>
+{% endif %}
+
+<div class="section-label">兑换码</div>
+<p class="muted" style="margin:0">兑换码功能即将上线。</p>
+{% if redeem_msg %}<div class="error" style="max-width:420px">{{ redeem_msg }}</div>{% endif %}
+
+<div class="section-label">订单历史</div>
+{% if orders %}
+<table class="table">
+  <thead><tr><th>订单号</th><th>套餐</th><th>金额</th><th>状态</th><th>时间</th></tr></thead>
+  <tbody>
+    {% for o in orders %}
+    <tr>
+      <td class="num">{{ o.order_id }}</td>
+      <td>{{ o.plan_label }}</td>
+      <td class="num">¥{{ o.amount }}</td>
+      <td>{{ o.status_text }}</td>
+      <td class="num">{{ o.created_at }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">还没有订单。</div>
+{% endif %}
+
+<div class="section-label">邀请</div>
+<p class="muted" style="margin:0">我的邀请码：<span class="mono" style="color:#000">{{ invite_code }}</span>　（占位，返利机制暂未启用）</p>
+{% endblock %}

@@ -2,12 +2,14 @@ import json
 import re
 import uuid
 
-from fastapi import Request
+from fastapi import Request, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app import app
 from chatgpt.authorization import verify_token
-from gateway.frontend_sync import get_frontend_template
+from gateway.frontend_sync import (get_frontend_template, get_cached_frontend,
+                                   compose_frontend, FrontendSessionError)
+from chatgpt.fp import get_fp
 from gateway.identity import build_session
 from gateway.login import login_html
 from gateway.reverseProxy import get_real_req_token
@@ -16,7 +18,7 @@ from utils.Logger import logger
 
 # 官网 HTML 里的 client-bootstrap：<script type="application/json" id="client-bootstrap" nonce="...">JSON</script>
 _CLIENT_BOOTSTRAP_RE = re.compile(
-    r'(<script\s+type="application/json"\s+id="client-bootstrap"[^>]*>)(.*?)(</script>)',
+    r'(<script\b[^>]*\bid="client-bootstrap"[^>]*>)(.*?)(</script>)',
     re.DOTALL,
 )
 
@@ -82,11 +84,15 @@ def _rewrite_client_bootstrap(html: str, session: dict) -> str:
         try:
             data = json.loads(m.group(2))
             data["authStatus"] = "logged_in"
-            data["session"] = session
-            data["user"] = session.get("user") or {}
+            source_session = data.get("session") or {}
+            # The fetcher has verified this source account; preserve actual plan,
+            # workspace and subscription fields instead of synthetic defaults.
+            from gateway.identity import sanitize_session
+            data["session"] = sanitize_session(source_session) if source_session.get('account') else session
+            data["user"] = data["session"].get("user") or {}
             sp = data.get("statsigPayload")
             if isinstance(sp, str) and sp:
-                data["statsigPayload"] = _sanitize_statsig_payload(sp, session)
+                data["statsigPayload"] = _sanitize_statsig_payload(sp, data["session"])
             bootstrap = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
         except Exception as e:
@@ -96,26 +102,74 @@ def _rewrite_client_bootstrap(html: str, session: dict) -> str:
         bootstrap = bootstrap.replace("&", _bs + "u0026").replace("<", _bs + "u003c").replace(">", _bs + "u003e")
         return m.group(1) + bootstrap + m.group(3)
 
-    html, n = _CLIENT_BOOTSTRAP_RE.subn(_repl, html, count=1)
+    html, n = _CLIENT_BOOTSTRAP_RE.subn(_repl, html)
     if n == 0:
-        logger.warning("[chatgpt_html] client-bootstrap tag not found; identity not rewritten")
+        raise FrontendSessionError('Official frontend bootstrap cannot be sanitized')
     return html
 
 
 @app.get("/", response_class=HTMLResponse)
 async def chatgpt_html(request: Request):
+    # 主页只认显式 ?token=（来自 Dashboard「进入 ChatGPT」入口）。
+    # 裸访问 / 一律回 Dashboard —— 主页是 Dashboard，不是聊天页；
+    # 未登录由 /dashboard 自行 303 到 /signin。不再回退读 cookie token，
+    # 否则残留的 token cookie 会把访问主页的用户直接送进聊天。
     token = request.query_params.get("token")
     if not token:
-        token = request.cookies.get("token")
-    if not token:
-        # 无身份 -> 进入 demo 选择页（free/plus 分组入口）；运营者 RT/AT 登录走 /login
-        return RedirectResponse(url="/demo", status_code=302)
+        return RedirectResponse(url="/dashboard", status_code=302)
+    if not _entitled(token):
+        # 套餐过期 / 未购买：入口直接拦掉，不渲染聊天页。
+        # seed 是永久凭据，收藏了带 token 的链接也绕不过去。
+        return RedirectResponse(url="/store?expired=1", status_code=302)
+    return await _render_account_page(request, token)
+
+
+def _entitled(seed: str) -> bool:
+    """该 seed 当前是否有权进聊天。
+
+    非 SaaS seed（运营者 / 直传 token）返回 True —— 车队运营侧不受 SaaS 权益约束。
+
+    这里只决定「要不要渲染这张 HTML 页」，真正的闸在 ``enforce_tier``：数据层故障时
+    页面照渲染（不把运营者挡在门外），但任何会话请求都会被 enforce_tier 拦成 503，
+    所以放行一张静态页并不构成白拿。
+    """
+    try:
+        from utils import entitlements
+        tier = entitlements.effective_tier(seed)
+        return tier is None or bool(tier)
+    except Exception as e:
+        logger.warning(f"[chatgpt_html] entitlement check failed, rendering page anyway: {e}")
+        return True
+
+
+@app.get('/c/{conversation_id}', response_class=HTMLResponse)
+async def conversation_page(request: Request, conversation_id: str):
+    """Reload an owned conversation without changing the bare-root contract."""
+    import utils.globals as globals
+    token = request.cookies.get('token', '').strip()
+    entry = globals.seed_map.get(token) or {}
+    if conversation_id not in entry.get('conversations', []):
+        raise HTTPException(status_code=404, detail='Conversation not found')
+    if not _entitled(token):
+        return RedirectResponse(url="/store?expired=1", status_code=302)
+    return await _render_account_page(request, token)
+
+
+def _website_unavailable():
+    return HTMLResponse(
+        '<h1>此账号的官网会话暂不可用</h1><p>请运营者检查该账号的会话配置后重试。</p>',
+        status_code=503, headers={'Cache-Control': 'no-store'})
+
+
+async def _render_account_page(request: Request, token: str):
 
     # 会话隔离：解析 SeedToken -> 账号 access_token，合成该账号的 session 身份
     try:
         req_token = await get_real_req_token(token)
         access_token = await verify_token(req_token) or ""
     except Exception as e:
+        if isinstance(e, HTTPException) and e.status_code == 503:
+            return _website_unavailable()
         logger.warning(f"[chatgpt_html] resolve seed account failed: {e}")
         access_token = ""
     session = build_session(access_token)
@@ -125,16 +179,33 @@ async def chatgpt_html(request: Request):
         return await login_html(request)
 
     # 官网最新 logged_in 版 HTML（client-bootstrap 里是 owner 身份，重写为种子账号身份）
-    html = await get_frontend_template()
-    html = _rewrite_client_bootstrap(html, session)
+    try:
+        fetched_html = await get_frontend_template(req_token, access_token, get_fp(req_token).copy())
+        context = get_cached_frontend(req_token, access_token)
+        html = compose_frontend(context) if context else fetched_html
+        if not html:
+            raise FrontendSessionError('Website context needs revalidation')
+        html = _rewrite_client_bootstrap(html, session)
+    except FrontendSessionError:
+        return _website_unavailable()
 
     # 清空本地存储，避免不同用户间的前端状态串扰
     clear_script = "<script>localStorage.clear();</script>"
     html = html.replace("</head>", clear_script + "</head>", 1)
 
-    response = HTMLResponse(content=html)
+    response = HTMLResponse(content=html, headers={'Cache-Control': 'no-store'})
     # 用户标识 cookie（SeedToken / access_token），gateway 反代时据此识别用户
     response.set_cookie("token", value=token, expires="Thu, 01 Jan 2099 00:00:00 GMT")
+    # Integrity state belongs to this account's page response.  Auth-session
+    # responses deliberately do not set it, preventing a delayed old-account
+    # refresh from overwriting a newly selected account's browser state.
+    context = get_cached_frontend(req_token, access_token)
+    integrity_state = (context or {}).get('cookies', {}).get('__Secure-oai-is')
+    if integrity_state:
+        response.set_cookie('__Secure-oai-is', integrity_state, secure=True,
+                            httponly=False, samesite='lax')
+    else:
+        response.delete_cookie('__Secure-oai-is', secure=True, httponly=False, samesite='lax')
     # 不再把 owner 的 session cookie 下发到用户浏览器（凭据泄漏）；
     # 上游认证由 gateway 服务端注入（reverseProxy 里 get_session_cookie）。
     return response

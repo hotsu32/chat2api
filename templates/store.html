@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}超市选购 · Chat-Share{% endblock %}
+{% block content %}
+<div class="mono-label">超市选购</div>
+<h1>选择你的套餐</h1>
+{% if expired %}
+<div class="error" style="max-width:520px">你的套餐已到期，ChatGPT 入口已暂停。续费后即刻恢复，原有会话不受影响。</div>
+{% endif %}
+<p class="lede">一个入口直达托管好的 ChatGPT，稳定不掉线。选好三件事，价格即出。</p>
+
+<div class="picker">
+  <div class="axis">
+    <div class="axis-title"><span class="idx">01</span>账号档次</div>
+    <div class="axis-options" data-axis="tier">
+      <button class="opt is-selected" type="button" data-value="plus">
+        <span class="name">Plus</span><span class="hint">日常够用</span>
+      </button>
+      <button class="opt" type="button" data-value="pro">
+        <span class="name">Pro</span><span class="hint">更强模型</span>
+      </button>
+    </div>
+  </div>
+  <div class="axis">
+    <div class="axis-title"><span class="idx">02</span>共享密度</div>
+    <div class="axis-options" data-axis="density">
+      <button class="opt is-selected" type="button" data-value="solo">
+        <span class="name">独享</span><span class="hint">专属号池</span>
+      </button>
+      <button class="opt" type="button" data-value="shared">
+        <span class="name">拼车</span><span class="hint">多人共享</span>
+      </button>
+    </div>
+  </div>
+  <div class="axis">
+    <div class="axis-title"><span class="idx">03</span>时长</div>
+    <div class="axis-options" data-axis="duration">
+      <button class="opt" type="button" data-value="1d"><span class="name">1 天</span><span class="hint"></span></button>
+      <button class="opt" type="button" data-value="1w"><span class="name">1 周</span><span class="hint"></span></button>
+      <button class="opt is-selected" type="button" data-value="1m"><span class="name">1 个月</span><span class="hint"></span></button>
+    </div>
+  </div>
+</div>
+
+<div class="summary">
+  <div>
+    <div class="mono-label">已选</div>
+    <div class="summary-name" id="sel-name">Plus · 独享 · 1 个月</div>
+  </div>
+  <div class="summary-price" id="sel-price">¥99 <small>/ 月</small></div>
+  <form method="get" action="/checkout">
+    <input type="hidden" name="plan" id="plan-id" value="plus-solo-1m">
+    <button class="btn" type="submit">立即下单</button>
+  </form>
+</div>
+
+<div class="section-label">说明</div>
+<div class="stack">
+  <p class="muted" style="margin:0">「独享」= 专属号池，独立会话，稳定性最好；「拼车」= 多人共享同一号池，性价比高，稳定性一般。</p>
+  <p class="muted" style="margin:0">每日对话上限：Plus 500 次，Pro 2000 次，当日用满次日恢复。点 Dashboard 的入口按钮即可直接进入，无需记任何口令。</p>
+</div>
+
+<script>
+  const PRICES = {{ prices | tojson }};
+  const TIER_LABEL = { plus: "Plus", pro: "Pro" };
+  const DENSITY_LABEL = { solo: "独享", shared: "拼车" };
+  const DURATION_LABEL = { "1d": "1 天", "1w": "1 周", "1m": "1 个月" };
+  const UNIT_LABEL = { "1d": "/ 天", "1w": "/ 周", "1m": "/ 月" };
+
+  const state = { tier: "plus", density: "solo", duration: "1m" };
+
+  function render() {
+    document.querySelectorAll("[data-axis]").forEach(function (axis) {
+      const key = axis.dataset.axis;
+      axis.querySelectorAll(".opt").forEach(function (btn) {
+        btn.classList.toggle("is-selected", btn.dataset.value === state[key]);
+      });
+    });
+    // 时长选项的价格提示随档次/密度联动
+    document.querySelectorAll('[data-axis="duration"] .opt').forEach(function (btn) {
+      const d = btn.dataset.value;
+      btn.querySelector(".hint").textContent = "¥" + PRICES[state.tier][state.density][d];
+    });
+    const price = PRICES[state.tier][state.density][state.duration];
+    document.getElementById("sel-name").textContent =
+      TIER_LABEL[state.tier] + " · " + DENSITY_LABEL[state.density] + " · " + DURATION_LABEL[state.duration];
+    document.getElementById("sel-price").innerHTML = "¥" + price + ' <small>' + UNIT_LABEL[state.duration] + "</small>";
+    document.getElementById("plan-id").value = state.tier + "-" + state.density + "-" + state.duration;
+  }
+
+  document.querySelectorAll(".opt").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      state[btn.closest("[data-axis]").dataset.axis] = btn.dataset.value;
+      render();
+    });
+  });
+  render();
+</script>
+{% endblock %}

@@ -150,6 +150,18 @@ async def verify_token(req_token):
         else:
             return None
     else:
+        from gateway.frontend_sync import verified_access_token, FrontendSessionError
+        account = store.get_account(req_token) or {}
+        if (account.get('status') in ('disabled', 'unhealthy')
+                or req_token in globals.error_token_list
+                or antiban_circuit.is_token_dead(req_token)):
+            raise HTTPException(status_code=401, detail='Account unavailable')
+        try:
+            website_access = await verified_access_token(req_token)
+        except FrontendSessionError:
+            raise HTTPException(status_code=503, detail='Account website session unavailable') from None
+        if website_access:
+            return website_access
         if req_token.startswith("eyJhbGciOi") or req_token.startswith("fk-"):
             access_token = req_token
             globals.sync_account_plan(req_token)

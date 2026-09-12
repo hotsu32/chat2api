@@ -13,7 +13,7 @@ Each test locks the *correct* behavior:
 
 def test_empty_session_serves_login_not_owner_template(client):
     """#1 一个无法解析为账号的 seed，不得下发携带 owner client-bootstrap 的 live 模板。"""
-    resp = client.get("/", cookies={"token": "seed-nobody"})
+    resp = client.get("/?token=seed-nobody")
     assert resp.status_code == 200
     # 登录页（含 RefreshToken 输入），而非官网 live 模板（含 client-bootstrap 身份 JSON）
     assert b"RefreshToken" in resp.content

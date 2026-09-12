@@ -4,48 +4,124 @@
 绑定前端浏览器 IP，经 gateway 反代后 IP 变化会触发风控。这里拦截新接口，
 由服务端统一算 sentinel + PoW，转发到老接口 /backend-api/conversation。
 """
+import asyncio
 import hashlib
 import json
 import random
+import time
 import uuid
 
 from fastapi import Request, HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from app import app
-from chatgpt.authorization import get_req_token, verify_token
+from chatgpt.authorization import verify_token
 from chatgpt.fp import get_fp
 from chatgpt.proofofWork import get_config, get_answer_token, get_requirements_token
-from gateway.reverseProxy import content_generator, headers_accept_list, resolve_seed_token
+from gateway.frontend_sync import (
+    FrontendSessionError,
+    get_session_cookie,
+    refresh_cached_frontend,
+)
+from gateway.identity import decode_jwt_payload
+from gateway.reverseProxy import (
+    _is_transient_network_error,
+    content_generator,
+    headers_accept_list,
+    resolve_seed_token,
+)
 from utils.tiers import enforce_tier
 from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import (
+    accept_language,
     chatgpt_base_url_list,
+    chat_request_timeout,
     turnstile_solver_url,
     sentinel_proxy_url_list,
-    force_no_history,
+    sentinel_cache_ttl,
+    sentinel_strict,
 )
 
 # 服务端 sentinel 缓存：req_token -> {chat_token, proof_token, turnstile_token}
 _sentinel_cache = {}
 _sentinel_cookie_cache = {}
 
+# curl_cffi 自动解压上游 body，透传上游的 content-encoding 会让浏览器把明文
+# 再按 gzip/br 解一次，直接 ERR_CONTENT_DECODING_FAILED（回复永远渲染不出来）。
+# 长度/分帧同理由网关自己重算。
+_HOP_BY_HOP_RESPONSE_HEADERS = ("content-encoding", "content-length", "transfer-encoding")
 
-def _build_headers(request, access_token, req_token):
+
+def _anon(value: str) -> str:
+    """日志用的稳定匿名标识：够区分账号/会话，但不可反推凭据。"""
+    return hashlib.sha256(value.encode()).hexdigest()[:8] if value else "-"
+
+
+def _host(base_url: str) -> str:
+    return base_url.replace("https://", "").replace("http://", "")
+
+
+def _sanitize_response_headers(rheaders):
+    return {k: v for k, v in rheaders.items()
+            if k.lower() not in _HOP_BY_HOP_RESPONSE_HEADERS}
+
+
+async def _upstream_context(request, req_token, host_url):
+    """构造 f/conversation 上游请求的完整身份：头 + 指纹 + 账号官网 cookie。
+
+    与 ``chatgpt_reverse_proxy`` 同一套规则——这条链路绕开了通用反代，若只透传
+    浏览器头，上游收到的是「镜像用户的浏览器 + 无账号归属」的请求：
+      * 缺 chatgpt-account-id，Plus/Pro 的工作区权益无法归属，turn 被拒；
+      * 缺账号官网 cookie，chatgpt.com 认不出这是该账号的会话；
+      * origin/referer 还指向镜像域名，等于对 chatgpt.com 发跨站 POST。
+
+    返回 (headers, fp, cookies, access_token)。account 不可解析时 fail-closed 抛 401。
+    """
+    if not req_token:
+        raise HTTPException(status_code=401, detail="No account available")
+    access_token = await verify_token(req_token)
     fp = get_fp(req_token).copy()
+    try:
+        context = await refresh_cached_frontend(req_token, access_token or "", dict(fp))
+    except FrontendSessionError:
+        raise HTTPException(status_code=503, detail="Account website session unavailable") from None
+    if context:
+        access_token = context["session"]["accessToken"]
+    if not access_token:
+        raise HTTPException(status_code=401, detail="No account available")
+
     headers = {
         key: value for key, value in request.headers.items()
         if key.lower() in headers_accept_list
     }
-    headers.update(fp)
-    headers.update({"authorization": f"Bearer {access_token}"})
-    return headers, fp
+    # fp 里 proxy_url / impersonate 是传输参数而非 HTTP 头；混进 headers 会把代理
+    # 地址原样发给上游（凭据泄漏 + 一眼非浏览器）。与反代一致，先摘掉再 update。
+    fp_headers = {k: v for k, v in fp.items() if k not in ("proxy_url", "impersonate")}
+    headers.update(fp_headers)
+    headers.update({
+        "authorization": f"Bearer {access_token}",
+        "accept-language": accept_language,
+        "host": _host(host_url),
+        "origin": host_url,
+        "referer": f"{host_url}/",
+    })
+    account_id = decode_jwt_payload(access_token).get(
+        "https://api.openai.com/auth", {}).get("chatgpt_account_id")
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+
+    # 账号自己的官网 session cookie（由网关注入，浏览器侧没有也不该有）。
+    # 绝不透传 request.cookies：那是镜像用户的浏览器 jar（含我们自己的 seed token）。
+    cookies = dict(get_session_cookie(req_token, access_token))
+    for cookie in _sentinel_cookie_cache.get(req_token, []):
+        cookies[cookie["name"]] = cookie["value"]
+    return headers, fp, cookies, access_token
 
 
-async def _server_sentinel(request, access_token, req_token, headers, fp):
+async def _server_sentinel(request, access_token, req_token, headers, fp, cookies=None):
     """服务端调 sentinel chat-requirements，返回 (chat_token, proof_token, turnstile_token, client, clients, session_id, user_agent)。"""
     user_agent = fp.get(
         "user-agent",
@@ -58,7 +134,10 @@ async def _server_sentinel(request, access_token, req_token, headers, fp):
 
     session_id = hashlib.md5(req_token.encode()).hexdigest()
     proxy_url = proxy_url.replace("{}", session_id) if proxy_url else None
-    client = Client(proxy=proxy_url, impersonate=impersonate)
+    # 与 f_conversation 的 conversation client 使用相同 timeout，使两者命中同一连接池 key：
+    # prepare 阶段的 sentinel 请求建立起的 TCP+TLS 连接，能被随后 f/conversation 直接复用（preconnect）。
+    client = Client(proxy=proxy_url, impersonate=impersonate, timeout=chat_request_timeout)
+    sentinel_proxy_url = None
     if sentinel_proxy_url_list:
         sentinel_proxy_url = (
             random.choice(sentinel_proxy_url_list).replace("{}", session_id)
@@ -74,12 +153,26 @@ async def _server_sentinel(request, access_token, req_token, headers, fp):
         config = get_config(user_agent, session_id)
         p = get_requirements_token(config)
         data = {"p": p}
-        for cookie in _sentinel_cookie_cache.get(req_token, []):
-            clients.session.cookies.set(**cookie)
-        r = await clients.post(
-            f"{host_url}/backend-api/sentinel/chat-requirements",
-            headers=headers, json=data, timeout=10,
-        )
+        # sentinel 请求也做瞬时网络错误重试：GFW 对新建 TLS 连接偶发 RST（SSL_ERROR_SYSCALL），
+        # 与 reverseProxy._request_with_retry 同因；不重试会空 sentinel 级联 422。
+        for attempt in range(2):
+            try:
+                r = await clients.post(
+                    f"{host_url}/backend-api/sentinel/chat-requirements",
+                    headers=headers, cookies=dict(cookies or {}), json=data, timeout=10,
+                )
+                break
+            except Exception as e:
+                if attempt == 0 and _is_transient_network_error(e):
+                    logger.warning(f"[f_conversation] sentinel transient network error, retrying: {str(e)[:120]}")
+                    await clients.discard()
+                    if sentinel_proxy_url_list:
+                        clients = Client(proxy=sentinel_proxy_url, impersonate=impersonate)
+                    else:
+                        client = clients = Client(proxy=proxy_url, impersonate=impersonate, timeout=chat_request_timeout)
+                    await asyncio.sleep(0.4)
+                    continue
+                raise
         oai_sc = r.cookies.get("oai-sc")
         if oai_sc:
             _sentinel_cookie_cache[req_token] = [{"name": "oai-sc", "value": oai_sc}]
@@ -124,21 +217,27 @@ async def f_sentinel_prepare(request: Request):
     """拦截 sentinel prepare：服务端算 sentinel，返回假 prepare_token（让前端跳过 PoW）。"""
     token = resolve_seed_token(request)
     req_token = await get_real_req_token_wrapper(token)
-    access_token = await verify_token(req_token)
-    headers, fp = _build_headers(request, access_token, req_token)
+    host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
+    headers, fp, cookies, access_token = await _upstream_context(request, req_token, host_url)
     try:
         chat_token, proof_token, turnstile_token, client, clients, _, _ = await _server_sentinel(
-            request, access_token, req_token, headers, fp
+            request, access_token, req_token, headers, fp, cookies
         )
         _sentinel_cache[req_token] = {
             "chat_token": chat_token,
             "proof_token": proof_token,
             "turnstile_token": turnstile_token,
+            "cached_at": time.time(),
         }
         await client.close()
         await clients.close()
     except HTTPException:
-        raise
+        if sentinel_strict:
+            raise
+        # 降级：PoW 解算失败 / 风控拒（HTTPException 403/429 等）不再硬失败透传给前端。
+        # 不写缓存，f/conversation 命中空缓存时会走 sentinel={} 降级继续，与 f/conversation
+        # 现有降级语义对齐。SENTINEL_STRICT=1 可恢复旧行为做调试对照。
+        logger.warning("[f_sentinel_prepare] server sentinel failed, degrading (SENTINEL_STRICT=off)")
     except Exception:
         pass
     return {
@@ -158,25 +257,31 @@ async def f_sentinel_finalize(request: Request):
 @app.post("/backend-api/f/conversation/prepare")
 async def f_conversation_prepare(request: Request):
     """拦截 f/conversation/prepare：返回假 conduit_token。"""
-    return {"conduit_token": str(uuid.uuid4())}
+    started = time.monotonic()
+    token = str(uuid.uuid4())
+    logger.info(f"[f_conversation_prepare] status=200 response=json bytes={len(token) + 21} "
+                f"elapsed_ms={int((time.monotonic() - started) * 1000)}")
+    return {"conduit_token": token}
 
 
 @app.post("/backend-api/f/conversation")
 async def f_conversation(request: Request):
     """拦截 f/conversation：服务端 sentinel + 转发老接口 /backend-api/conversation。"""
+    started = time.monotonic()
     token = resolve_seed_token(request)
     req_token = await get_real_req_token_wrapper(token)
-    access_token = await verify_token(req_token)
-    headers, fp = _build_headers(request, access_token, req_token)
+    # 匿名阶段日志：只打可稳定关联同一账号/会话的哈希前缀，不落 token / cookie / 代理地址。
+    logger.info(f"[f_conversation] phase=received seed={_anon(token)} account={_anon(req_token)}")
 
     host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
+    headers, fp, request_cookies, access_token = await _upstream_context(request, req_token, host_url)
+
     proxy_url = fp.pop("proxy_url", None)
     impersonate = fp.pop("impersonate", "safari15_3")
-    user_agent = fp.get("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0")
 
     session_id = hashlib.md5(req_token.encode()).hexdigest()
     proxy_url = proxy_url.replace("{}", session_id) if proxy_url else None
-    client = Client(proxy=proxy_url, impersonate=impersonate)
+    client = Client(proxy=proxy_url, impersonate=impersonate, timeout=chat_request_timeout)
     if sentinel_proxy_url_list:
         sentinel_proxy_url = (
             random.choice(sentinel_proxy_url_list).replace("{}", session_id)
@@ -186,12 +291,20 @@ async def f_conversation(request: Request):
     else:
         clients = client
 
-    # 用缓存的 sentinel token，或重新服务端算
+    # 用缓存的 sentinel token，或重新服务端算。缓存带 TTL：chat-requirements token 有时效，
+    # 过期（或 SENTINEL_CACHE_TTL=0 不缓存）时视为未命中重新解算，避免 stale token 触发上游 403。
     sentinel = _sentinel_cache.get(req_token, {})
+    if sentinel and sentinel_cache_ttl > 0:
+        if time.time() - sentinel.get("cached_at", 0) > sentinel_cache_ttl:
+            _sentinel_cache.pop(req_token, None)
+            sentinel = {}
     if not sentinel:
         try:
+            # 传一份完整 fp 给 _server_sentinel：此处 fp 已在上面 pop 掉 proxy_url/impersonate，
+            # 若直接用会走 proxy=None 直连被 GFW 重置，sentinel 空令牌级联 422。
+            _sentinel_fp = get_fp(req_token).copy()
             chat_token, proof_token, turnstile_token, c2, c3, _, _ = await _server_sentinel(
-                request, access_token, req_token, headers, fp
+                request, access_token, req_token, headers, _sentinel_fp, request_cookies
             )
             sentinel = {
                 "chat_token": chat_token,
@@ -209,6 +322,10 @@ async def f_conversation(request: Request):
         "openai-sentinel-proof-token": sentinel.get("proof_token", ""),
         "openai-sentinel-turnstile-token": sentinel.get("turnstile_token", ""),
     })
+    # sentinel 交换回来的 oai-sc 把 chat_token 绑到这次交换上；不带回去这一轮 turn，
+    # 上游视 token 为未绑定而拒。_server_sentinel 刚写完缓存，此处回填到本次 cookie。
+    for cookie in _sentinel_cookie_cache.get(req_token, []):
+        request_cookies[cookie["name"]] = cookie["value"]
 
     # 清理 f/ 特有字段，转成老接口 conversation 兼容格式
     data = await request.body()
@@ -247,7 +364,6 @@ async def f_conversation(request: Request):
     enforce_tier(token, _f_model)
 
     params = dict(request.query_params)
-    request_cookies = dict(request.cookies)
 
     async def _close(c, cs):
         for cl in (c, cs):
@@ -257,16 +373,36 @@ async def f_conversation(request: Request):
                 except Exception:
                     pass
 
+    # 转发到老接口 conversation（不是 f/conversation）。上游经代理可能瞬时超时/SSL reset，
+    # 做一次重建重试；最终失败返回 502 JSON，而不是未捕获异常 -> 500 栈（前端会渲染成「生成失败」）。
+    r = None
+    for _attempt in range(2):
+        try:
+            r = await client.post_stream(
+                f"{host_url}/backend-api/conversation",
+                params=params, headers=headers, cookies=request_cookies,
+                data=data, stream=True, allow_redirects=False,
+            )
+            break
+        except Exception as e:
+            if _attempt == 0 and _is_transient_network_error(e):
+                logger.warning(f"[f_conversation] transient network error, retrying: {str(e)[:120]}")
+                await client.discard()
+                client = Client(proxy=proxy_url, impersonate=impersonate, timeout=chat_request_timeout)
+                await asyncio.sleep(0.4)
+                continue
+            logger.error(f"[f_conversation] phase=upstream status=error error={type(e).__name__} "
+                         f"elapsed_ms={int((time.monotonic() - started) * 1000)}")
+            await _close(client, clients)
+            return JSONResponse(status_code=502, content={"detail": "upstream unavailable"})
+
     background = BackgroundTask(_close, client, clients)
-    # 转发到老接口 conversation（不是 f/conversation）
-    r = await client.post_stream(
-        f"{host_url}/backend-api/conversation",
-        params=params, headers=headers, cookies=request_cookies,
-        data=data, stream=True, allow_redirects=False,
-    )
-    rheaders = r.headers
-    content_type = rheaders.get("content-type", "")
-    logger.info(f"[f_conversation] upstream status={r.status_code} ct={content_type}")
+    rheaders = _sanitize_response_headers(r.headers)
+    content_type = r.headers.get("content-type", "")
+    logger.info(f"[f_conversation] phase=upstream status={r.status_code} "
+                f"account={_anon(req_token)} "
+                f"response={content_type.split(';', 1)[0]} "
+                f"elapsed_ms={int((time.monotonic() - started) * 1000)}")
 
     async def _filter_gen():
         async for _chunk in content_generator(r, token, True):

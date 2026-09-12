@@ -1,52 +1,43 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>注册 · ChatGPT 镜像</title>
-  <style>
-    :root { --fg:#0f172a; --muted:#64748b; --border:#e2e8f0; --accent:#10a37f; --bg:#ffffff; }
-    * { box-sizing:border-box; }
-    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-           color:var(--fg); background:var(--bg); -webkit-font-smoothing:antialiased; }
-    .wrap { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:32px 20px; }
-    .card { width:100%; max-width:400px; }
-    .brand { font-size:20px; font-weight:600; letter-spacing:-0.02em; margin:0 0 8px; }
-    .sub { color:var(--muted); font-size:14px; margin:0 0 28px; line-height:1.5; }
-    label { display:block; font-size:13px; font-weight:500; margin:0 0 6px; }
-    input { width:100%; padding:11px 14px; font-size:15px; border:1px solid var(--border);
-            border-radius:10px; outline:none; transition:border-color .15s, box-shadow .15s; }
-    input:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(16,163,127,.12); }
-    .field { margin-bottom:16px; }
-    button { width:100%; padding:12px 16px; font-size:15px; font-weight:600; color:#fff;
-             background:var(--accent); border:none; border-radius:10px; cursor:pointer; }
-    button:hover { filter:brightness(1.05); }
-    .error { background:#fef2f2; color:#b91c1c; border:1px solid #fecaca; padding:10px 14px;
-             border-radius:10px; font-size:14px; margin-bottom:18px; }
-    .foot { margin-top:20px; text-align:center; font-size:14px; color:var(--muted); }
-    .foot a { color:var(--accent); text-decoration:none; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h1 class="brand">ChatGPT 镜像</h1>
-      <p class="sub">注册即送免费档，直接进入网页聊天，无需自部署。</p>
-      {% if error %}<div class="error">{{ error }}</div>{% endif %}
-      <form method="post" action="/register">
-        <div class="field">
-          <label for="email">邮箱</label>
-          <input id="email" name="email" type="email" autocomplete="email" required>
-        </div>
-        <div class="field">
-          <label for="password">密码（至少 8 位）</label>
-          <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
-        </div>
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit">注册</button>
-      </form>
-      <div class="foot">已有账号？<a href="/signin">登录</a> · <a href="/landing">返回首页</a></div>
-    </div>
+{% extends "base_auth.html" %}
+{% block title %}注册 · Chat-Share{% endblock %}
+{% block content %}
+<div class="brand"><span class="mark"></span>Chat-Share</div>
+<p class="sub">注册一个账号，选购套餐后即可从 Dashboard 一键进入 ChatGPT。</p>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<div class="error" id="pw-error" style="display:none">两次输入的密码不一致</div>
+
+<form method="post" action="/register" onsubmit="return checkPw(this)">
+  <div class="field">
+    <label for="email">邮箱</label>
+    <input id="email" name="email" type="email" autocomplete="email" value="{{ email or '' }}" required>
   </div>
-</body>
-</html>
+  <div class="field">
+    <label for="password">密码</label>
+    <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+    <div class="hint">至少 8 位</div>
+  </div>
+  <div class="field">
+    <label for="confirm">确认密码</label>
+    <input id="confirm" name="confirm" type="password" autocomplete="new-password" minlength="8" required>
+  </div>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  {% if turnstile_site_key %}
+  <div class="field"><div class="cf-turnstile" data-sitekey="{{ turnstile_site_key }}"></div></div>
+  {% endif %}
+  <button class="btn btn-block" type="submit">注册</button>
+</form>
+
+<div class="auth-foot">已有账号？<a href="/signin">登录</a></div>
+
+<script>
+  function checkPw(form) {
+    var ok = form.password.value === form.confirm.value;
+    document.getElementById("pw-error").style.display = ok ? "none" : "block";
+    return ok;
+  }
+</script>
+{% if turnstile_site_key %}
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+{% endif %}
+{% endblock %}

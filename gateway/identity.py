@@ -10,6 +10,27 @@
 import base64
 import json
 import time
+import copy
+
+
+def sanitize_session(session: dict) -> dict:
+    """Preserve verified account capabilities, remove private session credentials."""
+    result = copy.deepcopy(session)
+    result['sessionToken'] = ''
+    result.pop('refreshToken', None)
+    user = result.get('user') or {}
+    for field, value in {'name': 'ChatGPT', 'email': '', 'picture': '',
+                         'phone_number': '', 'first_name': 'ChatGPT', 'last_name': ''}.items():
+        if field in user:
+            user[field] = value
+    account = result.get('account') or {}
+    for field in ('name', 'account_name'):
+        if field in account:
+            account[field] = 'ChatGPT'
+    for field in ('email', 'account_email'):
+        if field in account:
+            account[field] = ''
+    return result
 
 
 def decode_jwt_payload(token: str) -> dict:

@@ -237,6 +237,50 @@ chat2api migrate rollback ~/chat2api.backup-YYYYMMDD-HHMMSS
 - 支持 GPTs 商店、DeepResearch、Canvas
 - 多语言切换、敏感接口禁用
 
+#### 账号对应的官网启动状态
+
+镜像入口根据 Seed 绑定账号读取该账号的官网登录态 HTML，校验
+`/api/auth/session`、HTML 内 session 和 Access Token 的账号 ID 一致。
+静态资源可共享，动态启动配置按绑定凭据及账号隔离，不按套餐档次共用模板。
+
+号池中保存 `sess-...` 时直接使用该会话；仅保存 Access/Refresh Token 的账号，
+需要把该账号完整的官网会话 JSON 放在 `data/private/account-sessions/*.json`，
+其中 `account.id` 用于匹配，`sessionToken` 用于官网认证。保留其他字段供维护使用。
+该目录应为 `0700`，JSON 文件为 `0600`；`data/` 已被 Git 忽略，不要将内容加入日志或工单。
+既有 `data/session_cookie.txt` 仅在验证确属所选账号后使用，不能作为其他账号的替代模板。
+
+动态配置缓存最长 60 秒；到期重新验证账号并取得最新构建和权限配置。
+镜像 `/api/auth/session?refresh=true` 会绕过热缓存，使用绑定账号的 ST 向官网发起实际续期；
+同账号并发续期合并，普通读取等待正在进行的续期。缓存 AT 过期时也主动续期。
+只有官网会话与 HTML 身份校验通过才发布新状态；鉴权失败不再包装成成功响应。
+认证响应与 HTML 内的 AT 都必须具有有效、未过期的数值 `exp`；身份匹配但 AT 过期也不会发布。
+`/api/auth/session` 即使冷缓存也先验证该账号官网会话，不再由 AT 合成成功响应；
+缺少官网会话返回 `503`，未认证返回 `401`。此要求仅针对镜像会话接口。
+这不保证所有 ST 都能续期，仍需以真实返回及业务接口验证为准。
+凭据、账号或代理上下文不变时延续该账号经验证的官网 Cookie，避免每次刷新产生新设备实验分配。
+上下文改变则重新认证；会话缺失、账号不匹配或上游暂不可用时返回 `503` 和 `no-store`，
+不会使用其他账号的页面。返回浏览器的 session 移除 Session/Refresh Token，
+公开静态请求不携带账号认证。完整号池凭据管理的后续范围见
+[任务 6](docs/FLEET_ECOSYSTEM_SPEC.md#6-镜像修复待办任务-6--号池完整凭据管理)。
+
+`/backend-api/me` 保留真实用户业务元数据（例如决定升级入口的 `email_domain_type`），
+姓名、邮箱及组织名称/描述仍匿名化。旧 `/backend-api/subscriptions` 不再固定返回 Free；
+读取成功时仅返回订阅状态字段，上游错误保留为错误，不伪造套餐或有效期。
+镜像订阅查询的 `account_id` 由服务端绑定账号提供，忽略浏览器指定的其他账号。
+入口 `503` 也可能由上游浏览器验证挑战引起，不等同于账号或 Session Token 失效。
+诊断时可检查上游响应的 `cf-mitigated: challenge`，只记录状态，不记录 Cookie 或认证头。
+会话接口的 HTTP `200` 不代表续期成功：若 session 包含 `error`（例如
+`RefreshAccessTokenError`），即使仍携带账号和未过期的 Access Token，也拒绝发布该启动状态。
+这类情况需要核验该账号的官网登录和续期状态，不能只以模型接口成功判断会话健康。
+
+核验时请使用同一账号、工作区、设备尺寸和语言对比官网与镜像；模型、工具入口及订阅状态
+才是对应性依据，设备实验和推荐项目的排序可能不同。运行相关回归（分进程）：
+
+```bash
+.venv/bin/python -m pytest tests/test_frontend_sync.py tests/test_identity.py tests/test_config_log_privacy.py -q
+.venv/bin/python -m pytest tests_e2e/test_frontend_metadata.py tests_e2e/test_gateway_golden_path.py tests_e2e/test_security_fixes.py tests_e2e/test_resp_cache_gateway.py -q
+```
+
 ### 工程化能力（nanashiwang 分支）
 
 完整能力清单见上文 [✨ nanashiwang 分支新特性](#-nanashiwang-分支新特性) 表格。

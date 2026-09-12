@@ -111,6 +111,10 @@ async def switch_account(request: Request):
         raise HTTPException(status_code=503, detail="No healthy account available in this tier")
 
     _invalidate_account_caches(old_token)
+    # 账号切换后旧账号的慢 GET 响应缓存（models/accounts/check/conversation）全部作废，
+    # 否则新账号会命中旧账号的缓存内容
+    from utils import resp_cache
+    resp_cache.invalidate_all()
 
     try:
         access_token = await verify_token(new_token) or ""

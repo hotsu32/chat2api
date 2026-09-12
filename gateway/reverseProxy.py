@@ -15,9 +15,11 @@ from chatgpt.fp import get_fp
 from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import chatgpt_base_url_list, sentinel_proxy_url_list, force_no_history, file_host, voice_host, accept_language
-from gateway.frontend_sync import get_session_cookie
+from gateway.frontend_sync import get_session_cookie, refresh_cached_frontend, FrontendSessionError
+from gateway.identity import decode_jwt_payload
 from utils.usage import record_usage
 from utils.tiers import enforce_tier
+from utils import resp_cache
 
 
 def generate_current_time():
@@ -38,6 +40,21 @@ def _usage_kind(path: str):
     return None
 
 
+def _is_textual_content(content_type: str) -> bool:
+    """响应是否可安全按文本缓存（字体/wasm/octet-stream 等二进制会被 atext 破坏，须排除）。"""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct.startswith("text/"):
+        return True
+    return ct in (
+        "application/json",
+        "application/javascript",
+        "application/x-javascript",
+        "application/xml",
+        "application/ld+json",
+        "application/manifest+json",
+    )
+
+
 # 通用反代里 JSON 载荷中会暴露账号持有者真实身份的字段 → 匿名化值。
 # 注意：通用反代无法穷举所有身份字段，这里是「定向缓解 + 残余风险已文档化」，非全量脱敏。
 _GENERIC_IDENTITY_FIELDS = {
@@ -52,18 +69,64 @@ _GENERIC_IDENTITY_FIELDS = {
 }
 
 
-def _scrub_identity_fields(node):
-    """递归把 dict 中命中 _GENERIC_IDENTITY_FIELDS 的键原地替换为匿名值。"""
+def _scrub_identity_fields(node, *, identity=False):
+    """Scrub profile objects, preserving names in model/tool/business objects."""
     if isinstance(node, dict):
         for key in list(node.keys()):
-            if key in _GENERIC_IDENTITY_FIELDS:
+            if key in _GENERIC_IDENTITY_FIELDS and (identity or key.startswith('account_')):
                 node[key] = _GENERIC_IDENTITY_FIELDS[key]
             else:
-                _scrub_identity_fields(node[key])
+                _scrub_identity_fields(node[key], identity=key in ('user', 'profile', 'account', 'owner'))
     elif isinstance(node, list):
         for item in node:
-            _scrub_identity_fields(item)
+            _scrub_identity_fields(item, identity=identity)
     return node
+
+
+def _rewrite_and_scrub(content, *, path, base_url, petrol, origin_host, seed_cookie, content_type):
+    """对上游 body 做 URL 改写 + 身份脱敏，返回最终字符串。
+
+    与冷路径原逻辑完全一致，抽成独立函数供「缓存命中」与「缓存未命中」共用，
+    保证改写（origin host / petrol）与脱敏（镜像用户身份字段）在两种路径下行为一致。
+    """
+    if "public-api/" in path:
+        content = (content
+                   .replace("https://ab.chatgpt.com", f"{petrol}://{origin_host}")
+                   .replace("https://cdn.oaistatic.com", f"{petrol}://{origin_host}")
+                   .replace("webrtc.chatgpt.com", voice_host if voice_host else "webrtc.chatgpt.com")
+                   .replace("files.oaiusercontent.com", file_host if file_host else "files.oaiusercontent.com")
+                   .replace("chatgpt.com/ces", f"{origin_host}/ces")
+                   )
+    else:
+        content = (content
+                   .replace("https://ab.chatgpt.com", f"{petrol}://{origin_host}")
+                   .replace("https://cdn.oaistatic.com", f"{petrol}://{origin_host}")
+                   .replace("webrtc.chatgpt.com", voice_host if voice_host else "webrtc.chatgpt.com")
+                   .replace("files.oaiusercontent.com", file_host if file_host else "files.oaiusercontent.com")
+                   .replace("web-sandbox.oaiusercontent.com", f"{origin_host}/sandbox")
+                   .replace("https://chatgpt.com", f"{petrol}://{origin_host}")
+                   .replace("chatgpt.com/ces", f"{origin_host}/ces")
+                   )
+    if base_url == "https://web-sandbox.oaiusercontent.com":
+        content = content.replace("/assets", "/sandbox/assets")
+    # 定向脱敏：镜像用户（有 seed cookie）访问 backend-api JSON 时，抹除已知身份字段，
+    # 防止 catch-all 透传把账号持有者真实身份（email/name/phone 等）泄漏给镜像用户。
+    if seed_cookie and "backend-api/" in path and "application/json" in content_type:
+        try:
+            payload = json.loads(content)
+            _scrub_identity_fields(payload, identity=path.rstrip('/') in (
+                'backend-api/me', 'backend-api/settings', 'backend-api/user'))
+            if path.rstrip('/') == 'backend-api/me':
+                for org in (payload.get('orgs') or {}).get('data', []):
+                    _scrub_identity_fields(org, identity=True)
+                    for field, value in (('title', 'ChatGPT'), ('description', '')):
+                        if field in org:
+                            org[field] = value
+            content = json.dumps(payload, ensure_ascii=False)
+        except (ValueError, TypeError):
+            # 非合法 JSON（如 HTML 片段）跳过脱敏，保持原样透传
+            pass
+    return content
 
 
 headers_reject_list = [
@@ -214,7 +277,7 @@ async def _request_with_retry(method, url, *, params, headers, cookies, data, ma
                                      cookies=cookies, data=data, stream=True, allow_redirects=False)
             return r, client
         except Exception as e:
-            await client.close()
+            await client.discard()
             last_exc = e
             if attempt < max_attempts - 1 and _is_transient_network_error(e):
                 logger.warning(
@@ -248,6 +311,8 @@ def save_conversation(token, conversation_id, title=None):
         globals.seed_map[token]["conversations"].insert(0, conversation_id)
     globals.persist_conversation(token, conversation_id)
     globals.persist_seed_map()
+    # 会话内容已变（新消息），失效该会话详情缓存，避免后续 GET 命中旧内容
+    resp_cache.invalidate_path_prefix(f"backend-api/conversation/{conversation_id}")
     if title:
         logger.info(f"Conversation ID: {conversation_id}, Title: {title}")
 
@@ -303,7 +368,7 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
             petrol = cf_visitor.get("scheme", petrol)
 
         params = dict(request.query_params)
-        request_cookies = dict(request.cookies)
+        request_cookies = {}
         # 静态资源（cdn/assets）走匿名公网 CDN，携带凭据反而触发 CDN 鉴权 403
         is_static_asset = "cdn/" in path or "assets/" in path
         # 注入账号持有者的 session cookie（__Secure-next-auth.session-token / cf_clearance / oai-did），
@@ -311,12 +376,6 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         # 例外：estuary/content 等 sig 签名端点，sig 本身已自足；注入 session cookie 会让上游
         # 拿签名与会话做一致性校验而冲突，返回 500（实测不带 cookie 时返回 200 image/png）。
         # 例外：静态资源也不注入——CDN 对带 session cookie 的请求直接 403。
-        if "estuary" not in path and not is_static_asset:
-            try:
-                for _k, _v in (p.split("=", 1) for p in get_session_cookie().split("; ") if "=" in p):
-                    request_cookies[_k] = _v
-            except Exception:
-                pass
 
         # headers = {
         #     key: value for key, value in request.headers.items()
@@ -329,7 +388,9 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         }
 
         base_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
+        context = None
         if is_static_asset:
+            headers.pop('authorization', None)
             base_url = "https://cdn.oaistatic.com"
             # 官网新版前端资源路径带 /cdn/ 前缀（/cdn/assets/xxx），cdn 上实际是 /assets/xxx
             path = path.replace("cdn/", "", 1)
@@ -356,8 +417,21 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
             seed_cookie = request.cookies.get("token", "").strip()
             req_token = await get_real_req_token(seed_token)
             access_token = await verify_token(req_token)
+            try:
+                context = await refresh_cached_frontend(req_token, access_token or '', get_fp(req_token).copy())
+            except FrontendSessionError:
+                raise HTTPException(status_code=503, detail='Account website session unavailable') from None
+            if context:
+                access_token = context['session']['accessToken']
+            if "estuary" not in path and base_url == 'https://chatgpt.com':
+                request_cookies = get_session_cookie(req_token, access_token or '')
             if access_token:
                 headers.update({"authorization": f"Bearer {access_token}"})
+                account_id = decode_jwt_payload(access_token).get('https://api.openai.com/auth', {}).get('chatgpt_account_id')
+                if account_id:
+                    headers['chatgpt-account-id'] = account_id
+                    if seed_cookie and path == 'backend-api/subscriptions':
+                        params['account_id'] = account_id
         fp = get_fp(req_token).copy()
 
         session_id = hashlib.md5(req_token.encode()).hexdigest()
@@ -422,6 +496,27 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         # 幂等请求（GET/HEAD/OPTIONS）遇到瞬时 SSL/连接重置自动重试，消除偶发 502
         # （如 GPT 图片 estuary/content、会话轮询 api/auth/session）
         max_attempts = 3 if request.method.upper() in ("GET", "HEAD", "OPTIONS") else 1
+        # 慢上游 GET 响应缓存：models / accounts/check / conversation/{id} 短期内不变，
+        # 命中直接返回，省掉经代理节点的上游往返（页面加载 / 按钮渲染慢的根因）。
+        cache_ttl = resp_cache.cacheable(path, request.method)
+        cache_key = None
+        if cache_ttl:
+            cache_key = (req_token, path, tuple(sorted(params.items())),
+                         context['revision'] if context else '')
+            cached = resp_cache.get(cache_key)
+            if cached is not None:
+                content = _rewrite_and_scrub(
+                    cached["content"], path=path, base_url=base_url, petrol=petrol,
+                    origin_host=origin_host, seed_cookie=seed_cookie,
+                    content_type=cached["rheaders"].get("content-type", ""),
+                )
+                out_headers = {
+                    "cache-control": cached["rheaders"].get("cache-control", ""),
+                    "content-type": cached["rheaders"].get("content-type", ""),
+                    "expires": cached["rheaders"].get("expires", ""),
+                    "content-disposition": cached["rheaders"].get("content-disposition", ""),
+                }
+                return Response(content=content, headers=out_headers, status_code=cached["status"])
         client = None
         try:
             r, client = await _request_with_retry(
@@ -439,8 +534,6 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                                 .replace("cdn.oaistatic.com", origin_host)
                                 .replace("https", petrol)}, background=background)
             elif 'stream' in r.headers.get("content-type", ""):
-                logger.info(f"Request token: {req_token}")
-                logger.info(f"Request proxy: {proxy_url}")
                 logger.info(f"Request UA: {user_agent}")
                 logger.info(f"Request impersonate: {impersonate}")
                 conv_key = r.cookies.get("conv_key", "")
@@ -462,46 +555,27 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                                         status_code=r.status_code, background=background)
                 else:
                     content = await r.atext()
-                    if "public-api/" in path:
-                        content = (content
-                                   .replace("https://ab.chatgpt.com", f"{petrol}://{origin_host}")
-                                   .replace("https://cdn.oaistatic.com", f"{petrol}://{origin_host}")
-                                   .replace("webrtc.chatgpt.com", voice_host if voice_host else "webrtc.chatgpt.com")
-                                   .replace("files.oaiusercontent.com", file_host if file_host else "files.oaiusercontent.com")
-                                   .replace("chatgpt.com/ces", f"{origin_host}/ces")
-                                   )
-                    else:
-                        content = (content
-                                   .replace("https://ab.chatgpt.com", f"{petrol}://{origin_host}")
-                                   .replace("https://cdn.oaistatic.com", f"{petrol}://{origin_host}")
-                                   .replace("webrtc.chatgpt.com", voice_host if voice_host else "webrtc.chatgpt.com")
-                                   .replace("files.oaiusercontent.com", file_host if file_host else "files.oaiusercontent.com")
-                                   .replace("web-sandbox.oaiusercontent.com", f"{origin_host}/sandbox")
-                                   .replace("https://chatgpt.com", f"{petrol}://{origin_host}")
-                                   .replace("chatgpt.com/ces", f"{origin_host}/ces")
-                                   )
-                    if base_url == "https://web-sandbox.oaiusercontent.com":
-                        content = content.replace("/assets", "/sandbox/assets")
-                    # 定向脱敏：镜像用户（有 seed cookie）访问 backend-api JSON 时，抹除已知身份字段，
-                    # 防止 catch-all 透传把账号持有者真实身份（email/name/phone 等）泄漏给镜像用户。
-                    if seed_cookie and "backend-api/" in path and "application/json" in r.headers.get("content-type", ""):
-                        try:
-                            payload = json.loads(content)
-                            _scrub_identity_fields(payload)
-                            content = json.dumps(payload, ensure_ascii=False)
-                        except (ValueError, TypeError):
-                            # 非合法 JSON（如 HTML 片段）跳过脱敏，保持原样透传
-                            pass
+                    # 缓存慢上游 GET 的原始 body（改写/脱敏前的原文），命中时走同一条 _rewrite_and_scrub。
+                    # 仅缓存 200 + 文本响应：错误状态码（403/429/500）不得污染缓存，二进制不得被 atext 破坏。
+                    if cache_key and r.status_code == 200 and _is_textual_content(r.headers.get("content-type", "")):
+                        resp_cache.set(cache_key, {
+                            "content": content,
+                            "status": r.status_code,
+                            # 归一化小写键：命中路径用 rheaders.get("content-type") 取 content-type 决定是否脱敏，
+                            # 键大小写是 curl_cffi 库行为而非契约，显式归一化避免升级后静默跳过脱敏
+                            "rheaders": {k.lower(): v for k, v in r.headers.items()},
+                        }, cache_ttl)
+                    content = _rewrite_and_scrub(
+                        content, path=path, base_url=base_url, petrol=petrol,
+                        origin_host=origin_host, seed_cookie=seed_cookie,
+                        content_type=r.headers.get("content-type", ""),
+                    )
                     rheaders = dict(r.headers)
-                    content_type = rheaders.get("content-type", "")
-                    cache_control = rheaders.get("cache-control", "")
-                    expires = rheaders.get("expires", "")
-                    content_disposition = rheaders.get("content-disposition", "")
                     rheaders = {
-                        "cache-control": cache_control,
-                        "content-type": content_type,
-                        "expires": expires,
-                        "content-disposition": content_disposition
+                        "cache-control": rheaders.get("cache-control", ""),
+                        "content-type": rheaders.get("content-type", ""),
+                        "expires": rheaders.get("expires", ""),
+                        "content-disposition": rheaders.get("content-disposition", ""),
                     }
                     response = Response(content=content, headers=rheaders,
                                         status_code=r.status_code, background=background)

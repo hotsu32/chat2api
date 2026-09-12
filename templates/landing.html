@@ -36,27 +36,27 @@
   <div class="wrap">
     <div class="hero">
       <h1>ChatGPT 镜像</h1>
-      <p>稳定不掉线 · 成本优化 · 匿名隐蔽。注册即用，走网页直接聊，不用自己部署号池。</p>
+      <p>稳定不掉线 · 成本优化 · 匿名隐蔽。选一档套餐，走网页直接聊，不用自己部署号池。</p>
       <div>
-        <a class="btn btn-primary" href="/register">免费注册</a>
+        <a class="btn btn-primary" href="/register">注册账号</a>
         <a class="btn btn-ghost" href="/signin">登录</a>
       </div>
     </div>
 
     <div class="grid">
-      {% for tid, t in tiers.items() %}
-      <div class="plan{% if tid == 'plus' %} hot{% endif %}">
-        <div class="name">{{ t.label }}</div>
+      {% for p in plans %}
+      <div class="plan{% if p.tier == 'plus' %} hot{% endif %}">
+        <div class="name">{{ p.kicker }}</div>
         <div class="quota">
-          {% if t.quota_limit %}{{ t.quota_limit }}{% else %}不限{% endif %}
-          <small>次 / {{ '天' if t.quota_period == 'day' else '月' }}</small>
+          ¥{{ p.price }}
+          <small>{{ p.unit }}</small>
         </div>
         <ul>
-          <li>号组：{{ t.account_plan_types | join(' / ') }}</li>
-          <li>并发：{{ t.concurrency }}</li>
-          <li>模型：{{ t.models | join('、') }}</li>
+          <li>{{ p.desc }}</li>
+          <li>有效期：{{ p.days }} 天</li>
+          <li>每日 {% if p.tier == 'pro' %}2000{% else %}500{% endif %} 次对话</li>
         </ul>
-        <div class="enter"><a class="btn btn-primary" href="/register">立即开始</a></div>
+        <div class="enter"><a class="btn btn-primary" href="/store">立即选购</a></div>
       </div>
       {% endfor %}
     </div>

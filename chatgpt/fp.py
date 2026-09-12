@@ -1,5 +1,6 @@
 import json
 import random
+import time
 import uuid
 
 import ua_generator
@@ -8,10 +9,19 @@ from ua_generator.options import Options
 
 import utils.globals as globals
 from utils import configs
+from utils.proxy_health import weighted_choice
 from utils.routing import get_bound_proxy
 
 MAX_SUPPORTED_CHROME_MAJOR = 124
 MIN_SUPPORTED_CHROME_MAJOR = 119
+
+# Static-asset fingerprint cache: CDN 静态资源请求 req_token=""，get_fp 每次走全新生成分支，
+# 随机 UA/impersonate/代理 → 连接池 key 每次不同 → 每个 JS/CSS 子资源一次完整 socks5h 握手。
+# 缓存一份稳定画像复用，让同一页面几十个子资源共享同一条 keep-alive 连接。
+# 带 TTL 到期重建：节点死亡后最多 _STATIC_FP_TTL 内通过 weighted_choice 重选到健康节点。
+_static_fp_cache = None
+_static_fp_cache_at = 0.0
+_STATIC_FP_TTL = 3600.0  # 1h
 
 
 def _stringify_ch_value(value):
@@ -151,7 +161,7 @@ def get_fp(req_token):
             globals.fp_map[req_token] = fp
             globals.persist_fp_token(req_token)
         elif "proxy_url" in fp.keys() and (fp["proxy_url"] is None or fp["proxy_url"] not in configs.proxy_url_list):
-            fp["proxy_url"] = random.choice(configs.proxy_url_list) if configs.proxy_url_list else None
+            fp["proxy_url"] = weighted_choice(configs.proxy_url_list) if configs.proxy_url_list else None
             globals.fp_map[req_token] = fp
             globals.persist_fp_token(req_token)
         if "user-agent" in fp.keys():
@@ -220,7 +230,7 @@ def get_fp(req_token):
         fp = {
             "user-agent": user_agent,
             "impersonate": select_impersonate(user_agent),
-            "proxy_url": bound_proxy or (random.choice(configs.proxy_url_list) if configs.proxy_url_list else None),
+            "proxy_url": bound_proxy or (weighted_choice(configs.proxy_url_list) if configs.proxy_url_list else None),
             "oai-device-id": str(uuid.uuid4()),
             # 浏览器 tab/session 级稳定标识（真实浏览器同一 tab 内不变）
             "oai-session-id": str(uuid.uuid4()),
@@ -253,7 +263,12 @@ def get_fp(req_token):
             fp["sec-ch-ua-form-factors"] = _infer_form_factors(ua.device)
 
         if not req_token:
-            return fp
+            global _static_fp_cache, _static_fp_cache_at
+            now = time.time()
+            if _static_fp_cache is None or now - _static_fp_cache_at > _STATIC_FP_TTL:
+                _static_fp_cache = fp
+                _static_fp_cache_at = now
+            return dict(_static_fp_cache)
         else:
             globals.fp_map[req_token] = fp
             globals.persist_fp_token(req_token)

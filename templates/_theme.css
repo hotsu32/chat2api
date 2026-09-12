@@ -1,0 +1,191 @@
+/* Chat-Share · Swiss 黑白主题（方向 B）
+ * 纯黑白 + 灰阶 · Geist/Geist Mono · 锐利直角 · 发丝线 · 精密栅格
+ * 反 AI slop：无紫渐变 / 无 emoji 图标 / 无圆角卡+左彩边 / 无 Inter 当 display
+ */
+
+:root {
+  --black: #000;
+  --white: #fff;
+  --ink: #0a0a0a;
+  --gray: #666;
+  --gray-2: #999;
+  --gray-3: #c4c4c4;
+  --line: #e3e3e3;
+  --line-strong: #0a0a0a;
+  --paper: #fafafa;
+  --sans: "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--white);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.6;
+  letter-spacing: -0.006em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  text-wrap: pretty;
+}
+a { color: inherit; }
+
+/* ---------------------------------------------------------------- 布局骨架 */
+.page { max-width: 1060px; margin: 0 auto; padding: 56px 40px 96px; }
+.page--narrow { max-width: 720px; }
+.stack > * + * { margin-top: 16px; }
+
+/* 顶部导航 */
+.nav {
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid var(--line-strong); padding-bottom: 16px; margin-bottom: 56px;
+}
+.brand { font-weight: 700; font-size: 18px; letter-spacing: -0.03em; display: flex; align-items: center; gap: 10px; text-decoration: none; }
+.brand .mark { width: 11px; height: 11px; background: var(--black); display: inline-block; }
+.nav-links { display: flex; gap: 26px; align-items: center; font-size: 13px; }
+.nav-links a { color: var(--gray); text-decoration: none; }
+.nav-links a:hover, .nav-links a.is-active { color: var(--black); }
+.nav-user { color: var(--gray); font-family: var(--mono); font-size: 12px; }
+.nav-signout { background: none; border: none; padding: 0; font: inherit; font-size: 13px; color: var(--gray); cursor: pointer; }
+.nav-signout:hover { color: var(--black); }
+
+/* ---------------------------------------------------------------- 排版 */
+h1 { font-weight: 700; font-size: 40px; line-height: 1.08; letter-spacing: -0.035em; margin: 0 0 12px; }
+h2 { font-weight: 600; font-size: 20px; letter-spacing: -0.02em; margin: 0 0 4px; }
+.lede { color: var(--gray); font-size: 15px; max-width: 520px; margin: 0 0 44px; }
+.mono-label {
+  font-family: var(--mono); font-size: 11px; color: var(--gray-2);
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+.mono-label::before { content: "▸ "; color: var(--black); }
+.section-label {
+  font-family: var(--mono); font-size: 11px; color: var(--gray-2); letter-spacing: 0.08em;
+  text-transform: uppercase; padding-bottom: 10px; border-bottom: 1px solid var(--line); margin: 40px 0 20px;
+}
+.muted { color: var(--gray); }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* ---------------------------------------------------------------- 按钮 */
+.btn {
+  display: inline-block; padding: 12px 26px; border: 1px solid var(--black); border-radius: 0;
+  background: var(--black); color: var(--white); font-family: var(--sans); font-size: 14px;
+  font-weight: 500; text-decoration: none; cursor: pointer; text-align: center;
+  transition: background .12s ease, color .12s ease;
+}
+.btn:hover { background: var(--white); color: var(--black); }
+.btn-ghost { background: var(--white); color: var(--black); }
+.btn-ghost:hover { background: var(--black); color: var(--white); }
+.btn-block { display: block; width: 100%; }
+.btn-sm { padding: 9px 18px; font-size: 13px; }
+
+/* ---------------------------------------------------------------- 表单 */
+.field { margin-bottom: 18px; }
+.field label { display: block; font-size: 12px; font-family: var(--mono); letter-spacing: 0.04em; text-transform: uppercase; color: var(--gray); margin-bottom: 7px; }
+.field input {
+  width: 100%; padding: 12px 14px; font-size: 15px; font-family: var(--sans);
+  border: 1px solid var(--line); border-radius: 0; background: var(--white); color: var(--ink); outline: none;
+  transition: border-color .12s ease;
+}
+.field input:focus { border-color: var(--black); }
+.field .hint { font-size: 12px; color: var(--gray-2); margin-top: 6px; }
+.error {
+  border: 1px solid var(--black); background: var(--paper); color: var(--ink);
+  padding: 11px 14px; font-size: 13px; margin-bottom: 20px;
+}
+.error::before { content: "! "; font-family: var(--mono); font-weight: 700; }
+/* 告知，不是报错：同一块地方，但用浅框 + 无「!」前缀，跟 .error 在视觉上分开 */
+.notice {
+  border: 1px solid var(--line); background: var(--paper); color: var(--gray);
+  padding: 11px 14px; font-size: 13px; margin-bottom: 20px;
+}
+
+/* ---------------------------------------------------------------- 三列选择器 */
+.picker { display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px; margin-bottom: 40px; }
+.axis-title { font-family: var(--mono); font-size: 11px; color: var(--gray); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 14px; }
+.axis-title .idx { color: var(--gray-3); margin-right: 8px; }
+.axis-options { display: flex; flex-direction: column; gap: 8px; }
+.opt {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border: 1px solid var(--line); border-radius: 0;
+  background: var(--white); color: var(--black); cursor: pointer;
+  font-family: var(--sans); font-size: 14px; text-align: left;
+  transition: border-color .12s ease, background .12s ease, color .12s ease;
+}
+.opt:hover { border-color: var(--black); }
+.opt .hint { font-family: var(--mono); font-size: 12px; color: var(--gray-2); }
+.opt.is-selected { background: var(--black); border-color: var(--black); color: var(--white); }
+.opt.is-selected .hint { color: #bbb; }
+
+/* ---------------------------------------------------------------- 报价摘要 */
+.summary {
+  border-top: 1px solid var(--black); padding-top: 28px;
+  display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 24px;
+}
+.summary-name { font-weight: 600; font-size: 18px; letter-spacing: -0.02em; }
+.summary-price { font-weight: 700; font-size: 38px; letter-spacing: -0.035em; font-variant-numeric: tabular-nums; }
+.summary-price small { font-family: var(--mono); font-size: 14px; color: var(--gray); font-weight: 400; letter-spacing: 0; }
+
+/* ---------------------------------------------------------------- 卡片 / 套餐 */
+.plans { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0; border: 1px solid var(--black); }
+.plans--single { grid-template-columns: 1fr; }
+.card {
+  border: 1px solid var(--black); padding: 32px 28px; display: flex; flex-direction: column;
+}
+.cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
+@media (max-width: 720px) { .cards, .plans, .picker, .plans-cards { grid-template-columns: 1fr; } }
+.plan { padding: 32px 28px; display: flex; flex-direction: column; border-right: 1px solid var(--line); }
+.plan:last-child { border-right: none; }
+.plan-kicker { font-family: var(--mono); font-size: 11px; color: var(--gray); letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 12px; }
+.plan-name { font-weight: 700; font-size: 24px; letter-spacing: -0.025em; line-height: 1.15; margin-bottom: 8px; }
+.plan-desc { color: var(--gray); font-size: 14px; margin: 0 0 22px; }
+.plan-meta { display: flex; align-items: center; gap: 14px; font-size: 12px; color: var(--gray); margin-bottom: 24px; flex-wrap: wrap; }
+.plan-cta {
+  margin-top: auto; display: block; text-align: center; padding: 13px 0; border: 1px solid var(--black);
+  border-radius: 0; background: var(--black); color: var(--white); text-decoration: none;
+  font-weight: 500; font-size: 14px; transition: background .12s ease, color .12s ease;
+}
+.plan-cta:hover { background: var(--white); color: var(--black); }
+.plan-cta .arr { font-family: var(--mono); margin-left: 6px; }
+
+/* 状态 */
+.ok { color: var(--black); font-weight: 500; display: inline-flex; align-items: center; }
+.ok .sq { width: 8px; height: 8px; background: var(--black); display: inline-block; margin-right: 7px; }
+.warn { color: var(--gray); }
+.warn .sq { width: 8px; height: 8px; background: var(--gray-3); display: inline-block; margin-right: 7px; }
+
+/* ---------------------------------------------------------------- 表格 */
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th {
+  text-align: left; font-family: var(--mono); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--gray); font-weight: 400;
+  border-bottom: 1px solid var(--black); padding: 10px 12px 10px 0;
+}
+.table td { border-bottom: 1px solid var(--line); padding: 14px 12px 14px 0; }
+.table tr:last-child td { border-bottom: none; }
+.table .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.empty { color: var(--gray-2); font-size: 14px; padding: 28px 0; border-bottom: 1px solid var(--line); }
+
+/* 徽章 */
+.badge {
+  display: inline-block; font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em;
+  border: 1px solid var(--black); padding: 2px 8px; text-transform: uppercase;
+}
+.badge--muted { border-color: var(--gray-3); color: var(--gray); }
+
+/* ---------------------------------------------------------------- 认证页 */
+.auth-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 32px 20px; }
+.auth-card { width: 100%; max-width: 400px; }
+.auth-card h1 { font-size: 24px; letter-spacing: -0.025em; margin: 0 0 10px; }
+.auth-card .brand { font-size: 20px; margin-bottom: 8px; }
+.auth-card .sub { color: var(--gray); font-size: 14px; margin: 0 0 30px; line-height: 1.5; }
+.auth-foot { margin-top: 22px; text-align: center; font-size: 13px; color: var(--gray); }
+.auth-foot a { color: var(--black); text-decoration: none; border-bottom: 1px solid var(--black); }
+
+/* ---------------------------------------------------------------- 工具 */
+.foot-links { display: flex; gap: 0; margin-top: 36px; }
+.foot-links .btn { border-right: none; }
+.foot-links .btn:last-child { border-right: 1px solid var(--black); }
+.inline-form { display: inline; }
+.divider { height: 1px; background: var(--line); margin: 40px 0; }

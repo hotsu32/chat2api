@@ -56,6 +56,50 @@ def user_usage_total(seed, since=0) -> int:
     return db + pending
 
 
+def user_events(seed, since=0, limit=500):
+    """Return bounded seed-scoped events from SQLite plus unflushed memory.
+
+    The page only needs ``kind`` and ``created_at``. Keep the internal seed and
+    account identifiers inside this module so presentation code cannot leak them.
+    """
+    if not seed or limit <= 0:
+        return []
+    limit = min(int(limit), 500)
+    events = store.query_seed_usage(seed=seed, since=since, limit=limit)
+    with _lock:
+        events.extend(
+            {"kind": kind, "created_at": created_at}
+            for event_seed, _account, kind, created_at in _pending
+            if event_seed == seed and created_at >= since
+        )
+    events.sort(key=lambda event: event["created_at"], reverse=True)
+    return events[:limit]
+
+
+def user_daily_usage(seed, since=0):
+    """Return local-date and kind usage counts, including unflushed events."""
+    if not seed:
+        return []
+    groups = {
+        (event["date"], event["kind"]): event["count"]
+        for event in store.query_seed_usage_daily(seed=seed, since=since)
+    }
+    with _lock:
+        pending = [
+            (kind, created_at)
+            for event_seed, _account, kind, created_at in _pending
+            if event_seed == seed and created_at >= since
+        ]
+    for kind, created_at in pending:
+        date = time.strftime("%Y-%m-%d", time.localtime(created_at))
+        key = (date, kind)
+        groups[key] = groups.get(key, 0) + 1
+    return [
+        {"date": date, "kind": kind, "count": count}
+        for (date, kind), count in sorted(groups.items(), reverse=True)
+    ]
+
+
 def account_usage(account, since=0) -> int:
     """Aggregated usage count for an account."""
     return store.query_usage_count(account=account, since=since)

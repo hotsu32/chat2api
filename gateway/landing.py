@@ -12,14 +12,18 @@ from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app import app, templates
+import utils.payment as payment
+import utils.plans as plans
 import utils.store as store
-from utils.tiers import list_tiers, normalize_tier_id
+from utils.tiers import list_tiers
 
 
 @app.get("/landing", response_class=HTMLResponse)
 async def landing_page(request: Request):
+    # 落地页只摆月卡做价格锚点（12 种全摆会把首屏冲垮），完整组合在 /store 里选。
+    featured = [p for p in plans.all_plans() if p["duration"] == "1m"]
     return templates.TemplateResponse(
-        "landing.html", {"request": request, "tiers": list_tiers()}
+        "landing.html", {"request": request, "plans": featured, "tiers": list_tiers()}
     )
 
 
@@ -30,13 +34,25 @@ async def tiers_api(request: Request):
 
 @app.post("/api/orders")
 async def create_order(request: Request):
+    """下单占位（旧落地页入口）。金额一律服务端定价，不接受客户端传值。
+
+    真实下单走 ``POST /api/checkout``（见 ``gateway/saas.py``）；本入口保留兼容，
+    同样只建 ``pending`` 单，置 ``paid`` 必须经支付 provider 激活路径。
+
+    未配置支付渠道时同样拒绝建单 —— 与 ``/api/checkout`` 口径一致，
+    否则这里会留下一堆永远付不了款的孤儿单。
+    """
     from gateway.user import _current_email  # 惰性导入，避免与 user 模块的循环依赖
     email = _current_email(request)
+    if not payment.get_provider():
+        raise HTTPException(status_code=503, detail="支付渠道暂未开通，请联系客服")
     body = await request.json()
-    tier_id = normalize_tier_id(body.get("tier_id"))
-    amount = body.get("amount") or ""
+    plan_id = (body.get("tier_id") or "").strip()
+    detail = plans.plan_detail(plan_id)
+    if not detail:
+        raise HTTPException(status_code=400, detail="无效套餐")
     order_id = "ord_" + pysecrets.token_hex(12)
-    store.create_order(order_id, email, tier_id, amount, status="pending")
+    store.create_order(order_id, email, detail["id"], str(detail["price"]), status="pending")
     return JSONResponse(
-        {"order_id": order_id, "tier_id": tier_id, "amount": amount, "status": "pending"}
+        {"order_id": order_id, "tier_id": detail["id"], "amount": detail["price"], "status": "pending"}
     )

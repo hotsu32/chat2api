@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}设置 · Chat-Share{% endblock %}
+{% block content %}
+<div class="mono-label">设置</div>
+<h1>个人设置</h1>
+<p class="lede">账号信息与安全。</p>
+
+<div class="section-label">账号</div>
+<div class="field" style="max-width:420px">
+  <label>邮箱</label>
+  <input type="text" value="{{ email }}" readonly style="background:#fafafa;color:#666">
+</div>
+
+<div class="section-label">修改密码</div>
+{% if pw_msg %}<div class="error" style="max-width:420px">{{ pw_msg }}</div>{% endif %}
+<form method="post" action="/api/password" style="max-width:420px">
+  <div class="field">
+    <label for="old">当前密码</label>
+    <input id="old" name="old" type="password" autocomplete="current-password" required>
+  </div>
+  <div class="field">
+    <label for="new">新密码</label>
+    <input id="new" name="new" type="password" autocomplete="new-password" minlength="8" required>
+    <div class="hint">至少 8 位</div>
+  </div>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button class="btn" type="submit">保存</button>
+</form>
+
+<div class="section-label">邀请</div>
+<p class="muted" style="margin:0">我的邀请码：<span class="mono" style="color:#000">{{ invite_code }}</span></p>
+
+<div class="section-label">会话</div>
+<form method="post" action="/signout"><button class="btn btn-ghost" type="submit">退出登录</button></form>
+{% endblock %}

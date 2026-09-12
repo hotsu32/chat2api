@@ -1,0 +1,33 @@
+{% extends "base_auth.html" %}
+{% block title %}邮箱验证 · Chat-Share{% endblock %}
+{% block content %}
+<div class="brand"><span class="mark"></span>Chat-Share</div>
+
+{% if mode == 'sent' %}
+  {% if sent %}
+    <h1>验证邮件已发送</h1>
+    <p class="sub">我们已向 <b>{{ email }}</b> 发送了一封验证邮件，请查收并点击其中的链接完成验证（30 分钟内有效）。</p>
+  {% else %}
+    <h1>请完成邮箱验证</h1>
+    <p class="sub">当前环境尚未配置邮件服务，请用下方链接完成 <b>{{ email }}</b> 的邮箱验证。</p>
+    {% if dev_link %}<div class="error">开发环境：<a href="{{ dev_link }}" style="color:#000">点此直接验证</a></div>{% endif %}
+  {% endif %}
+  <a class="btn btn-block" href="/signin">去登录</a>
+{% elif state == 'ok' %}
+  <h1>邮箱验证成功</h1>
+  <p class="sub">{{ email }} 已验证，现在可以正常登录使用了。</p>
+  <a class="btn btn-block" href="/signin">去登录</a>
+{% elif state == 'expired' %}
+  <h1>链接已过期</h1>
+  <p class="sub">验证链接有效期为 30 分钟。请重新注册，或联系管理员重发。</p>
+  <a class="btn btn-block btn-ghost" href="/signin">返回登录</a>
+{% elif state == 'used' %}
+  <h1>链接已使用</h1>
+  <p class="sub">该验证链接已经使用过，请直接登录。</p>
+  <a class="btn btn-block" href="/signin">去登录</a>
+{% else %}
+  <h1>链接无效</h1>
+  <p class="sub">验证链接不正确，请确认你点击的是邮件里的完整链接。</p>
+  <a class="btn btn-block btn-ghost" href="/signin">返回登录</a>
+{% endif %}
+{% endblock %}

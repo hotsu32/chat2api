@@ -169,21 +169,31 @@ def _quota_since(period: Optional[str]) -> int:
 
 
 def resolve_user_tier(seed: str) -> Optional[str]:
-    """从 user_auth 解析用户订阅档；无 user_auth 行（运营者 seed / 直传 token）返回 None。
+    """从**已支付且未过期的订单**解析用户当前档位；无 user_auth 行返回 None。
 
     返回 None 是「不设限」的信号：只对 SaaS 注册用户执行档位/额度，车队运营侧走原有
     主链路不受影响（Stage 2 的 fail-open 边界）。
+
+    档位不再读 ``user_auth.tier_id``（那是「注册时写死 free 再也没变过」的死字段），
+    改为每次从 orders 推导 —— orders 是唯一真相源，到期靠算不靠扫表回收。
+    SaaS 用户但无有效套餐时返回 ``""``（有账号无权益），与 None 语义相反，
+    调用方必须用 ``is None`` 区分；本函数对外只承诺「None = 不设限」这一条契约。
+
+    数据层故障会向上抛 ``store.StoreError``：此时我们**无法**判断这个 seed 是运营者
+    还是过期用户，静默按「不设限」处理等于把闸门焊死在开的位置。由 ``enforce_tier``
+    决定怎么收口。
     """
     if not seed:
         return None
+    from utils import entitlements
+    from utils.store import StoreError
+
     try:
-        from utils import store as _store
-        row = _store.get_user_auth_by_seed(seed)
-        if not row:
-            return None
-        return normalize_tier_id(row.get("tier_id"))
+        return entitlements.effective_tier(seed)
+    except StoreError:
+        raise
     except Exception as e:
-        logger.debug(f"[tiers] resolve_user_tier error: {e}")
+        logger.warning(f"[tiers] resolve_user_tier error: {e}")
         return None
 
 
@@ -194,28 +204,53 @@ def user_usage_total(seed: str, tier_id: str) -> int:
     try:
         from utils import usage as _usage
         return _usage.user_usage_total(seed, since)
-    except Exception:
+    except Exception as e:
+        # 用量子系统单独故障时按 0 计（额度闸放行）：此时用户已经通过了
+        # resolve_user_tier 那道闸，确实持有有效套餐，因为统计不出用量就
+        # 把付费用户拒之门外是更糟的误伤。但必须留声 —— 静默的 0 会让
+        # 「额度形同虚设」这件事在日志里查无实据。
+        logger.warning(f"[tiers] usage lookup failed, counting as 0: {e}")
         return 0
 
 
 def enforce_tier(seed: str, model: Optional[str] = None) -> None:
-    """请求前档位执行：模型门禁 + 额度上限。无 user_auth 行时不设限（fail-open）。
+    """请求前档位执行：有效套餐 → 模型门禁 + 额度上限。
 
-    违规抛 :class:`fastapi.HTTPException`（403 模型 / 429 额度），由调用方直接向上返回。
+    三态（见 ``utils.entitlements``）：
+
+      - ``None``  无 user_auth 行（运营者 seed / 直传 token）→ 不设限（fail-open）。
+      - ``""``    SaaS 用户但无未过期的已支付订单 → 402 拒绝（未购买 / 已过期）。
+      - 档位 id   按该档执行模型白名单 + 额度。
+
+    违规抛 :class:`fastapi.HTTPException`（402 无有效套餐 / 403 模型 / 429 额度），
+    由调用方直接向上返回。
+
+    权益数据查不出来时抛 503 而非放行：分不清运营者和过期用户的时候，
+    正确的答案是「暂时不可用」，不是「都放进来」。
     """
-    tier_id = resolve_user_tier(seed)
-    if not tier_id:
+    from fastapi import HTTPException
+    from utils.store import StoreError
+
+    try:
+        tier_id = resolve_user_tier(seed)
+    except StoreError as e:
+        logger.error(f"[tiers] entitlement lookup failed for seed, refusing: {e}")
+        raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
+
+    if tier_id is None:
         return  # 非 SaaS 用户（运营者 seed / 直传 token），不设限
+
+    if not tier_id:
+        # 注册了但没买 / 买过但已过期 —— 不降级到免费档，直接拒绝并引导续费
+        raise HTTPException(status_code=402, detail="套餐已过期或未购买，请前往续费")
 
     tier = get_tier(tier_id) or {}
 
     if model and not tier_allows_model(tier_id, model):
-        from fastapi import HTTPException
         raise HTTPException(status_code=403, detail="当前档位不包含此模型")
 
     limit = tier.get("quota_limit")
     if limit is not None and limit > 0:
         used = user_usage_total(seed, tier_id)
         if used >= limit:
-            from fastapi import HTTPException
             raise HTTPException(status_code=429, detail="当前档位额度已用完")

@@ -6,11 +6,12 @@ import time
 import uuid
 
 from fastapi import Request, HTTPException
-from fastapi.responses import RedirectResponse, StreamingResponse, Response
+from fastapi.responses import RedirectResponse, StreamingResponse, Response, JSONResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 import utils.globals as globals
+from utils import resp_cache
 from app import app
 from chatgpt.authorization import verify_token
 from chatgpt.fp import get_fp
@@ -139,20 +140,21 @@ async def get_gizmos_snorlax_upsert(request: Request):
 
 @app.get("/backend-api/subscriptions")
 async def post_subscriptions(request: Request):
-    return {
-        "id": str(uuid.uuid4()),
-        "plan_type": "free",
-        "seats_in_use": 1,
-        "seats_entitled": 1,
-        "active_until": "2050-01-01T00:00:00Z",
-        "billing_period": None,
-        "will_renew": True,
-        "non_profit_org_discount_applied": None,
-        "billing_currency": "USD",
-        "is_delinquent": False,
-        "became_delinquent_timestamp": None,
-        "grace_period_end_timestamp": None
-    }
+    response = await chatgpt_reverse_proxy(request, 'backend-api/subscriptions')
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    if has_direct_access_token(token) and not request.cookies.get('token'):
+        return response
+    if response.status_code != 200:
+        return JSONResponse({'detail': 'Subscription information unavailable'},
+                            status_code=response.status_code, background=response.background,
+                            headers={'Cache-Control': 'no-store'})
+    # Expose subscription state, never billing identities or payment methods.
+    allowed = ('plan_type', 'seats_in_use', 'seats_entitled', 'active_until',
+               'billing_period', 'will_renew', 'is_delinquent',
+               'became_delinquent_timestamp', 'grace_period_end_timestamp')
+    payload = json.loads(response.body)
+    return JSONResponse({key: payload[key] for key in allowed if key in payload},
+                        background=response.background, headers={'Cache-Control': 'no-store'})
 
 
 @app.api_route("/backend-api/conversations", methods=["GET", "PATCH"])
@@ -237,6 +239,8 @@ async def patch_conversation(request: Request, conversation_id: str):
             raise HTTPException(status_code=404, detail="Conversation not found")
 
     patch_response = (await chatgpt_reverse_proxy(request, f"backend-api/conversation/{conversation_id}"))
+    # PATCH（改标题/归档/删除）已改动会话内容，失效详情缓存，避免 30s 内 GET 命中旧内容
+    resp_cache.invalidate_path_prefix(f"backend-api/conversation/{conversation_id}")
     if is_direct:
         return patch_response
     else:
@@ -255,56 +259,9 @@ async def patch_conversation(request: Request, conversation_id: str):
 
 @app.get("/backend-api/me")
 async def get_me(request: Request):
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    seed = request.cookies.get("token", "").strip()
-    # 镜像用户会话（存在 seed cookie）绝不回传上游真实身份；只有直连 API 客户端才放行
-    if (len(token) == 45 or token.startswith("eyJhbGciOi")) and not seed:
-        return await chatgpt_reverse_proxy(request, "backend-api/me")
-    else:
-        me = {
-            "object": "user",
-            "id": "org-chatgpt",
-            "email": "",
-            "name": "ChatGPT",
-            "picture": "https://cdn.auth0.com/avatars/ai.png",
-            "created": int(time.time()),
-            "phone_number": None,
-            "mfa_flag_enabled": False,
-            "amr": [],
-            "groups": [],
-            "orgs": {
-                "object": "list",
-                "data": [
-                    {
-                        "object": "organization",
-                        "id": "org-chatgpt",
-                        "created": 1715641300,
-                        "title": "Personal",
-                        "name": "user-chatgpt",
-                        "description": "Personal org for chatgpt@openai.com",
-                        "personal": True,
-                        "settings": {
-                            "threads_ui_visibility": "NONE",
-                            "usage_dashboard_visibility": "ANY_ROLE",
-                            "disable_user_api_keys": False
-                        },
-                        "parent_org_id": None,
-                        "is_default": True,
-                        "role": "owner",
-                        "is_scale_tier_authorized_purchaser": None,
-                        "is_scim_managed": False,
-                        "projects": {
-                            "object": "list",
-                            "data": []
-                        },
-                        "groups": [],
-                        "geography": None
-                    }
-                ]
-            },
-            "has_payg_project_spend_limit": True
-        }
-    return Response(content=json.dumps(me, indent=4), media_type="application/json")
+    # The common proxy redacts profile identities while retaining the account's
+    # business metadata (including email_domain_type used by upgrade entrypoints).
+    return await chatgpt_reverse_proxy(request, "backend-api/me")
 
 
 @app.get("/backend-api/tasks")
@@ -484,19 +441,30 @@ async def edge():
 
 @app.api_route("/api/auth/session", methods=["GET", "POST"])
 async def auth_session(request: Request):
-    """拦截 /api/auth/session：返回种子账号的合成 session，不依赖 owner session cookie。
-
-    官网前端水合时会用该接口刷新 session，若返回 owner 身份则与重写后的 client-bootstrap
-    不一致（触发 React #418），且泄漏 owner 凭据。这里按 SeedToken 合成并直接返回。
-    """
+    """Return the bound website session; explicit refresh bypasses its hot cache."""
+    from gateway.frontend_sync import get_frontend_template, get_cached_frontend, FrontendSessionError
+    from gateway.identity import sanitize_session
     token = resolve_seed_token(request)
     try:
         req_token = await get_real_req_token(token)
         access_token = await verify_token(req_token) or ""
-    except Exception:
-        access_token = ""
-    session = build_session(access_token)
-    return Response(content=json.dumps(session, ensure_ascii=False), media_type="application/json")
+        if not access_token:
+            raise HTTPException(status_code=401)
+        await get_frontend_template(
+            req_token, access_token, get_fp(req_token).copy(),
+            refresh=request.query_params.get('refresh') == 'true')
+        context = get_cached_frontend(req_token, access_token)
+        if context is None:
+            raise FrontendSessionError('Website context needs revalidation')
+    except HTTPException as exc:
+        return Response(content='{}', status_code=exc.status_code, media_type='application/json',
+                        headers={'Cache-Control': 'no-store'})
+    except FrontendSessionError:
+        return Response(content='{}', status_code=503, media_type='application/json',
+                        headers={'Cache-Control': 'no-store'})
+    session = sanitize_session(context['session'])
+    return Response(content=json.dumps(session, ensure_ascii=False), media_type="application/json",
+                    headers={'Cache-Control': 'no-store'})
 
 
 if no_sentinel:

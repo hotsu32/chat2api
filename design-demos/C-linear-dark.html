@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat-Share · 方向 C Linear 暗色 Bento</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #08090A;
+    --panel: #0F1013;
+    --panel-2: rgba(255,255,255,0.03);
+    --ink: #EDEDEF;
+    --ink-soft: #8A8F98;
+    --line: rgba(255,255,255,0.08);
+    --accent: #5E6AD2;
+    --accent-soft: #7C86E0;
+    --glow-a: #4EA7FC;
+    --glow-b: #B59AFF;
+    --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    text-wrap: pretty;
+    line-height: 1.6;
+    letter-spacing: -0.01em;
+  }
+  .screen { max-width: 1080px; margin: 0 auto; padding: 64px 40px; }
+  .screen--dash { border-top: 1px solid var(--line); }
+
+  .nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 64px; }
+  .brand { font-weight: 700; font-size: 17px; letter-spacing: -0.02em; display: flex; align-items: center; gap: 10px; }
+  .brand .mark { width: 18px; height: 18px; border-radius: 5px; background: linear-gradient(135deg, var(--glow-a), var(--accent)); display: inline-block; }
+  .nav-links { display: flex; gap: 26px; align-items: center; font-size: 13px; color: var(--ink-soft); }
+  .nav-links a { color: var(--ink-soft); text-decoration: none; }
+  .nav-links a:hover { color: var(--ink); }
+
+  .screen-label { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 20px; }
+  .screen-label::before { content: "/ "; color: var(--accent); }
+
+  h1 { font-weight: 700; font-size: 38px; line-height: 1.1; letter-spacing: -0.03em; margin: 0 0 12px; }
+  .lede { color: var(--ink-soft); font-size: 15px; max-width: 480px; margin: 0 0 48px; }
+
+  .picker { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; margin-bottom: 40px; }
+  .axis-title { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 14px; }
+  .axis-options { display: flex; flex-direction: column; gap: 10px; }
+  .opt {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 13px 16px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel-2); color: var(--ink); cursor: pointer;
+    font-family: var(--sans); font-size: 14px; text-align: left;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .opt:hover { border-color: rgba(255,255,255,0.16); }
+  .opt .hint { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); }
+  .opt.is-selected {
+    border-color: transparent;
+    background: linear-gradient(var(--panel), var(--panel)) padding-box,
+                linear-gradient(135deg, var(--glow-a), var(--accent), var(--glow-b)) border-box;
+    border: 1px solid transparent;
+  }
+  .opt.is-selected .name { color: #fff; font-weight: 600; }
+  .opt.is-selected .hint { color: var(--accent-soft); }
+
+  .summary {
+    border: 1px solid var(--line); border-radius: 14px;
+    background: linear-gradient(var(--panel), var(--panel)) padding-box,
+                linear-gradient(135deg, rgba(94,106,210,0.5), rgba(181,154,255,0.4)) border-box;
+    border: 1px solid transparent;
+    padding: 28px 28px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 24px;
+  }
+  .summary-label { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.08em; }
+  .summary-name { font-weight: 600; font-size: 17px; }
+  .summary-price { font-weight: 700; font-size: 36px; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+  .summary-price small { font-family: var(--mono); font-size: 14px; color: var(--ink-soft); font-weight: 400; }
+  .btn {
+    display: inline-block; padding: 12px 26px; border-radius: 9px;
+    background: var(--accent); color: #fff; border: none; cursor: pointer;
+    font-family: var(--sans); font-size: 14px; font-weight: 500; letter-spacing: -0.01em;
+    text-decoration: none; transition: filter .15s ease;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset, 0 8px 24px -12px rgba(94,106,210,0.5);
+  }
+  .btn:hover { filter: brightness(1.08); }
+  .btn-ghost { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); box-shadow: none; }
+  .btn-ghost:hover { border-color: rgba(255,255,255,0.18); filter: none; }
+
+  .plans { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 18px; }
+  .plan {
+    background: linear-gradient(var(--panel), var(--panel)) padding-box,
+                linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02)) border-box;
+    border: 1px solid transparent; border-radius: 14px;
+    padding: 28px 26px; display: flex; flex-direction: column;
+  }
+  .plan:first-child {
+    background: linear-gradient(var(--panel), var(--panel)) padding-box,
+                linear-gradient(135deg, rgba(94,106,210,0.6), rgba(181,154,255,0.35)) border-box;
+  }
+  .plan-kicker { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 12px; }
+  .plan-name { font-weight: 700; font-size: 22px; letter-spacing: -0.02em; line-height: 1.2; margin-bottom: 8px; }
+  .plan-desc { color: var(--ink-soft); font-size: 14px; margin: 0 0 22px; }
+  .plan-meta { display: flex; align-items: center; gap: 14px; font-size: 12px; color: var(--ink-soft); margin-bottom: 24px; }
+  .ok { color: #9DE0B6; font-weight: 500; }
+  .ok .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #4C9A6B; margin-right: 7px; }
+  .plan-cta {
+    margin-top: auto; display: block; text-align: center; padding: 13px 0; border-radius: 9px;
+    background: var(--accent); color: #fff; text-decoration: none; font-weight: 500; font-size: 14px;
+    transition: filter .15s ease; box-shadow: 0 8px 24px -12px rgba(94,106,210,0.5);
+  }
+  .plan-cta:hover { filter: brightness(1.08); }
+  .plan-cta .arr { margin-left: 6px; }
+
+  .dash-foot { display: flex; gap: 14px; }
+</style>
+</head>
+<body>
+
+  <section class="screen">
+    <nav class="nav">
+      <div class="brand"><span class="mark"></span>Chat-Share</div>
+      <div class="nav-links">
+        <a href="#">超市</a><a href="#">Dashboard</a><a href="#">钱包</a><span>你好，林先生</span>
+      </div>
+    </nav>
+
+    <div class="screen-label">屏 1 · 超市选购</div>
+    <h1>选择你的套餐</h1>
+    <p class="lede">一个入口直达托管好的 ChatGPT，稳定不掉线。选好三件事，价格即出。</p>
+
+    <div class="picker">
+      <div class="axis">
+        <div class="axis-title">账号档次</div>
+        <div class="axis-options">
+          <button class="opt is-selected"><span class="name">Plus</span><span class="hint">日常够用</span></button>
+          <button class="opt"><span class="name">Pro</span><span class="hint">更强模型</span></button>
+        </div>
+      </div>
+      <div class="axis">
+        <div class="axis-title">共享密度</div>
+        <div class="axis-options">
+          <button class="opt is-selected"><span class="name">独享</span><span class="hint">专属号池</span></button>
+          <button class="opt"><span class="name">拼车</span><span class="hint">多人共享</span></button>
+        </div>
+      </div>
+      <div class="axis">
+        <div class="axis-title">时长</div>
+        <div class="axis-options">
+          <button class="opt"><span class="name">1 天</span><span class="hint">¥6</span></button>
+          <button class="opt"><span class="name">1 周</span><span class="hint">¥32</span></button>
+          <button class="opt is-selected"><span class="name">1 月</span><span class="hint">¥99</span></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="summary">
+      <div>
+        <div class="summary-label">已选</div>
+        <div class="summary-name">Plus · 独享 · 1 个月</div>
+      </div>
+      <div class="summary-price">¥99 <small>/ 月</small></div>
+      <a class="btn" href="#">立即下单</a>
+    </div>
+  </section>
+
+  <section class="screen screen--dash">
+    <nav class="nav">
+      <div class="brand"><span class="mark"></span>Chat-Share</div>
+      <div class="nav-links">
+        <a href="#">超市</a><a href="#">Dashboard</a><a href="#">钱包</a><span>你好，林先生</span>
+      </div>
+    </nav>
+
+    <div class="screen-label">屏 2 · Dashboard</div>
+    <h1>你的套餐入口</h1>
+    <p class="lede">点一下就进入聊天，全程不用记任何口令。</p>
+
+    <div class="plans">
+      <div class="plan">
+        <div class="plan-kicker">Plus · 独享 · 月卡</div>
+        <div class="plan-name">ChatGPT Plus 队列</div>
+        <p class="plan-desc">专属 Plus 号池，独立会话，稳定不掉线。</p>
+        <div class="plan-meta">
+          <span class="ok"><span class="dot"></span>服务正常</span>
+          <span>有效期至 2026-10-10 · 剩 30 天</span>
+        </div>
+        <a class="plan-cta" href="#">进入 ChatGPT <span class="arr">→</span></a>
+      </div>
+      <div class="plan">
+        <div class="plan-kicker">Pro · 拼车 · 周卡</div>
+        <div class="plan-name">ChatGPT Pro 队列</div>
+        <p class="plan-desc">共享 Pro 号池，多人共用，性价比之选。</p>
+        <div class="plan-meta">
+          <span class="ok"><span class="dot"></span>服务正常</span>
+          <span>有效期至 2026-09-17 · 剩 7 天</span>
+        </div>
+        <a class="plan-cta" href="#">进入 ChatGPT <span class="arr">→</span></a>
+      </div>
+    </div>
+
+    <div class="dash-foot">
+      <a class="btn btn-ghost" href="#">使用记录</a>
+      <a class="btn btn-ghost" href="#">钱包 / 账户</a>
+    </div>
+  </section>
+
+</body>
+</html>
