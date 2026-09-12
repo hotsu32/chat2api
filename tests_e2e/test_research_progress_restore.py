@@ -207,6 +207,43 @@ def test_upstream_silence_budget_is_unchanged_when_not_configured(
     assert seen and all(value == chat_request_timeout for value in seen)
 
 
+def test_an_unconfigured_research_turn_gets_the_larger_bounded_silence_budget(
+        client, mock_upstream, bound_account, monkeypatch):
+    """The real-risk correction, asserted where it actually takes effect.
+
+    An unconfigured deployment used to hand a research turn the chat budget, so
+    a normal turn that went quiet for minutes between steps was killed with no
+    terminal event.  The gateway must now open the research turn's own upstream
+    client with the bounded research default -- and the ordinary chat turn must
+    keep exactly the budget it had.
+    """
+    from gateway import f_conversation_gateway as gateway_module
+    from gateway.research_progress import DEFAULT_RESEARCH_TIMEOUT
+    from utils.configs import chat_request_timeout
+
+    seen = []
+    real_client = gateway_module.Client
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get('timeout'))
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_module, 'Client', spy)
+    monkeypatch.delenv('CHAT_RESEARCH_TIMEOUT', raising=False)
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream).status_code == 200
+    # The turn's own streaming client is widened; the sentinel preflight is a
+    # short non-streaming exchange and keeps the default deadline on purpose.
+    assert seen[0] == DEFAULT_RESEARCH_TIMEOUT, seen
+    assert DEFAULT_RESEARCH_TIMEOUT > chat_request_timeout
+    assert all(value in (chat_request_timeout, DEFAULT_RESEARCH_TIMEOUT) for value in seen), seen
+
+    # Ordinary chat on the same account is untouched: same conversation, no
+    # research hints, still the chat budget.
+    seen.clear()
+    assert _turn(client, {'token': SEED}).status_code == 200
+    assert seen and all(value == chat_request_timeout for value in seen), seen
+
+
 def test_research_turn_gets_the_configured_silence_budget(
         client, mock_upstream, bound_account, monkeypatch):
     from gateway import f_conversation_gateway as gateway_module
@@ -489,6 +526,76 @@ def test_the_report_route_stays_owner_scoped(client, mock_upstream, bound_accoun
     assert client.get(PROJECTION).status_code == 404
     assert client.get('/backend-api/research-progress/active',
                       cookies={'token': OTHER_SEED}).json() == {'research': False}
+
+
+# ---------------------------------------------------------------------------
+# The panel follows the newest turn, not the newest research turn
+# ---------------------------------------------------------------------------
+# The active poll is what puts the panel on screen.  A chat turn that starts
+# after a research turn used to leave the finished research panel on screen for
+# the whole retention TTL, claiming a research turn was running over an
+# unrelated chat.
+
+ACTIVE = '/backend-api/research-progress/active'
+
+
+def test_a_later_chat_turn_in_the_same_conversation_retires_the_active_panel(
+        client, mock_upstream, bound_account, monkeypatch):
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_report=True).status_code == 200
+    assert client.get(ACTIVE, cookies={'token': SEED}).json()['research'] is True
+
+    # The same conversation, this time an ordinary chat turn.
+    assert _turn(client, {'token': SEED}).status_code == 200
+    assert client.get(ACTIVE, cookies={'token': SEED}).json() == {'research': False}
+
+
+def test_a_later_chat_turn_in_another_conversation_retires_the_active_panel(
+        client, mock_upstream, bound_account, monkeypatch):
+    """The Seed's newest turn is what the panel is about, wherever it runs."""
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_report=True).status_code == 200
+    assert client.get(ACTIVE, cookies={'token': SEED}).json()['research'] is True
+
+    other = dict(_payload(), conversation_id='conv-2')
+    assert client.post('/backend-api/f/conversation', cookies={'token': SEED},
+                       json=other).status_code == 200
+    assert client.get(ACTIVE, cookies={'token': SEED}).json() == {'research': False}
+
+
+def test_the_retired_panel_does_not_take_the_report_with_it(
+        client, mock_upstream, bound_account, monkeypatch):
+    """Retiring the claim must not retire the record a refresh needs.
+
+    The panel is put away because no research turn is *current*; the answer the
+    conversation already produced stays restorable, which is the whole point of
+    retaining it.
+    """
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_report=True).status_code == 200
+    assert _turn(client, {'token': SEED}).status_code == 200
+    assert client.get(ACTIVE, cookies={'token': SEED}).json() == {'research': False}
+
+    before = len(mock_upstream.records)
+    restored = client.get(PROJECTION, cookies={'token': SEED})
+    assert restored.status_code == 200
+    assert restored.json()['projection']['report'] == RESEARCH_REPORT
+    assert len(mock_upstream.records) == before, 'a restore must not re-run the turn'
+
+
+def test_a_second_research_turn_puts_the_panel_back(
+        client, mock_upstream, bound_account, monkeypatch):
+    """Retiring on a chat turn must not mean "never again" for the Seed."""
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream).status_code == 200
+    assert _turn(client, {'token': SEED}).status_code == 200
+    assert client.get(ACTIVE, cookies={'token': SEED}).json() == {'research': False}
+
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_report=True).status_code == 200
+    body = client.get(ACTIVE, cookies={'token': SEED}).json()
+    assert body['research'] is True
+    assert body['conversation_id'] == CONVERSATION
+    assert body['projection']['report'] == RESEARCH_REPORT
 
 
 def test_a_turn_with_no_answer_body_reports_none_rather_than_inventing_one(

@@ -105,9 +105,19 @@ _FINGERPRINT_FIELD_LIMIT = 24
 _FINGERPRINT_FIELD_CHARS = 48
 
 # Research turns idle for minutes between steps while the measured upstream
-# silence tolerance is roughly `timeout + 6s` (see the evidence note).  This
-# knob widens only research turns; unset means no behaviour change at all.
+# silence tolerance is roughly `timeout + 6s` (see the evidence note), so the
+# ordinary chat budget kills a healthy research turn.  A research turn therefore
+# gets its own *bounded* default rather than the chat budget, and the knob below
+# still overrides it outright.
 RESEARCH_TIMEOUT_ENV = "CHAT_RESEARCH_TIMEOUT"
+# Five minutes of tolerated upstream silence: ten times the shipped chat default
+# (``CHAT_REQUEST_TIMEOUT`` = 30), never below whatever an operator configured for
+# chat.  Bounded on purpose: this is a low-speed watchdog, not a turn deadline,
+# so it only ever decides how long a stream may be *completely* quiet before the
+# connection is treated as dead -- a stream that keeps talking is never cut by
+# it.  Long enough for the minutes-long gaps a real research turn has, short
+# enough that a genuinely dead upstream is still noticed promptly.
+DEFAULT_RESEARCH_TIMEOUT = 300
 _RESEARCH_MODEL_MARKERS = ("deep-research", "deepresearch")
 _RESEARCH_MODEL_SLUGS = {"research"}
 _RESEARCH_SYSTEM_HINTS = {
@@ -692,20 +702,34 @@ def stream_timeout_for(body, default=None) -> float:
     With ``stream=True`` a scalar ``timeout`` is not a stream deadline: curl_cffi
     maps it to a low-speed watchdog (``curl_cffi/requests/utils.py``), so the
     measured effect is "how long may upstream go quiet", not "how long may the
-    turn run".  A research turn legitimately idles far longer than a chat turn,
-    so it may be given its own budget.  Unset (the default) changes nothing.
+    turn run".  A research turn legitimately idles for minutes between steps, so
+    leaving it on the chat budget kills it mid-turn -- the stream simply stops
+    with no terminal event, which is exactly the failure mode the retention work
+    exists to avoid.
+
+    Three cases, in order:
+
+    * an ordinary chat turn keeps the budget it always had, unchanged;
+    * an explicit ``CHAT_RESEARCH_TIMEOUT`` wins outright for research turns, in
+      both directions -- an operator asking for a *shorter* budget than the
+      default means it;
+    * otherwise a research turn gets ``DEFAULT_RESEARCH_TIMEOUT``, never below
+      whatever an operator configured for chat.  A value that cannot be parsed,
+      or that is not positive, counts as "not configured" rather than as a
+      budget -- a typo must not shorten a research turn.
     """
     budget = chat_request_timeout if default is None else default
     if not is_research_turn(body):
         return budget
+    research_default = max(budget, DEFAULT_RESEARCH_TIMEOUT)
     raw = (os.getenv(RESEARCH_TIMEOUT_ENV) or "").strip()
     if not raw:
-        return budget
+        return research_default
     try:
         value = float(raw)
     except ValueError:
-        return budget
-    return value if value > 0 else budget
+        return research_default
+    return value if value > 0 else research_default
 
 
 class Recorder:
@@ -783,7 +807,14 @@ class _Progress:
         self.state = "streaming"
         self.truncated = False
         self.updated_at = time.time()
+        # Two different questions, two different flags.  ``research`` is sticky:
+        # it marks a conversation that has a retained research turn, which is
+        # what keeps that turn's projection alive for the restore route.
+        # ``current_turn_research`` describes the turn that is running *now*,
+        # which is what the active poll answers -- a chat turn on the same
+        # conversation refreshes the record without reviving the panel.
         self.research = bool(research)
+        self.current_turn_research = bool(research)
         self.started_at = self.updated_at
         # Set exactly once, by the first terminal signal observed for this turn.
         # Everything the panel shows as "how long it took" is computed against
@@ -873,7 +904,12 @@ class ResearchProgressStore:
                 record.report = ""
                 record.report_final = False
                 record.report_truncated = False
+                # Sticky: the conversation keeps its retained research turn for
+                # the restore route.  Per-turn: this turn decides whether the
+                # research panel is current, so a chat turn on the same
+                # conversation puts the panel away instead of refreshing it.
                 record.research = record.research or bool(research)
+                record.current_turn_research = bool(research)
                 if research:
                     record.action = ACTION_STARTING
             return True
@@ -1022,15 +1058,29 @@ class ResearchProgressStore:
             }
 
     def active_snapshot(self, owner: str):
-        """Return the newest research projection owned by one Seed."""
+        """Return the newest research projection owned by one Seed.
+
+        "Is a research turn current for this Seed?" is a question about the
+        Seed's *newest* turn, not about whether research ever ran.  A chat turn
+        that starts after a research turn -- in the same conversation or in
+        another one -- makes the retained research panel stale, so this returns
+        ``{"research": False}`` and the browser puts the panel away instead of
+        leaving a finished report over an unrelated turn.
+
+        The retained record itself is deliberately *not* discarded: the
+        per-conversation restore route keeps serving it, which is what makes a
+        finished report still reachable on the page that ran it.
+        """
         now = time.time()
         with self._lock:
             candidates = [record for record in self._records.values()
-                          if record.owner == owner and record.research
+                          if record.owner == owner
                           and now - record.updated_at <= self.record_ttl]
             if not candidates:
                 return {"research": False}
             record = max(candidates, key=lambda item: item.updated_at)
+            if not record.current_turn_research:
+                return {"research": False}
             return self._view(record, now)
 
     def projection_snapshot(self, conversation_id: str, owner: str):

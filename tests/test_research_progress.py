@@ -33,6 +33,7 @@ from gateway.research_progress import (
     KIND_STREAM_COMPLETE,
     KIND_TERMINAL,
     KIND_TITLE_GENERATION,
+    DEFAULT_RESEARCH_TIMEOUT,
     ResearchProgressStore,
     classify,
     conversation_id_of,
@@ -312,12 +313,50 @@ async def test_abandoning_a_heartbeat_wrapped_stream_closes_it():
     assert closed == [True]
 
 
-def test_research_turn_silence_budget_defaults_to_the_existing_timeout(monkeypatch):
-    """Unset means no behaviour change: capacity semantics stay where they were."""
+def test_an_ordinary_chat_turn_keeps_the_existing_silence_budget(monkeypatch):
+    """The correction must not move capacity for ordinary chat at all."""
     from utils.configs import chat_request_timeout
     monkeypatch.delenv("CHAT_RESEARCH_TIMEOUT", raising=False)
     assert stream_timeout_for({"model": "gpt-5-6"}) == chat_request_timeout
-    assert stream_timeout_for({"model": "o3-deep-research"}) == chat_request_timeout
+    assert stream_timeout_for({"model": "gpt-5-6-thinking"}) == chat_request_timeout
+    assert stream_timeout_for({"messages": []}) == chat_request_timeout
+
+
+def test_a_research_turn_gets_its_own_bounded_default_not_the_chat_budget(monkeypatch):
+    """A normal long research turn must not be killed at the chat silence budget.
+
+    Measured on a real turn: research steps idle for minutes while the chat
+    budget tolerates roughly `timeout + 6s` of silence, so an unconfigured
+    deployment cut healthy research turns mid-stream -- no terminal event, the
+    turn recorded as failed.  The default is its own bounded value, larger than
+    the chat budget and smaller than a turn deadline.
+    """
+    from utils.configs import chat_request_timeout
+    monkeypatch.delenv("CHAT_RESEARCH_TIMEOUT", raising=False)
+    assert DEFAULT_RESEARCH_TIMEOUT > chat_request_timeout, \
+        "the research default must be strictly larger than the chat budget"
+    for research_body in ({"model": "o3-deep-research"},
+                          {"model": "research"},
+                          {"model": "gpt-5-6-thinking",
+                           "system_hints": ["plugin:connector_openai_deep_research"]},
+                          {"system_hints": ["research"]}):
+        assert stream_timeout_for(research_body) == DEFAULT_RESEARCH_TIMEOUT, research_body
+
+
+def test_the_research_default_is_bounded_rather_than_an_open_deadline(monkeypatch):
+    """No retries, no unbounded timeout: a dead upstream is still noticed."""
+    monkeypatch.delenv("CHAT_RESEARCH_TIMEOUT", raising=False)
+    assert 0 < DEFAULT_RESEARCH_TIMEOUT <= 60 * 30, \
+        "a silence watchdog must still fail a dead connection in bounded time"
+    assert stream_timeout_for({"model": "research"}) == DEFAULT_RESEARCH_TIMEOUT
+
+
+def test_the_research_default_is_never_below_a_configured_chat_budget(monkeypatch):
+    """An operator who raised the chat budget must not see research cut shorter."""
+    monkeypatch.delenv("CHAT_RESEARCH_TIMEOUT", raising=False)
+    import gateway.research_progress as module
+    monkeypatch.setattr(module, "chat_request_timeout", DEFAULT_RESEARCH_TIMEOUT * 3)
+    assert stream_timeout_for({"model": "research"}) == DEFAULT_RESEARCH_TIMEOUT * 3
 
 
 def test_official_research_slug_is_treated_as_a_research_turn(monkeypatch):
@@ -329,16 +368,28 @@ def test_official_research_slug_is_treated_as_a_research_turn(monkeypatch):
 
 def test_research_turn_can_be_given_a_longer_silence_budget(monkeypatch):
     from utils.configs import chat_request_timeout
-    monkeypatch.setenv("CHAT_RESEARCH_TIMEOUT", str(chat_request_timeout * 10))
-    assert stream_timeout_for({"model": "o3-deep-research"}) == chat_request_timeout * 10
-    assert stream_timeout_for({"system_hints": ["research"]}) == chat_request_timeout * 10
+    monkeypatch.setenv("CHAT_RESEARCH_TIMEOUT", str(DEFAULT_RESEARCH_TIMEOUT * 2))
+    assert stream_timeout_for({"model": "o3-deep-research"}) == DEFAULT_RESEARCH_TIMEOUT * 2
+    assert stream_timeout_for({"system_hints": ["research"]}) == DEFAULT_RESEARCH_TIMEOUT * 2
     assert stream_timeout_for({"model": "gpt-5-6"}) == chat_request_timeout
 
 
-def test_invalid_research_timeout_is_ignored_rather_than_crashing_a_turn(monkeypatch):
+def test_an_explicit_shorter_research_budget_is_honoured(monkeypatch):
+    """An operator asking for a shorter watchdog than the default means it."""
+    from utils.configs import chat_request_timeout
+    monkeypatch.setenv("CHAT_RESEARCH_TIMEOUT", str(chat_request_timeout * 4))
+    assert stream_timeout_for({"model": "research"}) == chat_request_timeout * 4
+
+
+def test_invalid_research_timeout_falls_back_to_the_research_default(monkeypatch):
+    """A typo must not shorten a research turn back to the chat budget."""
     from utils.configs import chat_request_timeout
     monkeypatch.setenv("CHAT_RESEARCH_TIMEOUT", "not-a-number")
-    assert stream_timeout_for({"model": "o3-deep-research"}) == chat_request_timeout
+    assert stream_timeout_for({"model": "o3-deep-research"}) == DEFAULT_RESEARCH_TIMEOUT
+    assert stream_timeout_for({"model": "gpt-5-6"}) == chat_request_timeout
+    for unusable in ("0", "-5", "  "):
+        monkeypatch.setenv("CHAT_RESEARCH_TIMEOUT", unusable)
+        assert stream_timeout_for({"model": "o3-deep-research"}) == DEFAULT_RESEARCH_TIMEOUT, unusable
 
 
 # ---------------------------------------------------------------------------
