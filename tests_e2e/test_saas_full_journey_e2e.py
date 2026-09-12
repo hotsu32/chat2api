@@ -69,6 +69,11 @@ def _upstream_records(mock_upstream, path=CONVERSATION_PATH):
     return [r for r in mock_upstream.records if r["path"].split("?")[0] == path]
 
 
+def _plan_days(plan_id):
+    import utils.plans as plans
+    return plans.plan_detail(plan_id)["days"]
+
+
 def _live_holders(account):
     """当前真实占用该号的活动/试用 Seed 数（容量口径与 seed_lifecycle 一致）。"""
     with store._connect() as conn:
@@ -220,6 +225,20 @@ def test_single_user_full_saas_journey(client, client_factory, mock_upstream, mo
     assert _chat(client, seed, stream=False).status_code == 200, "续费后必须能继续聊天"
     assert trials.trial_state(EMAIL)["used"] == 3, "曾付费用户不得回落到注册试用"
 
+    # -- 8b. 到期前同档续费：叠加有效期，且不得出现并行的活动入口卡片 --------------
+    month = _plan_days(PLUS_PLAN) * 86400
+    latest = max(o["expires_at"] for o in store.list_orders(email=EMAIL)
+                 if o["status"] == "paid" and o["tier_id"] == PLUS_PLAN)
+    before_ids = {o["order_id"] for o in store.list_orders(email=EMAIL)}
+    assert _checkout(client, PLUS_PLAN).status_code == 200
+    stacked = [o for o in store.list_orders(email=EMAIL) if o["order_id"] not in before_ids]
+    assert len(stacked) == 1
+    assert stacked[0]["expires_at"] == latest + month, "续费应从现有到期时间往后叠"
+
+    active = [s for s in _user_subscriptions(EMAIL) if s["healthy"]]
+    assert [s["plan_id"] for s in active] == [PLUS_PLAN], "同档续费产生了并行的活动卡片"
+    assert client.get("/dashboard").text.count("进入 ChatGPT") == 1, "同档续费多给了一个入口"
+
     # -- 9. Plus → Pro 升级：改绑健康 Pro 号，并释放旧 Plus 号的真实容量 -----------
     assert _checkout(client, PRO_PLAN).status_code == 200
     row = store.get_user(seed)
@@ -229,6 +248,18 @@ def test_single_user_full_saas_journey(client, client_factory, mock_upstream, mo
     body = client.get("/dashboard").text
     assert "ChatGPT Pro 队列" in body and "服务正常" in body
     _assert_no_free_product(body)
+
+    # 绑定只有一个，入口也只能有一个：生效档次是 Pro 时，旧 Plus 有效期不再显示为可用服务
+    subs_after = _user_subscriptions(EMAIL)
+    serviceable = [s for s in subs_after if s["serviceable"]]
+    assert len(serviceable) == 1, \
+        f"升级后应恰好剩一个可用入口，实际 {[(s['plan_id'], s['status_text']) for s in subs_after]}"
+    assert serviceable[0]["plan_id"] == PRO_PLAN
+    assert not [s for s in subs_after if s["healthy"] and s["plan_id"] != PRO_PLAN], \
+        "旧档位仍在展示活动服务卡"
+    assert body.count("进入 ChatGPT") == 1, "Dashboard 并列展示了多个可用入口"
+    # 付过钱的历史不能被抹掉：已过期的那张单如实留着
+    assert [s["status_text"] for s in subs_after].count("已过期") == 1
 
     assert _chat(client, seed, stream=False).status_code == 200
     assert f"Bearer {pro_token}" == _upstream_records(mock_upstream)[-1]["authorization"], \

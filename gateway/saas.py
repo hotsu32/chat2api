@@ -131,6 +131,13 @@ def _user_subscriptions(email: str) -> list:
 
     卡片口径必须与 ``entitlements.active_orders`` 一致：权益层认的订单这里就得显示，
     否则老用户会「有权益但看不到卡片」，既没有续费入口，Dashboard 还会把他弹回超市。
+
+    ``healthy`` 只说明这张订单自己没过期。可用的绑定只有一个，**入口也只能有一个**：
+    有多张活动卡片时 Dashboard 会并列渲染多个「进入 ChatGPT」，而它们指向同一个
+    Seed、只有一张能对上当前绑定 —— 到期前同档续费（叠加出第二段窗口）和 Plus 升 Pro
+    （旧档还没到期）都会命中。所以活动卡片只保留**生效档次**（最高有效档，与
+    ``_seed_binding`` 及权益层同口径）里到期最晚的那张。已过期的卡片是付款历史，
+    原样保留：不删订单、不改支付记录，只是不再把它当作现在能用的服务。
     """
     now = int(time.time())
     binding = _seed_binding(email)
@@ -177,8 +184,25 @@ def _user_subscriptions(email: str) -> list:
             "healthy": healthy,
             "serviceable": serviceable,
             "status_text": status_text,
+            # 归并活动卡片用的内部字段，返回前剔除（不进模板上下文）。
+            "_tier": detail["tier"] if detail else card["plan_id"],
+            "_expires": expires,
         })
-    return subs
+
+    # 活动入口只留一个：生效档次里到期最晚的那张。直接询问权益层的
+    # 公开接口，避免展示层依赖其私有档次排序实现。
+    active = [s for s in subs if s["healthy"]]
+    current = []
+    if active:
+        effective_tier = entitlements.effective_tier_for_email(email, now)
+        candidates = [s for s in active if s["_tier"] == effective_tier]
+        if candidates:
+            current = [max(candidates, key=lambda s: s["_expires"])]
+    history = [s for s in subs if not s["healthy"]]
+    for s in subs:
+        s.pop("_tier")
+        s.pop("_expires")
+    return current + history
 
 
 def _legacy_card(order: dict) -> Optional[tuple]:
