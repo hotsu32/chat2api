@@ -200,6 +200,9 @@ session_trim_to_last_user = is_true(os.getenv('SESSION_TRIM_TO_LAST_USER', True)
 fleet_db_path = os.getenv('FLEET_DB_PATH', os.path.join('data', 'chat2api.db'))
 # 用量统计内存计数 → usage_events 落库间隔（秒）
 usage_flush_interval_seconds = int(os.getenv('USAGE_FLUSH_INTERVAL_SECONDS', 60))
+# Explicit bound for shared/trial SaaS bindings, separate from request concurrency.
+# Zero means unconfigured (deny shared allocation); solo always has one binding.
+max_shared_seeds_per_account = int(os.getenv('FLEET_MAX_SHARED_SEEDS_PER_ACCOUNT', 0))
 
 # ---- 用户侧 SaaS（Stage 1 注册/登录；Stage 0 档位）----
 user_session_secret = os.getenv('USER_SESSION_SECRET', '').strip()
@@ -259,9 +262,25 @@ user_debug_links = is_true(os.getenv('USER_DEBUG_LINKS', False))
 # ---- 支付 ----
 # 支付渠道：留空 = 关闭下单（fail-closed，防止没接真支付时被白拿套餐）。
 # 目前可选：mock（演示，立即成功且不扣款，仅供本地联调）。
+app_env = os.getenv('APP_ENV', 'production').strip().lower()
 payment_provider = os.getenv('PAYMENT_PROVIDER', '').strip().lower()
+# 结算币种（服务端口径）：回调必须声明同一币种，否则拒绝激活。
+# 服务端不接受「回调说了算」——订单金额与币种都必须与库里/配置里的一致。
+payment_currency = (os.getenv('PAYMENT_CURRENCY', 'CNY').strip().upper() or 'CNY')
 # 未支付订单的保留时长（秒），超时视为废单，默认 30 分钟
 order_pending_ttl = int(os.getenv('ORDER_PENDING_TTL', 30 * 60))
+
+# ---- 开发 / 运营专用入口（默认关闭）----
+# /try、/demo 这类绕过注册与订阅的演示入口，以及公开档位目录里的非售卖档（free），
+# 只有显式打开本开关才可达。默认关：生产环境必须显式配置才能暴露这些入口，
+# 免得「部署时忘了关」变成任何人都能进核心聊天页的后门。
+# 打开它同时保留本地开发时对 /try、/demo、free 档目录的访问。
+dev_access_enabled = is_true(os.getenv('DEV_ACCESS_ENABLED', False))
+
+# ---- 运营审计 ----
+# 敏感池 / 支付 / 用户操作的审计库（独立 SQLite 文件，与车队库分开）。
+# 只记动作、对象匿名 id 与白名单内的非敏感字段，绝不写 token / cookie / 邮箱原文。
+audit_db_path = os.getenv('AUDIT_DB_PATH', os.path.join('data', 'audit.db'))
 
 
 def smtp_configured() -> bool:
@@ -353,4 +372,9 @@ logger.info("USER_SESSION_SECRET: " + str(bool(user_session_secret)))
 logger.info("REQUIRE_EMAIL_VERIFICATION: " + str(require_email_verification))
 logger.info("USER_TRUSTED_PROXIES: " + (f"{len(user_trusted_proxies)} rule(s)" if user_trusted_proxies else " (none, XFF ignored)"))
 logger.info("USER_DEBUG_LINKS:    " + str(user_debug_links))
+logger.info("------------------------- Payment ---------------------------")
+logger.info("APP_ENV:            " + str(app_env))
+logger.info("PAYMENT_PROVIDER:   " + (payment_provider or " (none, checkout disabled)"))
+logger.info("PAYMENT_CURRENCY:   " + str(payment_currency))
+logger.info("DEV_ACCESS_ENABLED: " + str(dev_access_enabled))
 logger.info("-" * 60)

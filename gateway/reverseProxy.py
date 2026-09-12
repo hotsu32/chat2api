@@ -10,8 +10,8 @@ from fastapi.responses import StreamingResponse, Response
 from starlette.background import BackgroundTask
 
 import utils.globals as globals
-from chatgpt.authorization import verify_token, get_req_token
-from chatgpt.fp import get_fp
+from chatgpt.authorization import verify_token, get_req_token, reject_development_alias
+from chatgpt.fp import extract_header_fp, get_fp
 from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import chatgpt_base_url_list, sentinel_proxy_url_list, force_no_history, file_host, voice_host, accept_language
@@ -20,6 +20,8 @@ from gateway.identity import decode_jwt_payload
 from gateway.sse_parser import extract_data_json, iter_sse_events_async
 from utils.usage import record_usage
 from utils.tiers import enforce_tier
+from gateway.generation import admit_generation, generation_lifetime, track_generation_client
+from gateway.generation import observe_generation_stream
 from utils import resp_cache
 
 
@@ -224,6 +226,15 @@ async def get_real_req_token(token):
         return req_token
     else:
         req_token = get_req_token("", token)
+        if not req_token:
+            from utils import store
+            try:
+                registered = store.get_user_auth_by_seed(token, strict=True)
+            except store.StoreError:
+                raise HTTPException(503, 'Account allocation unavailable') from None
+            if registered:
+                raise HTTPException(503, 'No eligible account capacity available')
+            raise HTTPException(401, 'No account available')
         return req_token
 
 
@@ -232,10 +243,17 @@ def resolve_seed_token(request: Request) -> str:
 
     浏览器前端会把账号持有者抓取 logged_in HTML 时带出的 client-bootstrap JWT 塞进
     Authorization 头；若以它为准，所有用户会串号到同一账号。真正的用户身份是 `token` cookie。
+
+    开发别名（``frontend-proof-*``）在这里一并被拒：HTML 入口的闸只挡浏览器，
+    而本函数是每一条后端路由读取调用者身份的唯一入口（``gateway/account.py``、
+    ``gateway/backend.py``、``gateway/f_conversation_gateway.py``、
+    ``gateway/resource_proxy.py`` 都走这里）。别名是开发闸门专用的真实账号句柄，
+    闸门关闭时必须在**读到身份的那一刻**就不存在，而不是等到页面或某一条链路去挡。
     """
     seed = request.cookies.get("token", "").strip()
     if not seed:
         seed = request.headers.get("authorization", "").replace("Bearer ", "").strip()
+    reject_development_alias(seed)
     return seed
 
 
@@ -282,7 +300,7 @@ async def _request_with_retry(method, url, *, params, headers, cookies, data, ma
             last_exc = e
             if attempt < max_attempts - 1 and _is_transient_network_error(e):
                 logger.warning(
-                    f"[retry] transient network error ({attempt + 1}/{max_attempts}) for {url}: {str(e)[:120]}"
+                    f"[retry] transient network error attempt={attempt + 1}/{max_attempts} kind={type(e).__name__}"
                 )
                 await asyncio.sleep(0.4 * (attempt + 1))
                 continue
@@ -291,6 +309,12 @@ async def _request_with_retry(method, url, *, params, headers, cookies, data, ma
 
 
 def save_conversation(token, conversation_id, title=None):
+    entry = globals.seed_map.get(token)
+    if not isinstance(entry, dict):
+        return False
+    conversations = entry.setdefault("conversations", [])
+    if not isinstance(conversations, list):
+        conversations = entry["conversations"] = list(conversations) if isinstance(conversations, (tuple, set)) else []
     if conversation_id not in globals.conversation_map:
         conversation_detail = {
             "id": conversation_id,
@@ -305,17 +329,18 @@ def save_conversation(token, conversation_id, title=None):
         globals.conversation_map[conversation_id]["update_time"] = generate_current_time()
         if title:
             globals.conversation_map[conversation_id]["title"] = title
-    if conversation_id not in globals.seed_map[token]["conversations"]:
-        globals.seed_map[token]["conversations"].insert(0, conversation_id)
+    if conversation_id not in conversations:
+        conversations.insert(0, conversation_id)
     else:
-        globals.seed_map[token]["conversations"].remove(conversation_id)
-        globals.seed_map[token]["conversations"].insert(0, conversation_id)
+        conversations.remove(conversation_id)
+        conversations.insert(0, conversation_id)
     globals.persist_conversation(token, conversation_id)
-    globals.persist_seed_map()
+    globals.persist_seed(token)
     # 会话内容已变（新消息），失效该会话详情缓存，避免后续 GET 命中旧内容
     resp_cache.invalidate_path_prefix(f"backend-api/conversation/{conversation_id}")
     if title:
         logger.info(f"Conversation ID: {conversation_id}, Title: {title}")
+    return True
 
 
 def _conversation_fields(payload):
@@ -352,16 +377,22 @@ async def content_generator(r, token, history=True):
                     if event_cid and not conversation_id:
                         conversation_id = event_cid
                         save_conversation(token, conversation_id)
-                        title = globals.conversation_map[conversation_id].get("title")
+                        title = (globals.conversation_map.get(conversation_id) or {}).get("title")
                     # 没有 conversation_id 就落库会写出无主记录，必须先等到 id
                     if event_title and not title and conversation_id:
                         title = event_title
                         save_conversation(token, conversation_id, title)
             except Exception:
-                pass
+                # Do not let bookkeeping break the upstream stream, but make a
+                # failed ownership record observable without exposing IDs/tokens.
+                logger.warning(
+                    f"[conversation] record_failed seed={hashlib.sha256(str(token).encode()).hexdigest()[:12]} "
+                    "reason=bookkeeping_error"
+                )
         yield event
 
 
+@generation_lifetime
 async def chatgpt_reverse_proxy(request: Request, path: str):
     try:
         origin_host = request.url.netloc
@@ -423,7 +454,10 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         else:
             seed_token = resolve_seed_token(request)
             seed_cookie = request.cookies.get("token", "").strip()
+            enforce_tier(seed_token)
             req_token = await get_real_req_token(seed_token)
+            if request.method == "POST" and path in ("backend-api/conversation", "backend-alt/conversation"):
+                await admit_generation(request, req_token, seed_token)
             access_token = await verify_token(req_token)
             try:
                 context = await refresh_cached_frontend(req_token, access_token or '', get_fp(req_token).copy())
@@ -447,7 +481,10 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         proxy_url = fp.pop("proxy_url", None)
         impersonate = fp.pop("impersonate", "safari15_3")
         user_agent = fp.get("user-agent")
-        headers.update(fp)
+        # 只允许 HTTP 头白名单字段出网。fp 记录同时承载 antiban 浏览器画像
+        # （screen/viewport/webgl 等嵌套结构）与路由元数据，整条 update 进去会让
+        # curl_cffi 编码 dict 头抛 AttributeError → 502（准入之后组头的那一轮必崩）。
+        headers.update(extract_header_fp(fp))
 
         headers.update({
             "accept-language": accept_language,
@@ -494,12 +531,16 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
             sentinel_proxy_url = random.choice(sentinel_proxy_url_list).replace("{}", session_id) if sentinel_proxy_url_list else None
 
             def _make_client():
-                return Client(proxy=sentinel_proxy_url)
+                client = Client(proxy=sentinel_proxy_url)
+                track_generation_client(request, client)
+                return client
         else:
             proxy_url = proxy_url.replace("{}", session_id) if proxy_url else None
 
             def _make_client():
-                return Client(proxy=proxy_url, impersonate=impersonate)
+                client = Client(proxy=proxy_url, impersonate=impersonate)
+                track_generation_client(request, client)
+                return client
 
         # 幂等请求（GET/HEAD/OPTIONS）遇到瞬时 SSL/连接重置自动重试，消除偶发 502
         # （如 GPT 图片 estuary/content、会话轮询 api/auth/session）
@@ -531,6 +572,7 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                 request.method, f"{base_url}/{path}", params=params, headers=headers,
                 cookies=request_cookies, data=data, max_attempts=max_attempts, client_factory=_make_client,
             )
+            track_generation_client(request, client)
             # 用量统计：成功发起上游请求后计数（内存），周期 flush 落库
             record_usage(seed_token, req_token, _usage_kind(path))
             background = BackgroundTask(client.close)
@@ -545,8 +587,13 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                 logger.info(f"Request UA: {user_agent}")
                 logger.info(f"Request impersonate: {impersonate}")
                 conv_key = r.cookies.get("conv_key", "")
-                response = StreamingResponse(content_generator(r, seed_token, history), media_type=r.headers.get("content-type", ""),
-                                  background=background)
+                # Only a generation response can establish a new conversation.
+                # A status/polling stream must not grant ownership from its data.
+                track_history = history and request.method == "POST" and path in (
+                    "backend-api/conversation", "backend-alt/conversation")
+                response = StreamingResponse(observe_generation_stream(request, content_generator(r, seed_token, track_history)), status_code=r.status_code,
+                                  media_type=r.headers.get("content-type", ""),
+                                  background=None if request.state.generation_admission is not None else background)
                 response.set_cookie("conv_key", value=conv_key)
                 return response
             elif 'image' in r.headers.get("content-type", "") or "audio" in r.headers.get("content-type", "") or "video" in r.headers.get("content-type", ""):
@@ -595,9 +642,9 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         except Exception as e:
             if client is not None:
                 await client.close()
-            logger.error(f"Reverse proxy failed for {path}: {str(e)}")
+            logger.error(f"Reverse proxy failed: {type(e).__name__}")
             raise HTTPException(status_code=502, detail="Upstream request failed")
     except HTTPException as e:
         raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Gateway request failed") from None

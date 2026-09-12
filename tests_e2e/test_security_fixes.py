@@ -9,6 +9,14 @@ Each test locks the *correct* behavior:
 #5  catch-all backend-api JSON 定向脱敏（已知身份字段置空，白名单保留）
 #6  跨 seed 会话详情越权（归属校验在代理之前，未归属 404）
 """
+import pytest
+
+
+@pytest.fixture
+def bound_seed(seed_account, seed_user, make_access_token):
+    token = make_access_token()
+    seed_account(token)
+    seed_user('seed-x', token)
 
 
 def test_empty_session_serves_login_not_owner_template(client):
@@ -39,14 +47,14 @@ def test_banned_path_allowed_for_direct_client(client, make_access_token):
     assert resp.status_code == 200
 
 
-def test_me_returns_anonymized_email(client):
+def test_me_returns_anonymized_email(client, bound_seed):
     """#3 镜像用户访问 /backend-api/me，email 必须为空串。"""
     resp = client.get("/backend-api/me", cookies={"token": "seed-x"})
     assert resp.status_code == 200
     assert resp.json()["email"] == ""
 
 
-def test_accounts_check_scrubs_owner_identity(client):
+def test_accounts_check_scrubs_owner_identity(client, bound_seed):
     """#4 /backend-api/accounts/check 抹除 account 内 owner 身份字段并匿名化 user_id。"""
     resp = client.get("/backend-api/accounts/check/v4-2023-04-27", cookies={"token": "seed-x"})
     assert resp.status_code == 200
@@ -60,7 +68,7 @@ def test_accounts_check_scrubs_owner_identity(client):
     assert acct["picture"] == ""
 
 
-def test_catchall_backend_api_json_scrubs_identity(client):
+def test_catchall_backend_api_json_scrubs_identity(client, bound_seed):
     """#5 catch-all 透传的 backend-api JSON 中，已知身份字段置空、白名单字段保留。"""
     resp = client.get("/backend-api/settings", cookies={"token": "seed-x"})
     assert resp.status_code == 200

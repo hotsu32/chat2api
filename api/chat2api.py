@@ -1,13 +1,15 @@
 import asyncio
+import json
 import time
 import types
 import uuid
 
+import anyio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Request, HTTPException, Form, Security
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
-from starlette.background import BackgroundTask
+from starlette.responses import Response
 
 import utils.globals as globals
 from app import app, templates, security_scheme
@@ -18,12 +20,25 @@ from utils.bootstrap import initialize_from_env
 from utils.Logger import logger
 from utils.configs import api_prefix, scheduled_refresh, history_disabled, enable_session_sticky
 from utils.retry import async_retry
+from utils.store import StoreError
+from utils.tiers import enforce_tier
 from utils import antiban
 from utils import fleet_health
+from utils import trials
 from utils import usage
 from utils.antiban import circuit as antiban_circuit
 
 scheduler = AsyncIOScheduler()
+
+
+def _require_pool_admin(request: Request):
+    """Protect legacy pool controls with the canonical admin boundary.
+
+    ``api.chat2api`` is imported before ``gateway.admin`` during app startup,
+    so the import must remain lazy to avoid a circular import.
+    """
+    from gateway.admin import require_admin_auth
+    require_admin_auth(request)
 
 
 def _responses_input_to_text(value):
@@ -165,23 +180,217 @@ def _compact_responses_payload(data):
     }
 
 
+def _admit_generation(seed):
+    """产品准入：套餐 / 试用资格闸 + 试用额度预留。
+
+    返回三态，与 :func:`utils.trials.reserve` 对齐但**先**过档位闸：
+
+      - ``None``：运营者 seed / 直传 token / 有效付费用户 —— 不占试用账，
+        **不是拒绝**；
+      - :class:`utils.trials.TrialAttempt`：SaaS 试用用户，本次生成已预占一次额度，
+        响应生命周期结束时用 ``finish(delivered)`` 结算；
+      - 抛 ``HTTPException``：无有效套餐 / 试用额度用尽 / 账号不可用 402，
+        权益或台账不可用 503。
+
+    模型门禁刻意不在这里执行（``enforce_tier`` 的第二参数留空）：``/v1`` 的模型别名
+    （如 ``gpt-4o``）与档位目录里的 slug 不同名，按目录白名单执行会把既有 API 客户端
+    的合法请求判成 403。档位、额度和试用资格它照样管。
+    """
+    enforce_tier(seed)
+    try:
+        reservation = trials.reserve(seed)
+    except trials.TrialDenied:
+        raise HTTPException(
+            status_code=402, detail="Plus trial unavailable; choose a subscription") from None
+    except StoreError:
+        raise HTTPException(
+            status_code=503, detail="Trial accounting temporarily unavailable") from None
+    if reservation is None:
+        return None
+    return trials.TrialAttempt(reservation, seed)
+
+
+class _CompletionObserver:
+    """OpenAI 兼容流的成功完成信号（不缓存正文，只记形状）。
+
+    成功 = 出现过带非空正文的增量 **且** 出现过带 ``finish_reason`` 的终止分片。
+    上游报错时 ``chatFormat.stream_response`` 只补一个 ``data: [DONE]`` 就收尾，
+    不会有终止分片；空流同理。所以「有 [DONE]」不等于成功，这个区分就是扣费判据。
+    """
+
+    def __init__(self):
+        self.text = False
+        self.terminal = False
+        self.failed = False
+
+    def observe(self, chunk):
+        if not isinstance(chunk, str) or not chunk.startswith("data: "):
+            return
+        payload = chunk[6:].strip()
+        if not payload or payload == "[DONE]":
+            return
+        try:
+            data = json.loads(payload)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        if data.get("error"):
+            self.failed = True
+            return
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return
+        # 逐条 choice 嗅探：终止信号只出现在某一条上时也不能漏判（漏判 = 成功不扣次数）。
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            content = delta.get("content") if isinstance(delta, dict) else None
+            if isinstance(content, str) and content.strip():
+                self.text = True
+            reason = choice.get("finish_reason")
+            if isinstance(reason, str) and reason:
+                self.terminal = True
+
+    @property
+    def completed(self):
+        return self.terminal and self.text and not self.failed
+
+
+async def _observe_completion(iterator, attempt):
+    """把分片发给客户端之前先嗅探完成信号（只置位，不结算）。"""
+    observer = _CompletionObserver()
+    try:
+        async for chunk in iterator:
+            observer.observe(chunk)
+            if observer.completed:
+                attempt.mark_completed()
+            yield chunk
+    finally:
+        # 生成器被取消 / 提前关闭时，内层生成器持有的上游流也要跟着结束，
+        # 否则它会一直挂在连接池里等下一个请求来 drain（见 test_m2_stream_cancel.py）。
+        # shield：断连时本协程正处于取消状态，不 shield 的话这个 await 会立刻再抛，
+        # 内层生成器根本关不掉，只能等 GC。
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await close()
+                except Exception:
+                    pass
+
+
+def _response_has_content(payload):
+    """非流式响应是否真的产出了一段回复（空正文不算一次成功生成）。"""
+    if not isinstance(payload, dict):
+        return False
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+    message = choices[0].get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return bool(isinstance(content, str) and content.strip())
+
+
+class _GenerationLifetime:
+    """一次生成持有的账号租约 + 试用账，直到 ASGI 发送任务结束才结束。
+
+    必须由 :class:`_LifetimeResponse` 在 ``finally`` 里收尾：流式响应在正文迭代器
+    抛错或发送失败时会从 Starlette 的任务组里直接抛出，``BackgroundTask`` 在那两条
+    路径上根本不会执行 —— 账号并发槽位就此永久泄漏。
+    """
+
+    def __init__(self, chat_service, attempt=None):
+        self.chat_service = chat_service
+        self.attempt = attempt
+        self._closed = False
+
+    async def close(self, delivered):
+        """按「是否完整交付」结清试用账并释放租约；重复调用是 no-op。
+
+        台账与租约是两件事：结账失败（哪怕是意料之外的异常）也不能把槽位一起丢掉，
+        所以 ``close_client`` 放在 ``finally`` 里 —— 归还槽位是硬保证，结账是尽力而为。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        # 客户端断连时 Starlette 会取消响应任务：清理必须在取消域里跑完，
+        # 否则槽位归还到一半就被打断。
+        with anyio.CancelScope(shield=True):
+            try:
+                if self.attempt is not None:
+                    self.attempt.finish(delivered)
+            finally:
+                await self.chat_service.close_client()
+
+
+class _LifetimeResponse(Response):
+    """把响应的 ASGI 生命周期接到 :class:`_GenerationLifetime` 上。
+
+    复用原响应的状态码、头部与正文迭代器，只在外面套一层 ``finally``：
+    正常收尾、发送失败、被取消，租约与试用账都在这里结束。
+    """
+
+    def __init__(self, response, lifetime):
+        super().__init__(status_code=response.status_code)
+        self.raw_headers = response.raw_headers
+        self.response = response
+        self.lifetime = lifetime
+
+    async def __call__(self, scope, receive, send):
+        delivered = False
+
+        async def observe_send(message):
+            nonlocal delivered
+            await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                delivered = True
+
+        try:
+            await self.response(scope, receive, observe_send)
+        finally:
+            await self.lifetime.close(delivered and 200 <= self.status_code < 300)
+
+
 async def _process_responses_request(request_data, req_token):
     chat_request_data = _convert_responses_request_to_chat(request_data)
     if chat_request_data.get("stream"):
         raise HTTPException(status_code=400, detail={"error": "stream responses is not supported yet"})
 
-    chat_service, res = await async_retry(process, chat_request_data, req_token)
+    attempt = _admit_generation(req_token)
+    try:
+        chat_service, res = await async_retry(process, chat_request_data, req_token)
+    except BaseException:
+        # 准入已经占掉一次试用额度，响应生命周期之前的任何失败都要退回。
+        if attempt is not None:
+            attempt.release()
+        raise
+    lifetime = _GenerationLifetime(chat_service, attempt)
     try:
         if isinstance(res, types.AsyncGeneratorType):
             raise HTTPException(status_code=400, detail={"error": "stream responses is not supported yet"})
-        return _convert_chat_response_to_responses(res, request_data)
-    finally:
-        await chat_service.close_client()
+        if attempt is not None and _response_has_content(res):
+            attempt.mark_completed()
+        return _convert_chat_response_to_responses(res, request_data), lifetime
+    except BaseException:
+        await lifetime.close(delivered=False)
+        raise
 
 
 @app.on_event("startup")
 async def app_start():
     initialize_from_env()
+    # Single-host SQLite: reclaim confirmed dead owners, never a live research
+    # request merely because it belongs to another process or takes a long time.
+    from utils.trials import recover_orphan_reservations
+    recover_orphan_reservations()
+    from utils.seed_lifecycle import freeze_expired_seeds
+    freeze_expired_seeds()
+    scheduler.add_job(
+        id='seed_expiry', func=freeze_expired_seeds,
+        trigger='interval', seconds=60, max_instances=1, coalesce=True,
+    )
     await antiban.init()
 
     # Session sticky: 启动时初始化 SQLite + 启动 TTL 清理定时任务
@@ -238,17 +447,29 @@ async def app_start():
         scheduler.start()
 
 
+async def _shutdown(chat_service):
+    """响应建立之前的异常/取消路径：shield 住取消域，保证账号槽位真的归还。
+
+    取消（客户端断连 / 服务停机）也是 ``BaseException``，被 ``except Exception``
+    漏掉时槽位就永久留在在飞状态 —— 容量单调泄漏，而不是报错。
+    """
+    with anyio.CancelScope(shield=True):
+        await chat_service.close_client()
+
+
 async def to_send_conversation(request_data, req_token):
     chat_service = ChatService(req_token)
     try:
         await chat_service.set_dynamic_data(request_data)
         await chat_service.get_chat_requirements()
         return chat_service
-    except HTTPException as e:
-        await chat_service.close_client()
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
-    except Exception as e:
-        await chat_service.close_client()
+    except BaseException as e:
+        # 取消同样是失败路径：账号槽位在响应建立之前也必须归还。
+        await _shutdown(chat_service)
+        if isinstance(e, HTTPException):
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
+        if isinstance(e, asyncio.CancelledError):
+            raise
         logger.error(f"Server error, {str(e)}")
         raise HTTPException(status_code=500, detail="Server error")
 
@@ -259,11 +480,14 @@ async def process(request_data, req_token):
         await chat_service.prepare_send_conversation()
         res = await chat_service.send_conversation()
         return chat_service, res
-    except HTTPException as e:
-        await chat_service.close_client()
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
-    except Exception as e:
-        await chat_service.close_client()
+    except BaseException as e:
+        await _shutdown(chat_service)
+        if isinstance(e, HTTPException):
+            if e.status_code == 500:
+                raise HTTPException(status_code=500, detail="Server error")
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
+        if isinstance(e, asyncio.CancelledError):
+            raise
         logger.error(f"Server error, {str(e)}")
         raise HTTPException(status_code=500, detail="Server error")
 
@@ -300,25 +524,36 @@ async def send_conversation(request: Request, credentials: HTTPAuthorizationCred
     # 副作用: 命中映射时改写 request_data['conversation_id'/'parent_message_id'/'messages']
     # 返回 lc_conv_id 用于流式响应嗅探回写；未启用或无 lc 字段时返回 None
     lc_conv_id = session_sticky.inject_session(request_data) if enable_session_sticky else None
-    chat_service, res = await async_retry(process, request_data, req_token)
+    # 产品准入：档位/试用资格 + 试用额度预留。必须在打上游之前，
+    # 否则一次拒绝会先花掉上游的连接与并发槽位。
+    attempt = _admit_generation(req_token)
+    try:
+        chat_service, res = await async_retry(process, request_data, req_token)
+    except BaseException:
+        # 响应还没建立，本次预留不可能被交付 —— 立刻退回。
+        if attempt is not None:
+            attempt.release()
+        raise
     # 把 lc_conv_id 挂到 chat_service 上，供 stream_response 嗅探时回写 DB
     if lc_conv_id:
         chat_service.librechat_conv_id = lc_conv_id
+    lifetime = _GenerationLifetime(chat_service, attempt)
     try:
         if isinstance(res, types.AsyncGeneratorType):
-            background = BackgroundTask(chat_service.close_client)
-            return StreamingResponse(res, media_type="text/event-stream", background=background)
-        else:
-            background = BackgroundTask(chat_service.close_client)
-            return JSONResponse(res, media_type="application/json", background=background)
+            body = res if attempt is None else _observe_completion(res, attempt)
+            return _LifetimeResponse(
+                StreamingResponse(body, media_type="text/event-stream"), lifetime)
+        if attempt is not None and _response_has_content(res):
+            attempt.mark_completed()
+        return _LifetimeResponse(JSONResponse(res, media_type="application/json"), lifetime)
     except HTTPException as e:
-        await chat_service.close_client()
+        await lifetime.close(delivered=False)
         if e.status_code == 500:
             logger.error(f"Server error, {str(e)}")
             raise HTTPException(status_code=500, detail="Server error")
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
-        await chat_service.close_client()
+        await lifetime.close(delivered=False)
         logger.error(f"Server error, {str(e)}")
         raise HTTPException(status_code=500, detail="Server error")
 
@@ -330,12 +565,18 @@ async def send_responses(request: Request, credentials: HTTPAuthorizationCredent
         request_data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail={"error": "Invalid JSON body"})
+    lifetime = None
     try:
-        response_payload = await _process_responses_request(request_data, req_token)
-        return JSONResponse(response_payload, media_type="application/json")
+        response_payload, lifetime = await _process_responses_request(request_data, req_token)
+        return _LifetimeResponse(
+            JSONResponse(response_payload, media_type="application/json"), lifetime)
     except HTTPException as e:
+        if lifetime is not None:
+            await lifetime.close(delivered=False)
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
+        if lifetime is not None:
+            await lifetime.close(delivered=False)
         logger.error(f"Server error, {str(e)}")
         raise HTTPException(status_code=500, detail="Server error")
 
@@ -347,12 +588,19 @@ async def send_responses_compact(request: Request, credentials: HTTPAuthorizatio
         request_data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail={"error": "Invalid JSON body"})
+    lifetime = None
     try:
-        data = await _process_responses_request(request_data, req_token)
-        return JSONResponse(_compact_responses_payload(data), media_type="application/json")
+        data, lifetime = await _process_responses_request(request_data, req_token)
+        return _LifetimeResponse(
+            JSONResponse(_compact_responses_payload(data), media_type="application/json"),
+            lifetime)
     except HTTPException as e:
+        if lifetime is not None:
+            await lifetime.close(delivered=False)
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
+        if lifetime is not None:
+            await lifetime.close(delivered=False)
         logger.error(f"Server error, {str(e)}")
         raise HTTPException(status_code=500, detail="Server error")
 
@@ -382,13 +630,15 @@ async def list_models(request: Request, credentials: HTTPAuthorizationCredential
 
 @app.get(f"/{api_prefix}/tokens" if api_prefix else "/tokens", response_class=HTMLResponse)
 async def upload_html(request: Request):
+    _require_pool_admin(request)
     tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
     return templates.TemplateResponse("tokens.html",
                                       {"request": request, "api_prefix": api_prefix, "tokens_count": tokens_count})
 
 
 @app.post(f"/{api_prefix}/tokens/upload" if api_prefix else "/tokens/upload")
-async def upload_post(text: str = Form(...)):
+async def upload_post(request: Request, text: str = Form(...)):
+    _require_pool_admin(request)
     lines = text.split("\n")
     for line in lines:
         if line.strip() and not line.startswith("#"):
@@ -400,7 +650,8 @@ async def upload_post(text: str = Form(...)):
 
 
 @app.post(f"/{api_prefix}/tokens/clear" if api_prefix else "/tokens/clear")
-async def clear_tokens():
+async def clear_tokens(request: Request):
+    _require_pool_admin(request)
     globals.token_list.clear()
     globals.error_token_list.clear()
     globals.persist_token_list()
@@ -410,15 +661,27 @@ async def clear_tokens():
 
 
 @app.post(f"/{api_prefix}/tokens/error" if api_prefix else "/tokens/error")
-async def error_tokens():
+async def error_tokens(request: Request):
+    _require_pool_admin(request)
     error_tokens_list = list(set(globals.error_token_list))
     return {"status": "success", "error_tokens": error_tokens_list}
 
 
 @app.get(f"/{api_prefix}/tokens/add/{{token}}" if api_prefix else "/tokens/add/{token}")
-async def add_token(token: str):
-    if token.strip() and not token.startswith("#"):
-        globals.token_list.append(token.strip())
+async def add_token_legacy(request: Request, token: str):
+    _require_pool_admin(request)
+    raise HTTPException(
+        status_code=410,
+        detail="Token-in-URL import is disabled; use POST /tokens/add",
+    )
+
+
+@app.post(f"/{api_prefix}/tokens/add" if api_prefix else "/tokens/add")
+async def add_token(request: Request, text: str = Form(...)):
+    _require_pool_admin(request)
+    token = text.strip()
+    if token and not token.startswith("#"):
+        globals.token_list.append(token)
         globals.persist_token_list()
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
     tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
@@ -426,7 +689,8 @@ async def add_token(token: str):
 
 
 @app.post(f"/{api_prefix}/seed_tokens/clear" if api_prefix else "/seed_tokens/clear")
-async def clear_seed_tokens():
+async def clear_seed_tokens(request: Request):
+    _require_pool_admin(request)
     globals.seed_map.clear()
     globals.conversation_map.clear()
     globals.persist_seed_map()

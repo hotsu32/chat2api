@@ -502,7 +502,7 @@ def test_register_reports_db_failure_instead_of_faking_success(client, monkeypat
     def boom(email, **fields):
         raise store.StoreError("disk full")
 
-    monkeypatch.setattr(store, "upsert_user_auth", boom)
+    monkeypatch.setattr(store, "create_user_with_trial", boom)
     resp = _register(client, "a5@example.com")
     assert resp.status_code == 503
     assert "稍后重试" in resp.text

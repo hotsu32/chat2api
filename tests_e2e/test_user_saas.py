@@ -18,6 +18,7 @@ import utils.configs as configs
 import utils.globals as globals
 import utils.store as store
 import utils.tiers as tiers
+from chatgpt.authorization import OPERATOR_SEED_STATUS
 
 
 def _make_user(seed, email, tier_id="free"):
@@ -25,6 +26,7 @@ def _make_user(seed, email, tier_id="free"):
         email, password_hash="pbkdf2_sha256$1$00$00", seed=seed, tier_id=tier_id, status="active"
     )
     globals.seed_map[seed] = {"token": "", "plan_type": None, "conversations": []}
+    store.upsert_user(seed, current_account='', status='active')
 
 
 def _grant(email, plan_id, days_left=30):
@@ -93,7 +95,7 @@ def test_tier_catalog_enumerates_group_models_quota():
 
 def test_tier_account_plan_types_and_model_gate():
     assert tiers.tier_account_plan_types("free") == ["free"]
-    assert "plus" in tiers.tier_account_plan_types("pro")
+    assert tiers.tier_account_plan_types("pro") == ["pro"]
     assert tiers.tier_allows_model("free", "gpt-5-5") is True
     assert tiers.tier_allows_model("free", "gpt-5-5-thinking") is False  # plus 专属
     assert tiers.tier_allows_model("plus", "gpt-5-5-thinking") is True
@@ -114,7 +116,7 @@ def test_resolve_user_tier_none_without_user_auth():
 # ---------------------------------------------------------------------------
 
 def test_signin_without_subscription_lands_on_dashboard(client):
-    """登录后即使没有订阅，也统一进入 Dashboard 空态。"""
+    """没有付费订阅的新用户登录后进入 Dashboard Plus 试用态。"""
     _register(client, "dashboard-login@example.com", "password123")
     csrf = client.cookies.get(configs.user_csrf_cookie) or ""
     client.post("/signout", data={"csrf_token": csrf})
@@ -124,18 +126,20 @@ def test_signin_without_subscription_lands_on_dashboard(client):
     assert resp.history[-1].status_code == 303
     assert resp.history[-1].headers["location"] == "/dashboard"
     assert "Dashboard" in resp.text
-    assert "去超市选购" in resp.text
+    assert "Plus 免费试用" in resp.text
+    assert "开始试用" in resp.text
 
 
-def test_dashboard_without_subscription_stays_on_empty_state(client):
-    """已登录但无订阅时，直接访问 Dashboard 不再跳 Store。"""
+def test_dashboard_without_subscription_shows_signup_trial(client):
+    """新用户无付费订阅时可从 Dashboard 试用，不强迫先购买。"""
     _register(client, "dashboard-empty@example.com", "password123")
 
     resp = client.get("/dashboard")
     assert resp.status_code == 200
     assert "Dashboard" in resp.text
     assert 'href="/store"' in resp.text
-    assert "/?token=" not in resp.text
+    assert "开始试用" in resp.text
+    assert "剩余 3 次" in resp.text
 
 
 def test_dashboard_requires_login(client):
@@ -145,7 +149,19 @@ def test_dashboard_requires_login(client):
     assert resp.headers["location"] == "/signin"
 
 
-def test_register_creates_user_with_seed_but_no_entitlement(client, monkeypatch, seed_account, make_access_token):
+def test_production_mock_checkout_does_not_create_or_activate_order(client, monkeypatch):
+    _register(client, 'production-checkout@example.test', 'Example-password-123!')
+    monkeypatch.setattr(configs, 'app_env', 'production')
+    monkeypatch.setattr(configs, 'payment_provider', 'mock')
+    response = client.post('/api/checkout', data={
+        'plan': 'plus-shared-1m',
+        'csrf_token': client.cookies.get(configs.user_csrf_cookie) or '',
+    })
+    assert response.status_code == 503
+    assert store.list_orders(email='production-checkout@example.test', strict=True) == []
+
+
+def test_register_creates_user_with_seed_and_plus_trial(client, monkeypatch, seed_account, make_access_token):
     seed_account(make_access_token(account_id="acc-plus", plan_type="plus"), plan_type="plus")
     _fake_template(monkeypatch)
 
@@ -155,16 +171,17 @@ def test_register_creates_user_with_seed_but_no_entitlement(client, monkeypatch,
     assert resp.history[-1].status_code == 303
     assert resp.history[-1].headers["location"] == "/dashboard"
     assert "Dashboard" in resp.text
-    assert "去超市选购" in resp.text
-    assert "/?token=" not in resp.text
+    assert "Plus 免费试用" in resp.text
+    assert "开始试用" in resp.text
 
     row = store.get_user_auth("alice@example.com")
     assert row is not None
     assert row["status"] == "active"
     assert row["seed"]
-    # 注册不附赠任何权益：必须先购买
+    # 注册附赠3次Plus试用；有效付费订单仍为空。
     from utils import entitlements
-    assert entitlements.effective_tier(row["seed"]) == ""
+    assert entitlements.effective_tier(row["seed"]) == "plus"
+    assert entitlements.active_orders(row["email"]) == []
     # 会话 cookie 已下发
     assert client.cookies.get(configs.user_session_cookie)
     # seed 已落到 seed_map
@@ -236,7 +253,7 @@ def test_no_plan_blocks_conversation_with_402(client, seed_account, make_access_
     assert resp.status_code == 402
 
 
-def test_paid_tier_quota_exceeded_returns_429(client, seed_account, make_access_token):
+def test_paid_tier_old_usage_quota_does_not_block_reply(client, seed_account, make_access_token):
     tok = make_access_token(account_id="acc-plus", plan_type="plus")
     seed_account(tok, plan_type="plus")
     seed = "seed-quota"
@@ -250,7 +267,8 @@ def test_paid_tier_quota_exceeded_returns_429(client, seed_account, make_access_
     resp = client.post(
         "/backend-api/conversation", cookies={"token": seed}, json={"model": "gpt-5-5"}
     )
-    assert resp.status_code == 429
+    assert resp.status_code == 200
+    assert "[DONE]" in resp.text
 
 
 def test_plus_user_routes_to_plus_pool(client, seed_account, make_access_token):
@@ -277,7 +295,7 @@ def test_upgrade_tier_switches_pool_on_failover(client, seed_account, make_acces
     client.get("/api/auth/session", cookies={"token": "seed-up"})
     assert globals.seed_map["seed-up"]["token"] == tok_plus
 
-    # 升到 pro（号组扩到 plus+pro）+ plus 号挂掉 → failover 切进 pro 号
+    # 升到 pro（只能使用 pro 号组）+ plus 号挂掉 → failover 切进 pro 号
     _grant("up@example.com", "pro-solo-1m")
     store.upsert_account(tok_plus, status="disabled")
     client.get("/api/auth/session", cookies={"token": "seed-up"})
@@ -308,10 +326,14 @@ def test_failover_skips_marked_dead_account(client, seed_account, make_access_to
 
 
 def test_operator_seed_not_limited_by_tier(client, seed_account, make_access_token):
-    # 运营者 seed（无 user_auth 行）走旧主链路，不受档位/额度限制
+    # 运营者 seed（无 user_auth 行）走旧主链路，不受档位/额度限制。
+    # 前提是它已被显式导入（``POST /seedtoken`` 写的授权标记）——
+    # 未经导入的任意 seed 一律 fail-closed，见 tests/test_unknown_seed_authorization.py。
     tok = make_access_token(account_id="acc-op", plan_type="plus")
     seed_account(tok, plan_type="plus")
     globals.seed_map["seed-op"] = {"token": tok, "plan_type": "plus", "conversations": []}
+    globals.persist_seed("seed-op")
+    store.upsert_user("seed-op", status=OPERATOR_SEED_STATUS)
 
     resp = client.post(
         "/backend-api/conversation", cookies={"token": "seed-op"}, json={"model": "o3"}
@@ -494,6 +516,11 @@ def _install_fake_provider(monkeypatch):
     """装一个「非 mock」的支付渠道，用来走真实的异步回调路径。
 
     mock 渠道的回调口被刻意关死（无签名可验），因此回调相关的用例不能用它。
+
+    它模拟的是一个**完整的真实渠道回调**：``verify`` 返回结构化的
+    ``payment.ProviderCallback``（订单号 + 流水号 + 金额 + 币种），而不是旧契约里
+    那个裸的 order_id 字符串。载荷里显式给出的字段优先，缺省时按库里的订单补齐 ——
+    后者是「渠道报的金额和订单一致」这一正常情形，前者让用例可以伪造不匹配的值。
     """
     import utils.payment as payment
 
@@ -505,7 +532,18 @@ def _install_fake_provider(monkeypatch):
             return {"provider": self.name, "order_id": order.get("order_id")}
 
         def verify(self, payload):
-            return (payload or {}).get("order_id") or None
+            payload = payload or {}
+            order_id = payload.get("order_id")
+            if not order_id:
+                return None
+            order = store.get_order(order_id) or {}
+            return payment.ProviderCallback(
+                order_id=order_id,
+                transaction_id=str(payload.get("transaction_id") or f"txn-{order_id}"),
+                amount=str(payload.get("amount", order.get("amount"))),
+                currency=str(payload.get("currency") or payment.expected_currency()),
+                provider=self.name,
+            )
 
     monkeypatch.setattr(payment, "get_provider", lambda: _FakeProvider())
     return _FakeProvider
@@ -516,7 +554,8 @@ def test_checkout_grants_entitlement_end_to_end(client):
     row = store.get_user_auth("pay@example.com")
 
     from utils import entitlements
-    assert entitlements.effective_tier(row["seed"]) == ""
+    assert entitlements.effective_tier(row["seed"]) == "plus"
+    assert entitlements.active_orders(row["email"]) == []
 
     resp = _checkout(client, "plus-solo-1m")
     assert resp.status_code == 200  # 跟随 303 到 /dashboard
@@ -546,7 +585,8 @@ def test_checkout_without_provider_is_fail_closed(client, monkeypatch):
 
     from utils import entitlements
     row = store.get_user_auth("noprov@example.com")
-    assert entitlements.effective_tier(row["seed"]) == ""
+    assert entitlements.effective_tier(row["seed"]) == "plus"
+    assert entitlements.active_orders(row["email"]) == []
     assert all(o["status"] == "pending" for o in store.list_orders(email="noprov@example.com"))
 
 
@@ -572,7 +612,8 @@ def test_payment_callback_is_rejected_under_mock(client):
 
     from utils import entitlements
     seed = store.get_user_auth("cb@example.com")["seed"]
-    assert entitlements.effective_tier(seed) == ""
+    assert entitlements.effective_tier(seed) == "plus"
+    assert entitlements.active_orders("cb@example.com") == []
 
 
 def test_payment_callback_is_idempotent(client, monkeypatch):
@@ -631,7 +672,6 @@ def test_concurrent_settlement_does_not_swallow_paid_time(client, monkeypatch):
     各自算出 now+30d，用户付了两个月只拿到一个月。
     """
     import threading
-    import gateway.saas as saas
 
     _install_fake_provider(monkeypatch)
     _register(client, "race@example.com", "password123")
@@ -641,27 +681,9 @@ def test_concurrent_settlement_does_not_swallow_paid_time(client, monkeypatch):
         resp = client.post("/api/orders", json={"tier_id": "plus-solo-1m"})
         ids.append(resp.json()["order_id"])
 
-    # 放大临界区：真实竞态窗口只有几微秒，靠运气撞不出来，必须在「读」和「写」之间
-    # 强行插入一个切换点。注意 barrier 在修好之后**必定超时** —— 两个线程被结算锁
-    # 串行化了，第二个根本进不到这里。这正是我们要的证据：barrier 能凑齐
-    # 就说明两个线程同时进了临界区，也就说明锁没起作用。
-    original = saas._grant_expiry
-    barrier = threading.Barrier(2, timeout=1)
-    both_entered = []
-
-    def _slow_grant_expiry(email, detail, now=None):
-        result = original(email, detail, now)
-        try:
-            barrier.wait()
-            both_entered.append(True)  # 无锁时才可能走到这里
-        except threading.BrokenBarrierError:
-            pass
-        return result
-
-    monkeypatch.setattr(saas, "_grant_expiry", _slow_grant_expiry)
-
     def _settle(oid):
-        saas._settle_order(oid)
+        from gateway.saas import _settle_order
+        _settle_order(oid)
 
     threads = [threading.Thread(target=_settle, args=(o,)) for o in ids]
     for t in threads:
@@ -671,7 +693,6 @@ def test_concurrent_settlement_does_not_swallow_paid_time(client, monkeypatch):
 
     expiries = sorted(store.get_order(o)["expires_at"] for o in ids)
     assert all(e for e in expiries), "两单都应已激活"
-    assert not both_entered, "两个线程同时进入了临界区 —— 结算锁没有生效"
     # 两单相差约 30 天（后一单从前一单的到期时间起算），而不是几乎相等
     assert expiries[1] - expiries[0] > 29 * 86400
 

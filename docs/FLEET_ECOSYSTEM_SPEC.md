@@ -55,6 +55,26 @@
 
 ### 3.2 保留独立（正交子系统，不迁，不属账号域）
 
+当前健康写入约束：凭据列表同步只维护成员关系和错误信号，不以“凭据仍在列表”证明恢复。已有 disabled、dead、degraded、unhealthy 状态不会因清空错误列表而变为 healthy；账号刷新后仍需有效健康证据。健康扫描仅更新已有且状态未发生变化的 healthy/unhealthy 行，不插入已删除账号，也不覆盖扫描期间的停用或降级决定。写入失败必须报告，不能计入成功探针数。dead 的 dwell 恢复与多个旧状态源的完整统一仍待四线目标验收。
+
+Seed 到期处理使用 `utils.seed_lifecycle.freeze_if_expired`：在同一 SQLite 事务内重新读取权益，仅冻结，不隐式激活续费用户；保留原账号、档次和会话记录。聊天门禁即时执行，启动时与每60秒的 `seed_expiry` 任务补齐闲置用户的到期状态。安全封禁仍归 `user_auth.status` 管理，普通到期不能禁止登录和续费。
+
+容量激活基础接口 `activate_seed(seed, candidate_account, max_active_seeds)` 优先尝试原账号，再尝试同档健康候选，并在同一事务内检查绑定数。该参数统计 active/trial Seed，不代表上游安全人数，也不代表请求并发上限。独享权益必须使用无其他活跃绑定的账号；已有当前有效独享权益的活跃绑定也会阻止共享或试用用户进入。同档重叠订单有任一有效独享订单时保留独享，不使用过期或较低档订单决定当前档的密度；历史裸档位订单与试用按共享处理。冲突时仅尝试同档候选，失败保留原状态和历史。内存发布失败会显式报错；数据库若已提交，重试会从数据库恢复该 Seed 的状态和历史。
+
+SaaS 进入镜像和切号现经 `route_seed` 在同一事务内选取并激活，读取数据库原绑定而非内存快照。优先恢复原账号；原号不符合条件时，在同档 healthy 候选中优先填充已有绑定的账号，同时遵守容量与独享限制。强制切换排除当前账号，找不到候选时保留绑定。两种 AUTO_SEED 模式都执行 SaaS 约束；镜像无可分配账号时返回503，不以空凭据继续发请求。运营者历史分配路径仍有全量 seed_map 写入，须继续收敛，不能据 SaaS 路径通过就宣布全部写入并发安全。
+
+运营配置 `FLEET_MAX_SHARED_SEEDS_PER_ACCOUNT` 为共享/试用的活跃绑定上限，默认0表示未配置，此时共享/试用分配返回503；独享固定1人。启用共享前必须根据本部署实测设置正整数，测试中的2只是合成测试数据，不能作为上游安全容量结论。冻结绑定不占此计数，恢复时重新检查。请求并发仍由独立准入租约控制。支付后立即分配、绑定失败恢复、代理健康共同路由与真实账号容量校准尚待验收；已有订单在用户再次进入时会经该路由恢复，但不等于支付回调已完成自动分配。
+
+容量是**用户可见**的：未配置时三次注册试用的入口不会出现（Dashboard 显示「试用容量暂未开放」），而不是渲染一个必然失败的「开始试用」。该状态由 `gateway/saas.py` 的 `trial_capacity_configured` 驱动，取值仍是同一个 `FLEET_MAX_SHARED_SEEDS_PER_ACCOUNT` —— 不新增第二份容量口径，也不因为有用户点不到试用而放宽默认值。
+
+### 3.2.1 产品面闸门（P0）
+
+- **Free 不是商品**：正式售卖档是 Plus / Pro（`utils/plans.py` 的 12 个 SKU）。公开档位目录 `GET /api/tiers` 只返回 `plus` / `pro`；`free` 是账号侧采集档，只在 `DEV_ACCESS_ENABLED=true` 时出现在目录里。
+- **开发 / 运营入口**：`/try`、`/demo` 绕过注册与订阅，直接把种子别名指向真实号池账号，二者统一由 `DEV_ACCESS_ENABLED` 控制（默认 false → 404）。关闭闸门不影响任何售卖路径（`/landing`、`/store`、`/api/orders`、`/checkout` 等照常）。
+- **支付契约**：`utils.payment` 的 provider `verify` 必须返回结构化 `ProviderCallback`（订单号 + 流水号 + 金额 + 币种），裸 `order_id` 一律判为无效回调。结算前由 `validate_callback` 用库里的订单逐条核对金额、币种与流水号归属/重放；mock 渠道无签名可验，`verify` 恒为 None 且回调口 403 —— 它只能通过 `api_checkout` 的 `auto_settle` 在本地/测试环境结算，且审计记录带 `source=mock_auto_settle`。
+- **封禁即下线**：`POST /admin/users/status`（status=banned）在写库后调用 `gateway.user.revoke_user_sessions`（即既有的 `store.bump_pw_version` 会话合同）吊销该账号全部 web 会话；`_current_email` 另有一道 `user_auth.status` 检查，避免吊销失败时旧 cookie 继续可用。登录页对被停用账号给出「账号已被停用」而不是「密码已变更」。
+- **运营审计**：`utils/audit.py`（独立 SQLite，`AUDIT_DB_PATH`）为号池增删改、支付结算、用户封禁/解封记录动作、匿名主体 id（`sha256` 派生）与白名单字段，不写 token / cookie / 代理凭据 / 邮箱原文；`GET /admin/audit` 读取。审计写入失败不阻断业务，因此它可能缺记录，不能当作不可篡改的账本。
+
 - `utils/antiban/` 的状态（`antiban_bucket/geo/dead`、`account_warnings`）——运行时风控状态，高频读写、自成模块。
 - `wss_map.json`——瞬态 websocket 状态。
 - `harvester_accounts.json`——harvester 模块自身的 email/note/采集历史存储。
@@ -136,6 +156,12 @@ CREATE TABLE proxies (
 
 - **等级**：复用 `identity.decode_jwt_payload` 解 `plan_type`/`real_email`；AccessToken 导入即解，
   Refresh/Session 首次换出 access_token 后懒解码写回 `accounts`。
+- **产品分池边界**：Plus 只选 Plus，Pro 只选 Pro；`data/tiers.json` 的
+  `account_plan_types` 可以缩小可选范围，不能扩大到其他档次。配置缺少对应档次或
+  该档没有健康账号时不跨档回退。权益数据库失败返回 503，与没有权益或号池耗尽区分；
+  拒绝分配不会删除原 Seed 绑定和会话记录。
+- **付费用量**：Plus/Pro 权益按有效期执行，旧档位配置中的每日次数不再阻断付费聊天。
+  历史 usage 仅用于观测；注册试用必须使用独立的成功结算额度，不能混用付费次数统计。
 - **健康**：周期后台任务（挂 `@app.on_event("startup")`）对每账号 `verify_token` → 轻量探活；
   `status` 三态；与 antiban `circuit` 的 dead 判定整合（避免两套健康判定打架）。
 - **粘性**：`get_req_token(seed)` 查 `users[seed].current_account`，空则按 `users[seed].plan_type`

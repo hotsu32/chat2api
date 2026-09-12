@@ -37,7 +37,7 @@ def test_build_session_anonymized(make_access_token):
     assert s["user"]["email"] == ""
     assert s["account"]["planType"] == "pro"
     assert s["account"]["id"] == "acc-9"
-    assert s["accessToken"] == token
+    assert s["accessToken"] == ""
 
 
 def test_build_session_not_anonymized(make_access_token):

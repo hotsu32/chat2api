@@ -11,6 +11,7 @@ import json
 import random
 import time
 import uuid
+import anyio
 
 from fastapi import Request, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -19,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app import app
 from chatgpt.authorization import verify_token
-from chatgpt.fp import get_fp
+from chatgpt.fp import extract_header_fp, get_fp
 from chatgpt.proofofWork import get_config, get_answer_token, get_requirements_token
 from gateway.frontend_sync import (
     FrontendSessionError,
@@ -34,7 +35,18 @@ from gateway.reverseProxy import (
     resolve_seed_token,
 )
 from gateway.sse_parser import extract_data_json
+from gateway.research_progress import (
+    detection_summary,
+    heartbeat_interval,
+    is_research_turn,
+    store as research_progress_store,
+    stream_timeout_for,
+    with_heartbeat,
+)
+from gateway.conversation_scope import conversation_is_foreign
 from utils.tiers import enforce_tier
+from gateway.generation import admit_generation, generation_lifetime, track_generation_client
+from gateway.generation import observe_generation_end, observe_generation_event
 from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import (
@@ -99,10 +111,7 @@ async def _upstream_context(request, req_token, host_url):
         key: value for key, value in request.headers.items()
         if key.lower() in headers_accept_list
     }
-    # fp 里 proxy_url / impersonate 是传输参数而非 HTTP 头；混进 headers 会把代理
-    # 地址原样发给上游（凭据泄漏 + 一眼非浏览器）。与反代一致，先摘掉再 update。
-    fp_headers = {k: v for k, v in fp.items() if k not in ("proxy_url", "impersonate")}
-    headers.update(fp_headers)
+    headers.update(extract_header_fp(fp))
     headers.update({
         "authorization": f"Bearer {access_token}",
         "accept-language": accept_language,
@@ -166,7 +175,7 @@ async def _server_sentinel(request, access_token, req_token, headers, fp, cookie
                 break
             except Exception as e:
                 if attempt == 0 and _is_transient_network_error(e):
-                    logger.warning(f"[f_conversation] sentinel transient network error, retrying: {str(e)[:120]}")
+                    logger.warning(f"[f_conversation] sentinel transient network error, retrying: {type(e).__name__}")
                     await clients.discard()
                     if sentinel_proxy_url_list:
                         clients = Client(proxy=sentinel_proxy_url, impersonate=impersonate)
@@ -193,7 +202,7 @@ async def _server_sentinel(request, access_token, req_token, headers, fp, cookie
                     )
                     turnstile_token = res.json().get("t")
             except Exception as e:
-                logger.info(f"Turnstile ignored: {e}")
+                logger.info(f"Turnstile unavailable: {type(e).__name__}")
 
         proofofwork = resp.get("proofofwork", {})
         if proofofwork.get("required"):
@@ -208,7 +217,7 @@ async def _server_sentinel(request, access_token, req_token, headers, fp, cookie
         chat_token = resp.get("token")
         return chat_token, proof_token, turnstile_token, client, clients, session_id, user_agent
     except Exception as e:
-        logger.error(f"[f_conversation] server sentinel failed: {e}")
+        logger.error(f"[f_conversation] server sentinel failed: {type(e).__name__}")
         await client.close()
         await clients.close()
         raise
@@ -305,12 +314,56 @@ def rewrite_f_conversation_body(body: dict) -> dict:
     return out
 
 
+def is_legacy_echo_event(payload: dict) -> bool:
+    """Whether a parsed upstream event is a legacy-endpoint artefact to drop.
+
+    The gateway forwards f/conversation to the legacy /backend-api/conversation,
+    which prefixes the stream with a resume token and echoes back the user and
+    system turns.  The new frontend does not expect either, so they are dropped
+    here; everything else is forwarded untouched.
+
+    Every field is type-checked before it is destructured.  ``type`` and
+    ``message`` are upstream-controlled, and a frame only has to be a legal JSON
+    object to reach this point — ``{"message": null}``, ``{"message": "..."}``
+    and ``{"message": {"author": null}}`` all are.  The previous version chained
+    ``.get()`` through those positions, so such a frame raised AttributeError
+    inside the streaming body.  That does not merely mis-classify one event: the
+    exception propagates out of the generator and tears down the whole
+    StreamingResponse, so the browser loses every later event *and* the terminal
+    one, mid-turn, with the response already committed as 200 (measured: a
+    stream of 8 events delivered 3, no terminal, no [DONE]).  A Deep Research
+    turn is exactly the case that cannot absorb that — its value is the long
+    tail of intermediate progress events.
+
+    Classification is therefore fail-open: an event whose shape is not
+    recognised is forwarded rather than dropped or fatal.  That matches the
+    project rule that unknown events must not be silently discarded, and keeps
+    the drop set to events positively identified as legacy echoes -- the
+    account-isolation filters below are unchanged.
+    """
+    if payload.get("type", "message") == "resume_conversation_token":
+        return True
+    if payload.get("type", "message") != "message":
+        return False
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return False
+    author = message.get("author")
+    if not isinstance(author, dict):
+        return False
+    return author.get("role") in ("user", "system")
+
+
 @app.post("/backend-api/f/conversation")
+@generation_lifetime
 async def f_conversation(request: Request):
     """拦截 f/conversation：服务端 sentinel + 转发老接口 /backend-api/conversation。"""
     started = time.monotonic()
     token = resolve_seed_token(request)
+    # 权益不足先拒绝，避免为已到期请求刷新官网会话或发起上游预检。
+    enforce_tier(token)
     req_token = await get_real_req_token_wrapper(token)
+    await admit_generation(request, req_token, token)
     # 匿名阶段日志：只打可稳定关联同一账号/会话的哈希前缀，不落 token / cookie / 代理地址。
     logger.info(f"[f_conversation] phase=received seed={_anon(token)} account={_anon(req_token)}")
 
@@ -322,7 +375,29 @@ async def f_conversation(request: Request):
 
     session_id = hashlib.md5(req_token.encode()).hexdigest()
     proxy_url = proxy_url.replace("{}", session_id) if proxy_url else None
-    client = Client(proxy=proxy_url, impersonate=impersonate, timeout=chat_request_timeout)
+    # 上游静默预算：stream=True 时 curl_cffi 把标量 timeout 映射成低速看门狗，
+    # 量到的是「上游能安静多久」而不是「这一轮能跑多久」（见 utils/configs.py 与
+    # tmp/research-protocol/OFFICIAL_INTERFACE_EVIDENCE.md）。研究轮在步骤之间会长时间
+    # 无事件，因此允许单独放宽；未配置时取值与原先完全一致。Starlette 会缓存 body，
+    # 下面那次解析仍读同一份字节。
+    try:
+        _early_body = json.loads(await request.body())
+    except Exception:
+        _early_body = None
+    logger.info(
+        f"[f_conversation] phase=request_shape research={is_research_turn(_early_body)} "
+        f"shape={json.dumps(detection_summary(_early_body), ensure_ascii=True, separators=(',', ':'))}"
+    )
+    # 续聊的会话归属在请求体里。拒绝「已属于另一个 Seed」的会话，且必须在任何上游
+    # 请求之前——否则同账号的另一个镜像用户可以先于归属检查把这一轮打到别人的会话上。
+    # 镜像没有记录的会话仍然放行：首轮新建要靠 content_generator 在流里认领 id。
+    _early_conversation_id = _early_body.get("conversation_id") if isinstance(_early_body, dict) else None
+    if isinstance(_early_conversation_id, str) and \
+            conversation_is_foreign(_early_conversation_id, token):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    upstream_timeout = stream_timeout_for(_early_body)
+    client = Client(proxy=proxy_url, impersonate=impersonate, timeout=upstream_timeout)
+    track_generation_client(request, client)
     if sentinel_proxy_url_list:
         sentinel_proxy_url = (
             random.choice(sentinel_proxy_url_list).replace("{}", session_id)
@@ -331,6 +406,8 @@ async def f_conversation(request: Request):
         clients = Client(proxy=sentinel_proxy_url, impersonate=impersonate)
     else:
         clients = client
+
+    track_generation_client(request, clients)
 
     # 用缓存的 sentinel token，或重新服务端算。缓存带 TTL：chat-requirements token 有时效，
     # 过期（或 SENTINEL_CACHE_TTL=0 不缓存）时视为未命中重新解算，避免 stale token 触发上游 403。
@@ -426,9 +503,10 @@ async def f_conversation(request: Request):
             break
         except Exception as e:
             if _attempt == 0 and _is_transient_network_error(e):
-                logger.warning(f"[f_conversation] transient network error, retrying: {str(e)[:120]}")
+                logger.warning(f"[f_conversation] transient network error, retrying: {type(e).__name__}")
                 await client.discard()
-                client = Client(proxy=proxy_url, impersonate=impersonate, timeout=chat_request_timeout)
+                client = Client(proxy=proxy_url, impersonate=impersonate, timeout=upstream_timeout)
+                track_generation_client(request, client)
                 await asyncio.sleep(0.4)
                 continue
             logger.error(f"[f_conversation] phase=upstream status=error error={type(e).__name__} "
@@ -451,26 +529,72 @@ async def f_conversation(request: Request):
         # boundaries never let a filtered event through.  Re-wrapping it in
         # iter_sse_events_async here would just parse the same bytes twice.
         completed = False
+        failed = None
+        failure = None
         events = 0
         try:
+            body_conversation_id = body.get("conversation_id")
+        except Exception:
+            body_conversation_id = None
+        # 保留这一轮的研究进度，供刷新/重连后向网关索取（上游协议未知，见
+        # gateway/research_progress.py 的边界说明）。记录发生在事件已经确定要下发给
+        # 浏览器之后，因此它不会改变线上字节，只是把它留档。
+        recorder = research_progress_store.recorder(
+            token, body_conversation_id, research=is_research_turn(body)
+        )
+
+        async def _pass_through():
+            nonlocal events
             async for event in content_generator(r, token, True):
                 # Each `event` is now exactly one SSE event (including its trailing
                 # blank line).  extract_data_json finds the data: field regardless
                 # of any leading event:/id:/retry: prefix lines, handles multiline
                 # events, and returns None for [DONE], comments, and non-JSON data.
                 _d = extract_data_json(event)
-                if _d is not None:
-                    _t = _d.get("type", "message")
-                    if _t == "resume_conversation_token":
-                        continue
-                    if _t == "message":
-                        _role = (_d.get("message") or {}).get("author", {}).get("role")
-                        if _role in ("user", "system"):
-                            continue
+                if _d is not None and is_legacy_echo_event(_d):
+                    continue
+                observe_generation_event(request, event)
+                if not recorder.record(event):
+                    # A repeated terminal marker: the browser already got one.
+                    continue
                 events += 1
                 yield event
+
+        try:
+            # 心跳默认关闭（interval=0 时 with_heartbeat 是直通）。开启时只在事件之间
+            # 插入 SSE 注释帧，不改变、不延迟、不丢弃任何事件。
+            async for event in with_heartbeat(_pass_through(), heartbeat_interval()):
+                yield event
             completed = True
+        except asyncio.CancelledError:
+            # Client disconnect. Not an error; recorded as cancelled below.
+            raise
+        except Exception as exc:
+            # A mid-stream failure is invisible from the outside: the response
+            # committed 200 at its first event, so the browser sees a stream
+            # that simply stops with no terminal event.  Without this branch it
+            # was also indistinguishable in the logs from a user pressing stop.
+            # The type is what reaches the log and the feedback record; the
+            # exception object is handed over only so the circuit can recognise
+            # a transport failure, and it keeps none of the exception's text.
+            failed = type(exc).__name__
+            failure = exc
+            raise
         finally:
+            # The outcome is recorded here rather than in the branches above: a
+            # browser disconnect closes this generator with GeneratorExit, which
+            # matches neither except clause, and the release path below runs for
+            # all three exits.
+            #
+            # The guard is told in the same place, and for the same reason.  It
+            # has no other way to learn how this stream ended: the response is
+            # already committed as 200, so a turn that delivered its terminal
+            # frame and a turn that died after the first event look identical
+            # from the response lifetime.  Only this iterator sees the
+            # difference, so "pending" can never reach the guard as a success.
+            outcome = "complete" if completed else ("failed" if failed else "cancelled")
+            observe_generation_end(request, outcome, failure)
+            recorder.finish(outcome)
             # The browser disconnecting (user hits stop, closes the tab,
             # navigates away) makes Starlette cancel the body task, which
             # closes this generator — the response's BackgroundTask never runs.
@@ -483,17 +607,36 @@ async def f_conversation(request: Request):
             # still attached, so the next turn for this account checks out a
             # session that is still mid-stream.  discard() hard-closes, which
             # is what makes the upstream observe the disconnect and stop.
-            await _release(client, clients, discard=not completed)
+            with anyio.CancelScope(shield=True):
+                await _release(client, clients, discard=not completed)
             # Shape only: how the stream ended, how many events reached the
             # browser, how long it ran.  No bodies, headers or query strings.
             # This is the only authoritative record that a cancelled turn was
             # actually torn down -- a browser-side observer cannot show it.
             logger.info(f"[f_conversation] phase=stream_release "
                         f"account={_anon(req_token)} "
-                        f"outcome={'complete' if completed else 'cancelled'} "
+                        f"outcome={outcome} "
+                        f"error={failed or '-'} "
                         f"released={'pooled' if completed else 'discarded'} "
                         f"events={events} "
                         f"elapsed_ms={int((time.monotonic() - started) * 1000)}")
+            # Whether the mirror kept anything a reloading browser can restore,
+            # in counts only: no event text, no metadata values, no prompt.  A
+            # research turn that streams correctly but retains nothing is a
+            # silent failure, and this is the line that would show it.
+            if recorder.research:
+                record = (research_progress_store.projection_snapshot(
+                    recorder.conversation_id, recorder.owner)
+                    if recorder.conversation_id else None)
+                projection = (record or {}).get("projection") or {}
+                logger.info(f"[f_conversation] phase=research_progress "
+                            f"account={_anon(req_token)} "
+                            f"retained={'yes' if record else 'no'} "
+                            f"state={(record or {}).get('state', '-')} "
+                            f"retained_events={(record or {}).get('events_seen', 0)} "
+                            f"sources={projection.get('sources', 0)} "
+                            f"sources_reported={projection.get('sources_evidenced', False)} "
+                            f"finished={projection.get('finished', False)}")
 
     if "stream" in content_type or "text/event-stream" in content_type:
         # X-Accel-Buffering: no tells nginx not to buffer the SSE stream.

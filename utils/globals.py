@@ -112,6 +112,14 @@ if token_list:
     logger.info(f"Token list count: {len(token_list)}, Error token list count: {len(error_token_list)}")
     logger.info("-" * 60)
 
+# One-time compatibility convergence: old releases persisted circuit-dead
+# markers only in JSON.  SQLite is the canonical routing status now; preserve
+# manual ``disabled`` decisions while importing those legacy restrictions.
+for _dead_token in list(antiban_dead_tokens):
+    _account = store.get_account(_dead_token)
+    if _account and _account.get("status") != "disabled":
+        store.set_account_status(_dead_token, "dead")
+
 
 # ---------------------------------------------------------------------------
 # Write-through persist helpers. The in-memory structures above remain the
@@ -119,28 +127,46 @@ if token_list:
 # ---------------------------------------------------------------------------
 
 def persist_token_list():
-    """Authoritative sync of accounts.token + status from token_list/error_token_list."""
+    """Sync credential membership without deleting durable account records.
+
+    Deletion is an explicit administrative operation.  A partial in-memory
+    snapshot, process restart or bulk-clear request must never erase health,
+    tier or audit-relevant account state from SQLite.
+    """
     err = set(error_token_list)
-    live = set(token_list) | err
     for t in token_list:
-        store.upsert_account(t, status="unhealthy" if t in err else "healthy")
+        store.sync_account_presence(t, errored=t in err)
     for t in err:
         if t not in token_list:
-            store.upsert_account(t, status="unhealthy")
-    for a in store.list_accounts():
-        if a["token"] not in live:
-            store.delete_account(a["token"])
+            store.sync_account_presence(t, errored=True)
 
 
 def persist_error_tokens():
-    """Authoritative status sync from error_token_list (mark error tokens unhealthy,
-    recovered tokens healthy)."""
+    """Persist error signals; clearing errors alone does not prove recovery."""
     err = set(error_token_list)
     for t in token_list:
-        store.upsert_account(t, status="unhealthy" if t in err else "healthy")
+        store.sync_account_presence(t, errored=t in err)
     for t in err:
         if t not in token_list:
-            store.upsert_account(t, status="unhealthy")
+            store.sync_account_presence(t, errored=True)
+
+
+def clear_error_token(token):
+    """Drop one token's error-list membership after a probe-verified recovery.
+
+    Clearing the list is **not** evidence of recovery: the caller must already have
+    published a healthy status through the guarded probe path (successful
+    authenticated probe + dwell + the conditional status UPDATE). This only stops the
+    in-memory list from contradicting that decision — routing reads the list, so a
+    stale membership would make the recovery cosmetic.
+
+    The in-memory list is derived state: a restart rebuilds it from ``accounts.status``
+    via ``store.load_all``, so this cannot leave a durable contradiction behind.
+    """
+    try:
+        error_token_list.remove(token)
+    except ValueError:
+        pass
 
 
 def persist_refresh_map():
@@ -189,6 +215,19 @@ def persist_seed_map():
     for u in store.list_users():
         if u["seed"] not in known:
             store.delete_user(u["seed"])
+
+
+def persist_seed(seed):
+    """Persist one Seed binding without rewriting unrelated users."""
+    entry = seed_map.get(seed)
+    if not isinstance(entry, dict):
+        return
+    store.upsert_user(
+        seed,
+        current_account=entry.get("token", ""),
+        plan_type=entry.get("plan_type"),
+        status=entry.get("status"),
+    )
 
 
 def persist_conversation(seed, conv_id):

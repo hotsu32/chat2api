@@ -1,4 +1,9 @@
-"""fleet core: tier pool, sticky routing, switch, verify_token (AccessToken path)."""
+"""fleet core: tier pool, sticky routing, switch, verify_token (AccessToken path).
+
+Operator Seeds (no ``user_auth`` row) are an explicit import path: the binding has
+to exist server-side before it can be routed to. See
+``tests/test_unknown_seed_authorization.py`` for the fail-closed contract itself.
+"""
 import pytest
 
 import utils.globals as globals
@@ -55,55 +60,64 @@ def test_pick_healthy_account(db, monkeypatch):
     monkeypatch.setattr(auth.random, "choice", _pick_max_token)
     assert auth._pick_healthy_account("plus") == "plus-1"
     assert auth._pick_healthy_account("free") == "free-1"
-    # tier pool empty -> fallback to any healthy account
-    assert auth._pick_healthy_account("team") in {"plus-1", "free-1"}
+    # 显式档位是硬边界：该档号池空了就空手而归，不跨档借号（详见 test_pool_tier_contract.py）
+    assert auth._pick_healthy_account("team") == ""
+    # 无档位请求（运营者 / 直传 token 老链路）才回退：先 free 池，再任意健康号
+    assert auth._pick_healthy_account() == "free-1"
 
 
 def test_pick_healthy_account_empty(db):
     assert auth._pick_healthy_account("plus") == ""
 
 
+def _import_operator_seed(seed, token, plan_type):
+    """Mirror the operator import (``POST /seedtoken``): binding + grant marker."""
+    globals.seed_map[seed] = {"token": token, "plan_type": plan_type, "conversations": []}
+    globals.persist_seed(seed)
+    store.upsert_user(seed, status=auth.OPERATOR_SEED_STATUS)
+
+
 def test_resolve_seed_account_sticky(db):
     store.upsert_account("plus-1", plan_type="plus", status="healthy")
-    globals.seed_map["seed-a"] = {"token": "plus-1", "plan_type": "plus", "conversations": []}
+    _import_operator_seed("seed-a", "plus-1", "plus")
     assert auth._resolve_seed_account("seed-a") == "plus-1"
 
 
 def test_resolve_seed_account_switch_on_disabled(db):
     store.upsert_account("plus-1", plan_type="plus", status="disabled")
     store.upsert_account("plus-2", plan_type="plus", status="healthy")
-    globals.seed_map["seed-a"] = {"token": "plus-1", "plan_type": "plus", "conversations": []}
+    _import_operator_seed("seed-a", "plus-1", "plus")
     assert auth._resolve_seed_account("seed-a") == "plus-2"
     assert globals.seed_map["seed-a"]["token"] == "plus-2"
 
 
-def test_resolve_seed_account_new_user(db, monkeypatch):
+def test_resolve_seed_account_requires_a_persisted_operator_grant(db, monkeypatch):
+    """A seed nobody imported is not an operator: it gets no account at all."""
     store.upsert_account("plus-1", plan_type="plus", status="healthy")
     monkeypatch.setattr(auth.random, "choice", _pick_max_token)
-    token = auth._resolve_seed_account("seed-new")
-    assert token == "plus-1"
-    assert globals.seed_map["seed-new"]["token"] == "plus-1"
-    # assigned account tier is written back to the new user (not left as "free").
+    assert auth._resolve_seed_account("seed-new") == ""
+    assert "seed-new" not in globals.seed_map
+
+    # Once the operator import persists the binding, the declared tier routes it.
+    _import_operator_seed("seed-new", "", "plus")
+    assert auth._resolve_seed_account("seed-new") == "plus-1"
     assert globals.seed_map["seed-new"]["plan_type"] == "plus"
 
 
 def test_switch_seed_account(db, monkeypatch):
     store.upsert_account("plus-1", plan_type="plus", status="healthy")
     store.upsert_account("plus-2", plan_type="plus", status="healthy")
-    globals.seed_map["seed-a"] = {"token": "plus-1", "plan_type": "plus", "conversations": []}
+    _import_operator_seed("seed-a", "plus-1", "plus")
     monkeypatch.setattr(auth.random, "choice", _pick_max_token)
     assert auth.switch_seed_account("seed-a") == "plus-2"
     assert globals.seed_map["seed-a"]["token"] == "plus-2"
 
 
-def test_switch_seed_account_new_user(db, monkeypatch):
+def test_switch_seed_account_requires_a_persisted_operator_grant(db):
     store.upsert_account("plus-1", plan_type="plus", status="healthy")
-    monkeypatch.setattr(auth.random, "choice", _pick_max_token)
-    token = auth.switch_seed_account("seed-new")
-    assert token == "plus-1"
-    assert globals.seed_map["seed-new"]["token"] == "plus-1"
-    # assigned account tier is written back even for a brand-new user.
-    assert globals.seed_map["seed-new"]["plan_type"] == "plus"
+    globals.seed_map["seed-new"] = {"token": "", "plan_type": "plus", "conversations": []}
+    assert auth.switch_seed_account("seed-new") == ""
+    assert globals.seed_map["seed-new"]["token"] == ""
 
 
 @pytest.mark.asyncio

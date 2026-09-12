@@ -1,0 +1,876 @@
+{
+ "captured_at": "2026-09-12",
+ "conversation": "conversation-1",
+ "events": [
+  {
+   "index": 0,
+   "kind": "non_json"
+  },
+  {
+   "index": 1,
+   "kind": "message_delta",
+   "shape": {
+    "c": "int",
+    "o": "str",
+    "p": "str",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "null",
+      "end_turn": "bool",
+      "id": "str",
+      "metadata": {
+       "exclusive_key": "str",
+       "is_visually_hidden_from_conversation": "bool",
+       "parent_id": "str",
+       "rebase_developer_message": "bool",
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 2,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "float",
+      "end_turn": "null",
+      "id": "str",
+      "metadata": {
+       "contextual_answers_message_type": "str",
+       "is_contextual_answers_system_message": "bool",
+       "is_visually_hidden_from_conversation": "bool",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 3,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "float",
+      "end_turn": "null",
+      "id": "str",
+      "metadata": {
+       "is_visually_hidden_from_conversation": "bool",
+       "message_source": "null",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "request_id": "str",
+       "system_hints": {
+        "items": "depth_limit",
+        "type": "array"
+       },
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 4,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "float",
+      "end_turn": "null",
+      "id": "str",
+      "metadata": {
+       "caterpillar_selected_sources": {
+        "items": "empty",
+        "type": "array"
+       },
+       "deep_research_version": "str",
+       "message_source": "null",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "request_id": "str",
+       "selected_mcp_sources": {
+        "items": "empty",
+        "type": "array"
+       },
+       "selected_sources": {
+        "items": "empty",
+        "type": "array"
+       },
+       "system_hints": {
+        "items": "depth_limit",
+        "type": "array"
+       },
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "venus_model_variant": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 5,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "o": "str",
+    "v": {
+     "items": {
+      "o": "str",
+      "p": "str",
+      "v": "float"
+     },
+     "type": "array"
+    }
+   }
+  },
+  {
+   "index": 6,
+   "kind": "other_json",
+   "shape": {
+    "conversation_id": "str",
+    "input_message": {
+     "author": {
+      "metadata": {},
+      "name": "null",
+      "role": "str"
+     },
+     "channel": "null",
+     "content": {
+      "content_type": "str",
+      "parts": {
+       "items": "str",
+       "type": "array"
+      }
+     },
+     "create_time": "float",
+     "end_turn": "null",
+     "id": "str",
+     "metadata": {
+      "is_visually_hidden_from_conversation": "bool",
+      "message_source": "null",
+      "parent_id": "str",
+      "request_id": "str",
+      "system_hints": {
+       "items": "str",
+       "type": "array"
+      },
+      "turn_exchange_id": "str",
+      "turn_id": "str",
+      "working_turn_id": "str"
+     },
+     "recipient": "str",
+     "status": "str",
+     "update_time": "null",
+     "weight": "float"
+    },
+    "type": "str"
+   },
+   "type": "input_message"
+  },
+  {
+   "index": 7,
+   "kind": "other_json",
+   "shape": {
+    "conversation_id": "str",
+    "input_message": {
+     "author": {
+      "metadata": {},
+      "name": "null",
+      "role": "str"
+     },
+     "channel": "null",
+     "content": {
+      "content_type": "str",
+      "parts": {
+       "items": "str",
+       "type": "array"
+      }
+     },
+     "create_time": "float",
+     "end_turn": "null",
+     "id": "str",
+     "metadata": {
+      "caterpillar_selected_sources": {
+       "items": "empty",
+       "type": "array"
+      },
+      "deep_research_version": "str",
+      "message_source": "null",
+      "parent_id": "str",
+      "request_id": "str",
+      "selected_mcp_sources": {
+       "items": "empty",
+       "type": "array"
+      },
+      "selected_sources": {
+       "items": "empty",
+       "type": "array"
+      },
+      "system_hints": {
+       "items": "str",
+       "type": "array"
+      },
+      "turn_exchange_id": "str",
+      "turn_id": "str",
+      "venus_model_variant": "str",
+      "working_turn_id": "str"
+     },
+     "recipient": "str",
+     "status": "str",
+     "update_time": "null",
+     "weight": "float"
+    },
+    "type": "str"
+   },
+   "type": "input_message"
+  },
+  {
+   "index": 8,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "o": "str",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "float",
+      "end_turn": "bool",
+      "id": "str",
+      "metadata": {
+       "cot_version": "str",
+       "default_model_slug": "str",
+       "is_visually_hidden_from_conversation": "bool",
+       "message_type": "str",
+       "model_slug": "str",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "parent_id": "str",
+       "rebase_system_message": "bool",
+       "request_id": "str",
+       "thinking_effort": "str",
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 9,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "float",
+      "end_turn": "bool",
+      "id": "str",
+      "metadata": {
+       "cot_version": "str",
+       "default_model_slug": "str",
+       "is_visually_hidden_from_conversation": "bool",
+       "message_type": "str",
+       "model_slug": "str",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "parent_id": "str",
+       "rebase_developer_message": "bool",
+       "request_id": "str",
+       "thinking_effort": "str",
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 10,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "float",
+      "end_turn": "null",
+      "id": "str",
+      "metadata": {
+       "cot_version": "str",
+       "default_model_slug": "str",
+       "is_visually_hidden_from_conversation": "bool",
+       "message_type": "str",
+       "model_slug": "str",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "parent_id": "str",
+       "request_id": "str",
+       "thinking_effort": "str",
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 11,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "float",
+      "end_turn": "bool",
+      "id": "str",
+      "metadata": {
+       "cot_version": "str",
+       "default_model_slug": "str",
+       "exclusive_key": "str",
+       "is_visually_hidden_from_conversation": "bool",
+       "message_type": "str",
+       "model_slug": "str",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "parent_id": "str",
+       "rebase_developer_message": "bool",
+       "request_id": "str",
+       "thinking_effort": "str",
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 12,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "str",
+      "content": {
+       "content_type": "str",
+       "language": "str",
+       "response_format_name": "null",
+       "text": "str"
+      },
+      "create_time": "float",
+      "end_turn": "bool",
+      "id": "str",
+      "metadata": {
+       "chatgpt_sdk": {
+        "attribution_id": "depth_limit",
+        "csp": "depth_limit",
+        "disable_loading_state": "depth_limit",
+        "distribution_channel": "depth_limit",
+        "fit_width": "depth_limit",
+        "height_hint": "depth_limit",
+        "hide_composer": "depth_limit",
+        "hide_full_screen_header": "depth_limit",
+        "hide_widget_actions": "depth_limit",
+        "hide_widget_feedback": "depth_limit",
+        "inline_frame_padding": "depth_limit",
+        "invocation_uuid": "depth_limit",
+        "prefers_border": "depth_limit",
+        "resolved_pineapple_uri": "depth_limit",
+        "resource_name": "depth_limit",
+        "tool_invoked_message": "depth_limit",
+        "tool_invoking_message": "depth_limit",
+        "turn_uuid": "depth_limit",
+        "width_hint": "depth_limit"
+       },
+       "citations": {
+        "items": "empty",
+        "type": "array"
+       },
+       "content_references": {
+        "items": "empty",
+        "type": "array"
+       },
+       "cot_version": "str",
+       "default_model_slug": "str",
+       "finish_details": {
+        "stop_tokens": "depth_limit",
+        "type": "depth_limit"
+       },
+       "is_complete": "bool",
+       "message_type": "str",
+       "model_slug": "str",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "parent_id": "str",
+       "request_id": "str",
+       "thinking_effort": "str",
+       "tool_invoked_message": "str",
+       "tool_invoking_message": "str",
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 13,
+   "kind": "other_json",
+   "shape": {
+    "conversation_id": "str",
+    "title": "str",
+    "type": "str"
+   },
+   "type": "title_generation"
+  },
+  {
+   "index": 14,
+   "kind": "other_json",
+   "shape": {
+    "conversation_id": "str",
+    "event": "str",
+    "marker": "str",
+    "message_id": "str",
+    "type": "str"
+   },
+   "type": "message_marker"
+  },
+  {
+   "index": 15,
+   "kind": "other_json"
+  },
+  {
+   "index": 16,
+   "kind": "other_json",
+   "shape": {
+    "async_status": "int",
+    "conversation_id": "str",
+    "type": "str"
+   },
+   "type": "conversation_async_status"
+  },
+  {
+   "index": 17,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "str",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "float",
+      "end_turn": "null",
+      "id": "str",
+      "metadata": {
+       "cot_version": "str",
+       "default_model_slug": "str",
+       "invoked_plugin": {},
+       "invoked_resource": {
+        "api_tool_version": "depth_limit",
+        "app_name": "depth_limit",
+        "contains_mcp_source": "depth_limit",
+        "description": "depth_limit",
+        "publish_status": "depth_limit",
+        "resource_uri": "depth_limit"
+       },
+       "is_visually_hidden_from_conversation": "bool",
+       "message_type": "str",
+       "model_slug": "str",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "parent_id": "str",
+       "request_id": "str",
+       "thinking_effort": "str",
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 18,
+   "kind": "other_json",
+   "shape": {
+    "c": "int",
+    "v": {
+     "conversation_id": "str",
+     "error": "null",
+     "error_code": "null",
+     "message": {
+      "author": {
+       "metadata": {},
+       "name": "null",
+       "role": "str"
+      },
+      "channel": "null",
+      "content": {
+       "content_type": "str",
+       "parts": {
+        "items": "depth_limit",
+        "type": "array"
+       }
+      },
+      "create_time": "float",
+      "end_turn": "bool",
+      "id": "str",
+      "metadata": {
+       "can_save": "bool",
+       "chatgpt_sdk_suppressed_response": "bool",
+       "citations": {
+        "items": "empty",
+        "type": "array"
+       },
+       "content_references": {
+        "items": "empty",
+        "type": "array"
+       },
+       "conversation_followup_suggestions_eligible": "bool",
+       "cot_version": "str",
+       "default_model_slug": "str",
+       "invoked_plugin": {},
+       "invoked_resource": {
+        "api_tool_version": "depth_limit",
+        "app_name": "depth_limit",
+        "contains_mcp_source": "depth_limit",
+        "description": "depth_limit",
+        "publish_status": "depth_limit",
+        "resource_uri": "depth_limit"
+       },
+       "is_visually_hidden_from_conversation": "bool",
+       "message_type": "str",
+       "model_slug": "str",
+       "model_switcher_deny": {
+        "items": "empty",
+        "type": "array"
+       },
+       "parent_id": "str",
+       "request_id": "str",
+       "search_result_groups": {
+        "items": "empty",
+        "type": "array"
+       },
+       "story_events": {
+        "items": "empty",
+        "type": "array"
+       },
+       "thinking_effort": "str",
+       "turn_exchange_id": "str",
+       "turn_id": "str",
+       "working_turn_id": "str"
+      },
+      "recipient": "str",
+      "status": "str",
+      "update_time": "null",
+      "weight": "float"
+     }
+    }
+   }
+  },
+  {
+   "index": 19,
+   "kind": "other_json",
+   "shape": {
+    "conversation_id": "str",
+    "event": "str",
+    "marker": "str",
+    "message_id": "str",
+    "type": "str"
+   },
+   "type": "message_marker"
+  },
+  {
+   "index": 20,
+   "kind": "other_json",
+   "shape": {
+    "conversation_id": "str",
+    "metadata": {
+     "a32e6ebcb": "int",
+     "auto_switcher_race_winner": "null",
+     "cluster_region": "str",
+     "conduit_prewarmed": "bool",
+     "did_auto_switch_to_reasoning": "bool",
+     "did_prompt_contain_image": "bool",
+     "fast_convo": "bool",
+     "is_autoswitcher_enabled": "bool",
+     "is_first_turn": "bool",
+     "is_multimodal": "null",
+     "is_search": "null",
+     "low_turn_topic_ttl": "bool",
+     "message_id": "str",
+     "model_slug": "str",
+     "plan_type": "str",
+     "plan_type_bucket": "str",
+     "pro_mode_turn_topic_streaming": "bool",
+     "product_experience": "str",
+     "region": "null",
+     "replace_stream_status": "bool",
+     "request_id": "str",
+     "requested_model_experience": "str",
+     "resume_with_websockets": "bool",
+     "search_tool_call_count": "null",
+     "search_tool_query_types": "null",
+     "server_ttfvt_ms": "float",
+     "service": "null",
+     "streaming_async_status": "bool",
+     "temporal_conversation_turn": "bool",
+     "tool_invoked": "bool",
+     "tool_name": "str",
+     "turn_exchange_id": "str",
+     "turn_mode": "str",
+     "turn_trace_id": "str",
+     "turn_use_case": "str",
+     "user_agent": "str",
+     "warmup_state": "str"
+    },
+    "type": "str"
+   },
+   "type": "server_ste_metadata"
+  },
+  {
+   "index": 21,
+   "kind": "other_json",
+   "shape": {
+    "conversation_id": "str",
+    "type": "str"
+   },
+   "type": "message_stream_complete"
+  },
+  {
+   "index": 22,
+   "kind": "terminal"
+  }
+ ],
+ "events_seen": 23,
+ "note": "Redacted field-name/shape capture of one real Plus Deep Research turn through the mirror (23 events). Values are type names only; no URLs, prompts, identifiers or credentials were retained.",
+ "source": "real mirror Plus Deep Research",
+ "state": "complete",
+ "terminal": true
+}

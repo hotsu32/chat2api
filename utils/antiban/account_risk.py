@@ -12,6 +12,7 @@ Step B（account_degraded_link_enabled 打开后生效）：命中后联动熔�
 接入点：chatgpt/chatFormat.py 的 system 角色分支 + moderation 类型 chunk。
 """
 
+import hashlib
 import json
 import re
 import threading
@@ -20,6 +21,7 @@ from typing import Any, Dict, Optional
 
 import utils.globals as globals
 from utils import configs
+from utils.antiban.concurrency import anon_id
 from utils.Logger import logger
 
 
@@ -72,7 +74,7 @@ def _persist() -> None:
         with open(globals.ACCOUNT_WARNINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(globals.account_warnings, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"[account_risk] persist failed: {e}")
+        logger.error(f"[account_risk] persist failed: {type(e).__name__}")
 
 
 def _extract_text(message: Dict[str, Any]) -> str:
@@ -142,16 +144,19 @@ def _escalate(token: str, hit_count: int) -> None:
         if hit_count >= threshold:
             circuit.mark_dead(token, "degraded_quality")
             logger.error(
-                f"[account_risk] token={token[:12]}... degraded x{hit_count} >= {threshold} → mark_dead"
+                f"[account_risk] {anon_id(token)} degraded x{hit_count} >= {threshold} → mark_dead"
             )
         else:
-            cooldown.extend_cooldown(token, configs.account_degraded_cooldown)
+            cooldown.extend_cooldown(
+                token, configs.account_degraded_cooldown, reason="degraded_quality"
+            )
             logger.warning(
-                f"[account_risk] token={token[:12]}... degraded x{hit_count} < {threshold} "
+                f"[account_risk] {anon_id(token)} degraded x{hit_count} < {threshold} "
                 f"→ extend_cooldown {configs.account_degraded_cooldown}s"
             )
     except Exception as e:
-        logger.error(f"[account_risk] escalate error (suppressed): {e}")
+        # 只记录异常类型：异常原文可能带上游响应内容
+        logger.error(f"[account_risk] escalate error (suppressed): {type(e).__name__}")
 
 
 def sniff(token: Optional[str], message: Dict[str, Any], raw_chunk: Optional[Dict[str, Any]] = None) -> None:
@@ -189,14 +194,15 @@ def sniff(token: Optional[str], message: Dict[str, Any], raw_chunk: Optional[Dic
         if not pattern_hit:
             return
 
-        # 命中：构造记录
-        snippet = (text or json.dumps(message.get("metadata") or {}, ensure_ascii=False))[:300]
+        # 命中：构造记录。**不保存上游原文**——命中文本可能含会话内容或账号信息。
+        # 保留 pattern（规则命中项）、长度和不可逆摘要：足以做「同一条文案重复出现」
+        # 的聚类校准，但无法还原正文。
+        text_for_digest = text or json.dumps(message.get("metadata") or {}, ensure_ascii=False)
         record = {
             "hit_at": int(time.time()),
             "pattern": pattern_hit,
-            "snippet": snippet,
-            "conversation_id": (raw_chunk or {}).get("conversation_id") if isinstance(raw_chunk, dict) else None,
-            "message_id": message.get("id"),
+            "text_digest": hashlib.sha256(text_for_digest.encode("utf-8")).hexdigest()[:16],
+            "text_len": len(text_for_digest),
             "role": (message.get("author") or {}).get("role"),
         }
 
@@ -208,17 +214,15 @@ def sniff(token: Optional[str], message: Dict[str, Any], raw_chunk: Optional[Dic
                 del bucket[: len(bucket) - _MAX_RECORDS_PER_TOKEN]
             _persist()
 
-        logger.warning(
-            f"[account_risk] HIT token={token[:12]}... pattern={pattern_hit} "
-            f"snippet={snippet[:120]!r}"
-        )
+        # 只记录匿名账号标识与命中规则；命中文案本身不入日志
+        logger.warning(f"[account_risk] HIT {anon_id(token)} pattern={pattern_hit}")
 
         # Step B: 降智命中 → 联动冷却/熔断（校准后启用，避免误杀）
         if configs.account_degraded_link_enabled:
             _escalate(token, len(bucket))
     except Exception as e:
-        # 任何异常都不能影响主流程
-        logger.error(f"[account_risk] sniff error (suppressed): {e}")
+        # 任何异常都不能影响主流程；只记异常类型，原文可能带上游内容
+        logger.error(f"[account_risk] sniff error (suppressed): {type(e).__name__}")
 
 
 def get_warnings(token: str) -> list:
@@ -229,13 +233,16 @@ def get_warnings(token: str) -> list:
 
 
 def get_warning_summary() -> Dict[str, Dict[str, Any]]:
-    """供后台批量展示：token -> {count, last_hit_at, last_pattern}。"""
+    """供后台批量展示：anon_id -> {count, last_hit_at, last_pattern}。
+
+    键用匿名标识而不是 token：这个返回值会进后台接口/日志，不能携带凭据。
+    """
     summary = {}
     for token, records in globals.account_warnings.items():
         if not records:
             continue
         last = records[-1]
-        summary[token] = {
+        summary[anon_id(token)] = {
             "count": len(records),
             "last_hit_at": last.get("hit_at"),
             "last_pattern": last.get("pattern"),

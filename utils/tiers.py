@@ -60,7 +60,7 @@ _DEFAULT_TIERS: Dict[str, Dict[str, Any]] = {
     },
     "pro": {
         "label": "Pro",
-        "account_plan_types": ["plus", "pro"],
+        "account_plan_types": ["pro"],
         "group": "pro",
         "quota_limit": 2000,
         "quota_period": "day",
@@ -129,11 +129,14 @@ def normalize_tier_id(tier_id: Optional[str]) -> str:
 
 
 def tier_account_plan_types(tier_id: str) -> List[str]:
-    """该档可用的 account.plan_type 号组范围（半专属分池的过滤键）。"""
+    """配置可以缩小号组，不能让 Plus/Pro 产品使用其他档账号。"""
     tier = get_tier(tier_id)
     if not tier:
         return []
-    return tier.get("account_plan_types") or []
+    configured = tier.get("account_plan_types") or []
+    if tier_id in ("plus", "pro"):
+        return [tier_id] if tier_id in configured else []
+    return configured
 
 
 def tier_allows_model(tier_id: str, model: str) -> bool:
@@ -171,13 +174,15 @@ def _quota_since(period: Optional[str]) -> int:
 def resolve_user_tier(seed: str) -> Optional[str]:
     """从**已支付且未过期的订单**解析用户当前档位；无 user_auth 行返回 None。
 
-    返回 None 是「不设限」的信号：只对 SaaS 注册用户执行档位/额度，车队运营侧走原有
-    主链路不受影响（Stage 2 的 fail-open 边界）。
+    返回 None 只说明「这个 seed 没有 SaaS 身份」，**不是**「可以随便用号池」：
+    号池分配的授权契约在 ``chatgpt/authorization.py``（注册付费/Plus 试用，
+    或显式运营者/导入/开发句柄），本函数只回答档位问题。历史上把 None 读成
+    「运营者，不设限」正是匿名 cookie 拿到付费号池的那条链路。
 
     档位不再读 ``user_auth.tier_id``（那是「注册时写死 free 再也没变过」的死字段），
     改为每次从 orders 推导 —— orders 是唯一真相源，到期靠算不靠扫表回收。
     SaaS 用户但无有效套餐时返回 ``""``（有账号无权益），与 None 语义相反，
-    调用方必须用 ``is None`` 区分；本函数对外只承诺「None = 不设限」这一条契约。
+    调用方必须用 ``is None`` 区分；本函数对外只承诺「None = 无 SaaS 身份」这一条契约。
 
     数据层故障会向上抛 ``store.StoreError``：此时我们**无法**判断这个 seed 是运营者
     还是过期用户，静默按「不设限」处理等于把闸门焊死在开的位置。由 ``enforce_tier``
@@ -192,9 +197,8 @@ def resolve_user_tier(seed: str) -> Optional[str]:
         return entitlements.effective_tier(seed)
     except StoreError:
         raise
-    except Exception as e:
-        logger.warning(f"[tiers] resolve_user_tier error: {e}")
-        return None
+    except Exception:
+        raise StoreError("Entitlement resolution failed") from None
 
 
 def user_usage_total(seed: str, tier_id: str) -> int:
@@ -218,7 +222,10 @@ def enforce_tier(seed: str, model: Optional[str] = None) -> None:
 
     三态（见 ``utils.entitlements``）：
 
-      - ``None``  无 user_auth 行（运营者 seed / 直传 token）→ 不设限（fail-open）。
+      - ``None``  无 user_auth 行（直传 token / 已授权的运营者 seed）→ 本函数不设档位限制。
+        注意这里**不做**授权判断：谁能拿到号池账号由 ``chatgpt/authorization.py`` 的分配
+        契约决定。本函数放行一个未知 seed，不等于它会拿到账号 —— 拿不到账号的请求会在
+        取号阶段被拒（401/503），不会到达上游。
       - ``""``    SaaS 用户但无未过期的已支付订单 → 402 拒绝（未购买 / 已过期）。
       - 档位 id   按该档执行模型白名单 + 额度。
 
@@ -233,14 +240,20 @@ def enforce_tier(seed: str, model: Optional[str] = None) -> None:
 
     try:
         tier_id = resolve_user_tier(seed)
-    except StoreError as e:
-        logger.error(f"[tiers] entitlement lookup failed for seed, refusing: {e}")
+    except StoreError:
+        logger.error("[tiers] entitlement lookup failed, refusing")
         raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
 
     if tier_id is None:
         return  # 非 SaaS 用户（运营者 seed / 直传 token），不设限
 
     if not tier_id:
+        from utils.seed_lifecycle import freeze_if_expired, LifecycleDenied
+        try:
+            freeze_if_expired(seed)
+        except (StoreError, LifecycleDenied):
+            logger.error("[tiers] Seed freeze unavailable, refusing")
+            raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试") from None
         # 注册了但没买 / 买过但已过期 —— 不降级到免费档，直接拒绝并引导续费
         raise HTTPException(status_code=402, detail="套餐已过期或未购买，请前往续费")
 
@@ -248,6 +261,11 @@ def enforce_tier(seed: str, model: Optional[str] = None) -> None:
 
     if model and not tier_allows_model(tier_id, model):
         raise HTTPException(status_code=403, detail="当前档位不包含此模型")
+
+    # Plus/Pro 按有效期使用，不再把旧目录的每日次数作为付费门禁。
+    # 注册试用的三次额度由独立预留/结算控制，不复用历史 usage 计数。
+    if tier_id in ("plus", "pro"):
+        return
 
     limit = tier.get("quota_limit")
     if limit is not None and limit > 0:

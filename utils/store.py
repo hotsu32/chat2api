@@ -25,6 +25,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from typing import Any, Dict, List, Optional
 
 from utils import configs
@@ -163,6 +164,28 @@ def init_db() -> None:
                     );
                     CREATE INDEX IF NOT EXISTS idx_orders_email ON orders(email);
 
+                    CREATE TABLE IF NOT EXISTS trial_grants (
+                        email      TEXT PRIMARY KEY,
+                        seed       TEXT,
+                        tier       TEXT NOT NULL,
+                        total      INTEGER NOT NULL,
+                        used       INTEGER NOT NULL DEFAULT 0,
+                        created_at INTEGER,
+                        updated_at INTEGER
+                    );
+
+                    CREATE TABLE IF NOT EXISTS trial_reservations (
+                        res_id      TEXT PRIMARY KEY,
+                        email       TEXT NOT NULL,
+                        seed        TEXT,
+                        status      TEXT NOT NULL DEFAULT 'reserved',
+                        instance_id TEXT,
+                        created_at  INTEGER,
+                        updated_at  INTEGER
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_trial_res_email
+                        ON trial_reservations(email, status);
+
                     CREATE TABLE IF NOT EXISTS email_tokens (
                         token      TEXT PRIMARY KEY,
                         email      TEXT NOT NULL,
@@ -194,6 +217,9 @@ _ADDED_COLUMNS = (
     # 密码版本：改密 / 重置密码时 +1，旧会话 token 里的 pwv 对不上即失效。
     # 默认 1 让老行天然等于「从未改过密」，无需数据回填。
     ("user_auth", "pw_version", "INTEGER NOT NULL DEFAULT 1"),
+    # 预留归属进程实例 id（格式 "<pid>:<uuid>"），用于孤儿预留回收。
+    # 旧库升级时补空列；旧行 NULL 表示来源未知，回收时不触碰（保守处理）。
+    ("trial_reservations", "instance_id", "TEXT"),
 )
 
 
@@ -230,6 +256,56 @@ def set_meta(key: str, value: str) -> None:
             )
     except Exception as e:
         logger.error(f"[store] set_meta error: {e}")
+
+
+# Outcome codes for bind_payment_transaction. Callers must switch on these instead of
+# collapsing them into a bool: "already bound to this order" (idempotent, let it
+# through) and "bound to another order" (replay, refuse) are opposite decisions.
+PAYMENT_TXN_BOUND = "bound"
+PAYMENT_TXN_IDEMPOTENT = "idempotent"
+PAYMENT_TXN_CONFLICT = "conflict"
+
+
+def bind_payment_transaction(key: str, order_id: str) -> str:
+    """Atomically claim ``key`` (a provider transaction id) for ``order_id``.
+
+    Returns :data:`PAYMENT_TXN_BOUND` (new claim), :data:`PAYMENT_TXN_IDEMPOTENT`
+    (this order already owns it) or :data:`PAYMENT_TXN_CONFLICT` (another order owns
+    it). Raises :class:`StoreError` when the read, the write or the transaction fails.
+
+    The read and the write must be one transaction. ``get_meta`` -> ``set_meta`` is two,
+    so two concurrent callbacks carrying the same provider transaction id can both read
+    "unbound" and both claim it, settling one payment against two orders. BEGIN IMMEDIATE
+    (plus ``_WRITE_LOCK`` for in-process callers) makes the loser observe the winner's
+    row instead of a stale empty one.
+
+    Unlike ``get_meta``/``set_meta`` this never swallows a failure: "the binding store is
+    unreadable" is a different fact from "no binding", and collapsing the two is what
+    lets a database hiccup fail open into settlement.
+    """
+    if not key or not order_id:
+        raise StoreError("payment transaction binding requires a key and an order id")
+    try:
+        with _WRITE_LOCK, closing(_connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+                if row is None:
+                    conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (key, order_id))
+                    conn.execute("COMMIT")
+                    return PAYMENT_TXN_BOUND
+                # A row that exists but does not hold this exact order id owns the
+                # transaction — including a blank legacy value: refuse rather than guess.
+                matched = row[0] == order_id
+                conn.execute("ROLLBACK")
+                return PAYMENT_TXN_IDEMPOTENT if matched else PAYMENT_TXN_CONFLICT
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+    except Exception as exc:
+        logger.error("[store] payment transaction binding unavailable")
+        raise StoreError("payment transaction binding unavailable") from exc
 
 
 def is_migrated() -> bool:
@@ -334,6 +410,66 @@ def upsert_account(token: str, **fields: Any) -> None:
         logger.error(f"[store] upsert_account error: {e}")
 
 
+def sync_account_presence(token: str, *, errored: bool) -> None:
+    """Import credentials without treating inventory presence as health evidence.
+
+    Error signals can restrict a healthy row; clearing an error list requires a
+    separate successful health probe before an unhealthy row becomes routable.
+    """
+    status = "unhealthy" if errored else "healthy"
+    now = int(time.time())
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            conn.execute(
+                "INSERT INTO accounts (token, status, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(token) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at "
+                "WHERE accounts.status='healthy' AND excluded.status='unhealthy'",
+                (token, status, now),
+            )
+    except Exception as exc:
+        raise StoreError("account inventory persistence unavailable") from exc
+
+
+def apply_health_probe(token: str, expected_status: str, status: str, checked_at: int) -> bool:
+    """Apply probe evidence only to an unchanged, probe-managed account.
+
+    A probe never inserts accounts or clears manual/circuit restrictions. False
+    means its snapshot is stale; persistence failures remain explicit.
+    """
+    if expected_status not in {"healthy", "degraded", "unhealthy", "dead"} \
+            or status not in {"healthy", "unhealthy"}:
+        return False
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            result = conn.execute(
+                "UPDATE accounts SET status=?, last_health_check=?, updated_at=? "
+                "WHERE token=? AND status=? AND COALESCE(last_health_check, 0)<=?",
+                (status, checked_at, int(time.time()), token, expected_status, checked_at),
+            )
+            return result.rowcount == 1
+    except Exception as exc:
+        raise StoreError("health state persistence unavailable") from exc
+
+
+def set_account_status(token: str, status: str) -> bool:
+    """Set an existing account's canonical routing status.
+
+    This never creates an account: circuit signals must not turn arbitrary
+    caller input into durable pool inventory.
+    """
+    if status not in {"healthy", "degraded", "unhealthy", "dead", "disabled"}:
+        raise ValueError("invalid account status")
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            result = conn.execute(
+                "UPDATE accounts SET status=?, updated_at=? WHERE token=?",
+                (status, int(time.time()), token),
+            )
+            return result.rowcount == 1
+    except Exception as exc:
+        raise StoreError("account status persistence unavailable") from exc
+
+
 def delete_account(token: str) -> None:
     try:
         with _WRITE_LOCK, _connect() as conn:
@@ -411,6 +547,80 @@ def list_users() -> List[Dict[str, Any]]:
         return []
 
 
+def _revoke_grants(conn, status: str, seed: Optional[str] = None) -> int:
+    """Delete grant rows (and their conversations) inside one open transaction."""
+    if seed is None:
+        rows = conn.execute(
+            "SELECT seed FROM users WHERE status=?", (status,)
+        ).fetchall()
+        seeds = [r[0] for r in rows]
+    else:
+        # The status guard stays: this revokes a *grant*, it does not delete an
+        # arbitrary identity row that happens to share the name.
+        seeds = [r[0] for r in conn.execute(
+            "SELECT seed FROM users WHERE seed=? AND status=?", (seed, status)
+        ).fetchall()]
+    if seeds:
+        marks = ",".join("?" for _ in seeds)
+        conn.execute(f"DELETE FROM conversations WHERE seed IN ({marks})", seeds)
+        conn.execute(f"DELETE FROM users WHERE seed IN ({marks})", seeds)
+    return len(seeds)
+
+
+def _revoke_grants_transactionally(status: str, seed: Optional[str]) -> int:
+    """Run :func:`_revoke_grants` under one transaction; fail closed on any error."""
+    try:
+        with _WRITE_LOCK, closing(_connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                removed = _revoke_grants(conn, status, seed)
+                conn.execute("COMMIT")
+                return removed
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    except sqlite3.Error as e:
+        logger.error(f"[store] revoke grants error: {e}")
+        raise StoreError("operator grant revocation failed") from None
+
+
+def delete_operator_grants(status: str) -> int:
+    """Revoke **every** grant carrying ``status``; returns the number removed.
+
+    This is the revoke-all primitive behind ``DELETE /seedtoken`` with
+    ``seed="clear"``. It is deliberately self-contained: it selects the rows and
+    deletes them in one ``BEGIN IMMEDIATE`` transaction instead of delegating to a
+    ``list_users`` sweep. That sweep could not tell "no grant left" from "the read
+    failed" (``list_users`` folds a storage error into an empty list), so a single
+    failed read silently turned "revoke everything" into "revoke nothing" while the
+    caller answered success — and the grants, not the bindings, are what authorize
+    the paid pool.
+
+    Failures raise :class:`StoreError` instead: the caller must be able to report a
+    failed revocation rather than a completed one.
+
+    ``status`` is passed in by the caller (``chatgpt.authorization`` owns the
+    constant) because this module must not import the authorization layer.
+    """
+    return _revoke_grants_transactionally(status, None)
+
+
+def delete_operator_grant(seed: str, status: str) -> bool:
+    """Revoke one named grant; ``True`` when a grant row was actually removed.
+
+    A durable grant can outlive its in-memory ``seed_map`` binding (a failed
+    persist, a restart, a direct DB edit), so revocation is keyed by name against
+    SQLite and does not require the binding to still exist. Returns ``False`` when
+    there was no such grant — that is the caller's "not found".
+
+    Raises :class:`StoreError` on a storage failure, like
+    :func:`delete_operator_grants`.
+    """
+    if not seed:
+        return False
+    return _revoke_grants_transactionally(status, seed) > 0
+
+
 # ---------------------------------------------------------------------- user_auth
 
 _USER_AUTH_COLUMNS = {
@@ -431,7 +641,7 @@ def _row_pw_version(value: Any) -> int:
         return _PW_VERSION_DEFAULT
 
 
-def get_user_auth(email: str) -> Optional[Dict[str, Any]]:
+def get_user_auth(email: str, strict: bool = False) -> Optional[Dict[str, Any]]:
     try:
         with _connect() as conn:
             row = conn.execute(
@@ -446,8 +656,10 @@ def get_user_auth(email: str) -> Optional[Dict[str, Any]]:
                 "tier_id": row[3], "status": row[4], "pw_version": _row_pw_version(row[5]),
                 "created_at": row[6], "updated_at": row[7],
             }
-    except Exception as e:
-        logger.error(f"[store] get_user_auth error: {e}")
+    except Exception:
+        logger.error('[store] user_auth_lookup_unavailable')
+        if strict:
+            raise StoreError('User auth lookup unavailable') from None
         return None
 
 
@@ -614,7 +826,51 @@ def activate_order(order_id: str, expires_at: int) -> bool:
         return False
 
 
-def get_order(order_id: str) -> Optional[Dict[str, Any]]:
+def settle_order(order_id: str, now: Optional[int] = None) -> bool:
+    """Atomically stack same-owner/tier paid time and settle a pending order.
+
+    BEGIN IMMEDIATE protects independent connections/processes as well as local
+    callers. This does not verify payment: only a verified provider or explicit
+    local mock settlement may call it. Failures raise; a retry never adds time
+    to an already paid order.
+    """
+    from utils import plans
+    from utils.entitlements import _order_window
+    now = int(time.time()) if now is None else int(now)
+    try:
+        with _WRITE_LOCK, closing(_connect()) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                row = conn.execute(f'SELECT {_ORDER_COLS} FROM orders WHERE order_id=?', (order_id,)).fetchone()
+                order = _order_row_to_dict(row) if row else None
+                detail = plans.plan_detail(order['tier_id']) if order else None
+                if not order or order['status'] != 'pending' or not detail or not order['email']:
+                    conn.execute('ROLLBACK')
+                    return False
+                base = now
+                for paid in conn.execute(
+                    f"SELECT {_ORDER_COLS} FROM orders WHERE email=? AND status='paid'",
+                    (order['email'],),
+                ).fetchall():
+                    window = _order_window(_order_row_to_dict(paid))
+                    if window and window[0] == detail['tier']:
+                        base = max(base, window[2])
+                conn.execute(
+                    "UPDATE orders SET status='paid', expires_at=?, updated_at=? WHERE order_id=? AND status='pending'",
+                    (base + detail['days'] * 86400, now, order_id),
+                )
+                conn.execute('COMMIT')
+                return True
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute('ROLLBACK')
+                raise
+    except Exception as exc:
+        raise StoreError('Order settlement unavailable') from exc
+
+
+def get_order(order_id: str, strict: bool = False) -> Optional[Dict[str, Any]]:
+    """Read an order; payment paths use strict=True to distinguish DB failure."""
     try:
         with _connect() as conn:
             row = conn.execute(
@@ -622,8 +878,10 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
                 (order_id,),
             ).fetchone()
             return _order_row_to_dict(row) if row else None
-    except Exception as e:
-        logger.error(f"[store] get_order error: {e}")
+    except Exception:
+        logger.error('[store] order_lookup_unavailable')
+        if strict:
+            raise StoreError('Order lookup unavailable') from None
         return None
 
 
@@ -666,6 +924,323 @@ def list_orders(email: Optional[str] = None, strict: bool = False) -> List[Dict[
         if strict:
             raise StoreError(str(e)) from e
         return []
+
+
+# ------------------------------------------------------------------- trials
+# Plus 免费试用的两张表。余额是钱，不是统计量，所以状态流转全部落库：
+#
+#   trial_grants        每个 email 一行，``total`` 发了多少次、``used`` 结算掉多少次。
+#   trial_reservations  每次生成一行，``reserved`` -> ``settled`` / ``released``。
+#
+# 余额 = total - used - 未终结的 reserved 数。预留先占额度，成功才计 used，失败退回。
+# 不做内存计数：进程重启后余额必须原样，多线程下也不能靠 GIL 侥幸。
+
+_TRIAL_GRANT_COLS = "email, seed, tier, total, used, created_at, updated_at"
+
+
+def _trial_grant_row_to_dict(r: tuple) -> Dict[str, Any]:
+    return {
+        "email": r[0], "seed": r[1], "tier": r[2], "total": int(r[3] or 0),
+        "used": int(r[4] or 0), "created_at": r[5], "updated_at": r[6],
+    }
+
+
+def create_trial_grant(email: str, seed: str, tier: str, total: int) -> bool:
+    """发一份试用额度。已经发过则不覆盖，返回 False（授予幂等）。
+
+    用 ``INSERT ... ON CONFLICT DO NOTHING`` 而不是「先查再插」：注册重试和并发
+    重复提交都会走到这里，读-改-写会让同一个人拿到两份额度。
+    """
+    if not email or total <= 0:
+        return False
+    now = int(time.time())
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO trial_grants (email, seed, tier, total, used, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 0, ?, ?) ON CONFLICT(email) DO NOTHING",
+                (email, seed, tier, int(total), now, now),
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.error("[store] create_trial_grant error")
+        raise StoreError("create_trial_grant failed") from e
+
+
+def create_user_with_trial(
+    email: str,
+    *,
+    password_hash: str,
+    seed: str,
+    status: str,
+    trial_tier: str,
+    trial_total: int,
+) -> None:
+    """注册原子 DAO：建 user_auth 行 + 发试用额度，同一事务。
+
+    两步任一失败则整笔回滚 —— 不会出现「注册成功但没有额度」的僵尸账号，
+    也不会出现「有额度但没有账号」的游离授权。
+
+    ``user_auth`` 行以 ``INSERT OR FAIL`` 写入（主键冲突即失败）；
+    ``trial_grants`` 行用与 :func:`create_trial_grant` 相同的 ``ON CONFLICT DO NOTHING``
+    保留授予幂等语义，但此处赠额失败（即已存在同 email 的 grant）也视为整笔失败：
+    同一 email 不能拿两份试用额度，重复注册应被拒绝在外层。
+
+    失败时抛 :class:`StoreError`。
+    """
+    if not email or not seed:
+        raise StoreError("create_user_with_trial: email and seed are required")
+    now = int(time.time())
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO user_auth (email, password_hash, seed, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (email, password_hash, seed, status, now, now),
+                )
+                cur = conn.execute(
+                    "INSERT INTO trial_grants (email, seed, tier, total, used, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 0, ?, ?) ON CONFLICT(email) DO NOTHING",
+                    (email, seed, trial_tier, int(trial_total), now, now),
+                )
+                if cur.rowcount == 0:
+                    # grant conflict = duplicate email grant; roll back the user row too
+                    conn.execute("ROLLBACK")
+                    raise StoreError("create_user_with_trial: trial grant conflict for email")
+                conn.execute(
+                    "INSERT INTO users (seed, plan_type, current_account, status, created_at, updated_at) "
+                    "VALUES (?, ?, '', 'trial', ?, ?)",
+                    (seed, trial_tier, now, now),
+                )
+                conn.execute("COMMIT")
+            except StoreError:
+                raise
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    except StoreError:
+        raise
+    except Exception as e:
+        logger.error("[store] create_user_with_trial error")
+        raise StoreError("create_user_with_trial failed") from e
+
+
+def get_trial_grant(email: str, strict: bool = False) -> Optional[Dict[str, Any]]:
+    """该 email 的试用额度行；从未发过返回 None。
+
+    ``strict=True`` 时查询失败抛 :class:`StoreError` —— 权益判定分不清「没发过」和
+    「查不到」，把后者当成前者等于一次锁库就让所有试用用户被拒。
+    """
+    if not email:
+        return None
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                f"SELECT {_TRIAL_GRANT_COLS} FROM trial_grants WHERE email=?", (email,)
+            ).fetchone()
+            return _trial_grant_row_to_dict(row) if row else None
+    except Exception as e:
+        logger.error("[store] get_trial_grant error")
+        if strict:
+            raise StoreError("get_trial_grant failed") from e
+        return None
+
+
+def count_open_trial_reservations(email: str, strict: bool = False) -> int:
+    """尚未终结（``reserved``）的预留数 —— 已占住但还没计入 used 的那部分。"""
+    if not email:
+        return 0
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM trial_reservations WHERE email=? AND status='reserved'",
+                (email,),
+            ).fetchone()
+            return int(row[0]) if row else 0
+    except Exception as e:
+        logger.error("[store] count_open_trial_reservations error")
+        if strict:
+            raise StoreError("count_open_trial_reservations failed") from e
+        return 0
+
+
+def reserve_trial(res_id: str, email: str, seed: str, limit: int,
+                  instance_id: str = "") -> bool:
+    """原子占一次试用额度：额度够且账号仍有效才插预留行。
+
+    整个「校验账号 + 算余额 + 插行」在一条 SQL 的单事务里完成（INSERT ... SELECT ... WHERE），
+    并且持 _WRITE_LOCK。两件事必须在同一条语句里做：
+    1. 检查 user_auth 行的 seed / status 仍与调用方读到的一致（防止预读后账号被吊销或 seed 被轮换）；
+    2. 检查余额 >= limit（防止并发四次都通过）。
+    分成两步写就会有竞态；此处用 subquery 把两个条件折进 WHERE，保证原子性。
+
+    instance_id 标记本次预留的归属进程（格式 "<pid>:<uuid>"），用于进程崩溃后的孤儿回收。
+    空字符串表示调用方未传（兼容旧调用），存为 NULL，回收时不触碰（保守处理）。
+    """
+    if not res_id or not email:
+        return False
+    now = int(time.time())
+    iid = instance_id if instance_id else None
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO trial_reservations "
+                "  (res_id, email, seed, status, instance_id, created_at, updated_at) "
+                "SELECT ?, ?, ?, 'reserved', ?, ?, ? WHERE ("
+                # 余额条件：total - used - open_reserved >= limit
+                "  SELECT g.total - g.used - ("
+                "    SELECT COUNT(*) FROM trial_reservations r"
+                "     WHERE r.email = g.email AND r.status = 'reserved'"
+                "  ) FROM trial_grants g WHERE g.email = ? AND g.seed = ? AND g.tier = 'plus'"
+                ") >= ? "
+                # 账号有效性二次校验：seed 和 status 必须与调用方读到的一致，
+                # 防止 reserve() 读完 user_auth 到这里之间账号被吊销或 seed 被轮换。
+                "AND EXISTS ("
+                "  SELECT 1 FROM user_auth u"
+                "   WHERE u.email = ? AND u.seed = ? AND u.status = 'active'"
+                ")",
+                (res_id, email, seed, iid, now, now, email, seed, int(limit), email, seed),
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.error("[store] reserve_trial error")
+        raise StoreError("reserve_trial failed") from e
+
+
+def get_trial_reservation(res_id: str) -> Optional[Dict[str, Any]]:
+    if not res_id:
+        return None
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT res_id, email, seed, status, created_at, updated_at "
+                "FROM trial_reservations WHERE res_id=?",
+                (res_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {"res_id": row[0], "email": row[1], "seed": row[2], "status": row[3],
+                    "created_at": row[4], "updated_at": row[5]}
+    except Exception as e:
+        logger.error("[store] get_trial_reservation error")
+        return None
+
+
+def settle_trial_reservation(res_id: str, seed: str) -> bool:
+    """预留 → 已消费：置 ``settled`` 并把 ``used`` +1，两步在同一事务里。
+
+    返回是否真的发生了流转。重复终态（回调重投 / 终止事件投递两次）第二次返回
+    False 且不再扣 —— ``WHERE status='reserved'`` 保证只有一次 UPDATE 命中。
+
+    ``seed`` 必填且在 SQL 里校验归属：预留 id 是服务端生成的，但它会随请求上下文流转，
+    拿到一个 id 就能结算别人的额度不是可接受的边界。
+    """
+    if not res_id or not seed:
+        return False
+    now = int(time.time())
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE trial_reservations SET status='settled', updated_at=? "
+                    "WHERE res_id=? AND status='reserved' AND seed=? "
+                    "AND email IN (SELECT email FROM user_auth WHERE seed=?)",
+                    [now, res_id, seed, seed],
+                )
+                if cur.rowcount == 0:
+                    conn.execute("ROLLBACK")
+                    return False
+                row = conn.execute(
+                    "SELECT email FROM trial_reservations WHERE res_id=?", (res_id,)
+                ).fetchone()
+                conn.execute(
+                    "UPDATE trial_grants SET used = used + 1, updated_at = ? WHERE email = ?",
+                    (now, row[0] if row else ""),
+                )
+                conn.execute("COMMIT")
+                return True
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    except Exception as e:
+        logger.error("[store] settle_trial_reservation error")
+        raise StoreError("settle_trial_reservation failed") from e
+
+
+def release_trial_reservation(res_id: str, seed: str) -> bool:
+    """预留 → 已释放（生成失败 / 断连 / 非 2xx），额度退回余额。
+
+    只对仍是 ``reserved`` 的行生效：已结算的不退款，避免一次成功被迟到的错误路径
+    抹掉；已释放的重复调用返回 False，不产生第二次退款。
+
+    ``seed`` 必填且在 SQL 里校验归属，防止跨账号释放。
+    """
+    if not res_id or not seed:
+        return False
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            cur = conn.execute(
+                "UPDATE trial_reservations SET status='released', updated_at=? "
+                "WHERE res_id=? AND status='reserved' AND seed=? "
+                "AND email IN (SELECT email FROM user_auth WHERE seed=?)",
+                [int(time.time()), res_id, seed, seed],
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.error("[store] release_trial_reservation error")
+        raise StoreError("release_trial_reservation failed") from e
+
+
+def get_orphan_instance_ids(current_instance_id: str) -> List[str]:
+    """返回所有「外来」reserved 预留行的 instance_id 去重列表。
+
+    用于孤儿回收：调用方拿到这个列表后逐一检查进程存活性，再把确认已死的 id
+    传给 :func:`release_reservations_by_instance_ids` 批量释放。
+
+    只返回 ``instance_id IS NOT NULL AND instance_id != current`` 的行；
+    ``NULL`` 行（旧代码写入、未迁移）不返回，调用方不触碰它们。
+    """
+    if not current_instance_id:
+        return []
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT instance_id FROM trial_reservations "
+                "WHERE status='reserved' AND instance_id IS NOT NULL "
+                "AND instance_id != ?",
+                (current_instance_id,),
+            ).fetchall()
+            return [r[0] for r in rows]
+    except Exception as e:
+        logger.error("[store] get_orphan_instance_ids error")
+        raise StoreError("get_orphan_instance_ids failed") from e
+
+
+def release_reservations_by_instance_ids(dead_instance_ids: List[str]) -> int:
+    """将归属已死进程实例的 ``reserved`` 预留行批量释放，返回释放数量。
+
+    调用方（``trials.recover_orphan_reservations``）负责通过 PID 存活检查确认这些
+    instance_id 对应的进程已死；本函数只做 SQL 更新，不做任何存活判断。
+    空列表直接返回 0，不执行 SQL。
+    """
+    if not dead_instance_ids:
+        return 0
+    now = int(time.time())
+    placeholders = ",".join("?" * len(dead_instance_ids))
+    try:
+        with _WRITE_LOCK, _connect() as conn:
+            cur = conn.execute(
+                f"UPDATE trial_reservations SET status='released', updated_at=? "
+                f"WHERE status='reserved' AND instance_id IN ({placeholders})",
+                [now, *dead_instance_ids],
+            )
+            return cur.rowcount
+    except Exception as e:
+        logger.error("[store] release_reservations_by_instance_ids error")
+        raise StoreError("release_reservations_by_instance_ids failed") from e
 
 
 # ------------------------------------------------------------------ email_tokens
@@ -1080,9 +1655,11 @@ def load_all() -> Dict[str, Any]:
                 {"id": f"proxy-{i + 1}", "name": p[0], "proxy_url": p[1]} for i, p in enumerate(proxies)
             ]
 
-            users = conn.execute("SELECT seed, plan_type, current_account FROM users ORDER BY rowid").fetchall()
-            for seed, plan_type, account in users:
-                result["seed_map"][seed] = {"token": account, "plan_type": plan_type, "conversations": []}
+            users = conn.execute("SELECT seed, plan_type, current_account, status FROM users ORDER BY rowid").fetchall()
+            for seed, plan_type, account, status in users:
+                result["seed_map"][seed] = {
+                    "token": account, "plan_type": plan_type, "status": status, "conversations": []
+                }
 
             convs = conn.execute("SELECT conv_id, seed, account, title, create_time, update_time FROM conversations").fetchall()
             for conv_id, seed, account, title, create_time, update_time in convs:

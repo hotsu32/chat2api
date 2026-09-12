@@ -16,6 +16,11 @@ import copy
 def sanitize_session(session: dict) -> dict:
     """Preserve verified account capabilities, remove private session credentials."""
     result = copy.deepcopy(session)
+    # The browser identifies the mirror user with the Seed cookie.  Upstream
+    # credentials stay server-side and are injected by the reverse proxy.
+    # Keep the field for compatibility with the official session shape, but
+    # never expose the account bearer token to a shared user.
+    result['accessToken'] = ''
     result['sessionToken'] = ''
     result.pop('refreshToken', None)
     user = result.get('user') or {}
@@ -130,7 +135,7 @@ def build_session(access_token: str, anonymize: bool = True) -> dict:
             "residencyRegion": residency,
             "computeResidency": residency,
         },
-        "accessToken": access_token,
+        "accessToken": "",
         "authProvider": "openai",
         "sessionToken": "",
     }

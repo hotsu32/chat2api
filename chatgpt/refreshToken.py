@@ -24,6 +24,10 @@ import utils.globals as globals
 _session_key_lock = asyncio.Lock()
 
 
+def _anon(value: str) -> str:
+    return hashlib.sha256((value or "").encode()).hexdigest()[:12]
+
+
 def persist_refresh_map():
     globals.persist_refresh_map()
 
@@ -119,7 +123,7 @@ async def _migrate_session_key(old_key, new_key, new_access_token, jwt_exp, prox
             "fail_count": 0,
             "jwt_exp": jwt_exp,
             "last_proxy": proxy_url or meta.get("last_proxy", ""),
-            "rotated_from": old_key[:24] + "...",
+            "rotated_from": _anon(old_key),
             "rotated_at": now,
         })
         globals.refresh_map[new_key] = meta
@@ -158,8 +162,8 @@ async def _migrate_session_key(old_key, new_key, new_access_token, jwt_exp, prox
             persist_error_tokens()
 
         logger.info(
-            f"[rotation] session-token rotated: {old_key[:16]}... -> {new_key[:16]}... "
-            f"(jwt_exp={jwt_exp}, +{jwt_exp - now}s)"
+            f"[rotation] session-token rotated old={_anon(old_key)} new={_anon(new_key)} "
+            f"jwt_lifetime={jwt_exp - now}s"
         )
 
 
@@ -186,7 +190,7 @@ async def rt2ac(refresh_token, force_refresh=False):
                 globals.error_token_list[:] = [item for item in globals.error_token_list if item != refresh_token]
                 persist_error_tokens()
             persist_refresh_map()
-            logger.info(f"refresh_token -> access_token with openai: {access_token}")
+            logger.info(f"[rt2ac] refresh succeeded account={_anon(refresh_token)}")
             return access_token
         except HTTPException as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -243,7 +247,7 @@ async def sess2ac(session_token, force_refresh=False):
                 persist_error_tokens()
             persist_refresh_map()
         logger.info(
-            f"session_cookie -> access_token OK (key={effective_key[:12]}..., "
+            f"[sess2ac] refresh succeeded account={_anon(effective_key)} "
             f"jwt_exp_in={(jwt_exp - int(time.time())) if jwt_exp else 'n/a'}s, "
             f"rotated={'yes' if effective_key != storage_key else 'no'})"
         )
@@ -292,7 +296,7 @@ async def fetch_session_access_token(session_cookie):
         raw_text = (r.text or "").strip()
         content_type = r.headers.get("content-type", "")
         logger.info(
-            f"[sess2ac] key={storage_key[:12]}... status={r.status_code} "
+            f"[sess2ac] account={_anon(storage_key)} status={r.status_code} "
             f"ctype={content_type} body_len={len(raw_text)} "
             f"proxy={'yes' if proxy_url else 'no'} chunks={cookie_header.count('session-token')}"
         )
@@ -301,16 +305,14 @@ async def fetch_session_access_token(session_cookie):
             if storage_key not in globals.error_token_list and r.status_code in (401, 403):
                 globals.error_token_list.append(storage_key)
                 persist_error_tokens()
-            raise Exception(
-                f"chatgpt.com/api/auth/session status={r.status_code}: {raw_text[:200]}"
-            )
+            raise RuntimeError(f"upstream_session_status_{r.status_code}")
         if not raw_text:
-            raise Exception("chatgpt.com/api/auth/session 返回空响应；cookie 可能已失效")
+            raise RuntimeError("upstream_session_empty")
 
         try:
             payload = json.loads(raw_text)
         except json.JSONDecodeError:
-            raise Exception(f"非 JSON 响应 ctype={content_type}: {raw_text[:200]}")
+            raise RuntimeError("upstream_session_non_json")
 
         # 未登录时 NextAuth 返回 {} 或 {"user": null}
         access_token = payload.get("accessToken") or payload.get("access_token")
@@ -318,10 +320,7 @@ async def fetch_session_access_token(session_cookie):
             if storage_key not in globals.error_token_list:
                 globals.error_token_list.append(storage_key)
                 persist_error_tokens()
-            raise Exception(
-                f"session cookie 无效或过期（response keys={list(payload.keys())}）。"
-                f"提示：NextAuth session token 可能分片，请确保同时提供 .0 和 .1（若存在）"
-            )
+            raise RuntimeError("upstream_session_unauthenticated")
 
         # NextAuth 滚动续期：尝试从响应 Set-Cookie 中提取新 session-token；
         # 若拿到，立刻把所有数据结构里的旧 key 替换为新 key 并持久化，达成"永不过期"
@@ -331,7 +330,7 @@ async def fetch_session_access_token(session_cookie):
             rotated = _extract_rotated_cookie(r, session_cookie)
         except Exception as e:
             rotated = None
-            logger.warning(f"[sess2ac] extract rotated cookie failed (non-fatal): {e!r}")
+            logger.warning(f"[sess2ac] extract rotated cookie failed kind={type(e).__name__}")
         if rotated:
             new_storage_key = "sess-" + rotated
             await _migrate_session_key(
@@ -347,15 +346,15 @@ async def fetch_session_access_token(session_cookie):
         now = int(time.time())
         refresh_meta = globals.refresh_map.get(storage_key, {})
         refresh_meta.update({
-            "last_error": str(e)[:300],
+            "last_error": type(e).__name__,
             "last_error_at": now,
             "fail_count": int(refresh_meta.get("fail_count", 0)) + 1,
             "last_proxy": proxy_url or "",
         })
         globals.refresh_map[storage_key] = refresh_meta
         persist_refresh_map()
-        logger.error(f"[sess2ac] key={storage_key[:12]}... failed: {str(e)[:400]}")
-        raise HTTPException(status_code=500, detail=str(e)[:300])
+        logger.error(f"[sess2ac] account={_anon(storage_key)} failed={type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Account website session unavailable") from None
     finally:
         await client.close()
         del client

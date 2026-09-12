@@ -1,4 +1,10 @@
 """store: SQLite DAO — CRUD, tier pool, conversations, usage, migration idempotency."""
+import contextlib
+import sqlite3
+import threading
+
+import pytest
+
 import utils.store as store
 
 ACCESS = "eyJhbGciOiJIUzI1NiJ9.payload.signature"
@@ -109,3 +115,154 @@ def test_load_all_roundtrip(db):
     assert loaded["seed_map"]["seed-a"]["token"] == ACCESS
     assert "conv-1" in loaded["conversation_map"]
     assert loaded["routing_config"]["bindings"][ACCESS]["proxy_url"] == "http://p"
+
+
+def test_reload_preserves_frozen_seed_state_and_history(db):
+    store.upsert_user('frozen-seed', plan_type='plus', current_account='original-account', status='frozen')
+    store.upsert_conversation('historical-conversation', 'frozen-seed', 'original-account', 'History', 't1', 't2')
+    loaded = store.load_all()
+    assert loaded['seed_map']['frozen-seed']['status'] == 'frozen'
+    assert loaded['seed_map']['frozen-seed']['token'] == 'original-account'
+    assert loaded['seed_map']['frozen-seed']['conversations'] == ['historical-conversation']
+
+
+# ---------------------------------------------------- payment transaction binding
+
+class _MetaGuard:
+    """Connection proxy whose statements against the ``meta`` KV table fail."""
+
+    def __init__(self, conn, fail_on):
+        self._conn = conn
+        self._fail_on = fail_on
+
+    def execute(self, sql, *params):
+        keyword = sql.strip().split(" ", 1)[0].lower()
+        if "meta" in sql.lower() and self._fail_on in ("any", keyword):
+            raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, *params)
+
+    # Context-manager dunders are looked up on the type, not via __getattr__.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._conn.__exit__(*exc_info)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_bind_payment_transaction_claims_a_fresh_key(db):
+    key = "paytxn:fake:txn-1"
+    assert store.bind_payment_transaction(key, "ord-a") == store.PAYMENT_TXN_BOUND
+    assert store.get_meta(key) == "ord-a"
+
+
+def test_bind_payment_transaction_same_order_is_idempotent(db):
+    """渠道重投同一笔回调：同一张单再认领一次不算冲突，也不改写绑定值。"""
+    key = "paytxn:fake:txn-dup"
+    assert store.bind_payment_transaction(key, "ord-a") == store.PAYMENT_TXN_BOUND
+    assert store.bind_payment_transaction(key, "ord-a") == store.PAYMENT_TXN_IDEMPOTENT
+    assert store.get_meta(key) == "ord-a"
+
+
+def test_bind_payment_transaction_other_order_conflicts_without_overwriting(db):
+    """一个支付流水号绑给第二张单 = 重放：拒绝，且绝不改写已有绑定。"""
+    key = "paytxn:fake:txn-shared"
+    store.bind_payment_transaction(key, "ord-first")
+    assert store.bind_payment_transaction(key, "ord-second") == store.PAYMENT_TXN_CONFLICT
+    assert store.get_meta(key) == "ord-first", "第二张单覆盖了第一张的绑定"
+
+
+@pytest.mark.parametrize("key,order_id", [("", "ord-a"), ("paytxn:fake:txn", ""), ("", "")])
+def test_bind_payment_transaction_refuses_incomplete_identity(db, key, order_id):
+    with pytest.raises(store.StoreError):
+        store.bind_payment_transaction(key, order_id)
+
+
+@pytest.mark.parametrize("fail_on", ["any", "select", "insert"])
+def test_bind_payment_transaction_storage_failure_is_typed(db, monkeypatch, fail_on):
+    """读 / 写 / 整条连接的故障都必须变成 StoreError，而不是静默返回一个结果。
+
+    把「查不了」和「没绑过」混为一谈，就是让一次数据库打嗝变成一次放行。
+    """
+    real_connect = store._connect
+    monkeypatch.setattr(store, "_connect", lambda: _MetaGuard(real_connect(), fail_on))
+
+    with pytest.raises(store.StoreError):
+        store.bind_payment_transaction("paytxn:fake:txn-fail", "ord-a")
+
+
+def test_bind_payment_transaction_connect_failure_is_typed(db, monkeypatch):
+    def _boom(*_a, **_kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_connect", _boom)
+    with pytest.raises(store.StoreError):
+        store.bind_payment_transaction("paytxn:fake:txn-fail", "ord-a")
+
+
+def test_bind_payment_transaction_write_failure_leaves_no_partial_row(db, monkeypatch):
+    """写失败后不得留下半截绑定：重投时必须仍然看到「未绑定」这一真实状态。"""
+    key = "paytxn:fake:txn-half"
+    real_connect = store._connect
+    monkeypatch.setattr(store, "_connect", lambda: _MetaGuard(real_connect(), "insert"))
+
+    with pytest.raises(store.StoreError):
+        store.bind_payment_transaction(key, "ord-a")
+
+    # 绕过被注入故障的连接，直接读文件：绑定表里没有半截行
+    conn = sqlite3.connect(store._db_path())
+    try:
+        assert conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone() is None
+    finally:
+        conn.close()
+
+
+@pytest.fixture(params=[True, False], ids=["with-write-lock", "begin-immediate-only"])
+def in_process_lock(request):
+    """Whether the process-local write lock is left in place during a race test."""
+    return request.param
+
+
+def test_bind_payment_transaction_has_exactly_one_winner_under_concurrency(
+    db, monkeypatch, in_process_lock
+):
+    """N 个并发认领同一个流水号：恰好一个 bound，其余 conflict。
+
+    旧实现先读后写，并发时全部都能读到「未绑定」，于是同一个流水号绑上了 N 张单。
+
+    两个变体各覆盖一层防线：``with-write-lock`` 是单进程常态；``begin-immediate-only``
+    把进程内写锁换成 no-op，逼出真正的 SQLite 事务语义 —— 多 worker 部署时
+    ``_WRITE_LOCK`` 形同虚设，跨进程只有 BEGIN IMMEDIATE + busy_timeout 在挡。
+    只有这一层在时仍然必须恰好一个赢家，否则删掉 BEGIN IMMEDIATE 也没人会发现。
+    """
+    if not in_process_lock:
+        monkeypatch.setattr(store, "_WRITE_LOCK", contextlib.nullcontext())
+
+    key = "paytxn:fake:txn-race"
+    order_ids = [f"ord-race-{i}" for i in range(8)]
+    barrier = threading.Barrier(len(order_ids))
+    lock = threading.Lock()
+    outcomes = {}
+
+    def _worker(order_id):
+        barrier.wait(timeout=10)
+        try:
+            outcome = store.bind_payment_transaction(key, order_id)
+        except store.StoreError as exc:
+            outcome = f"store_error:{exc}"
+        with lock:
+            outcomes[order_id] = outcome
+
+    threads = [threading.Thread(target=_worker, args=(order_id,)) for order_id in order_ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert len(outcomes) == len(order_ids), outcomes
+    winners = [o for o in order_ids if outcomes[o] == store.PAYMENT_TXN_BOUND]
+    assert len(winners) == 1, outcomes
+    assert list(outcomes.values()).count(store.PAYMENT_TXN_CONFLICT) == len(order_ids) - 1, outcomes
+    assert store.get_meta(key) == winners[0]

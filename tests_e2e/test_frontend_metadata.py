@@ -8,10 +8,13 @@ from gateway.reverseProxy import _rewrite_and_scrub
 
 
 def test_user_metadata_keeps_upgrade_eligibility_with_anonymous_identity(
-        client, monkeypatch):
+        client, monkeypatch, seed_account, seed_user, make_access_token):
     from gateway import reverseProxy as proxy
     from utils import resp_cache
     resp_cache.invalidate_all()
+    token = make_access_token(plan_type='free')
+    seed_account(token, plan_type='free')
+    seed_user('seed-free', token, plan_type='free')
 
     class Result:
         status_code = 200
@@ -192,10 +195,13 @@ def test_entry_preserves_bound_capabilities_and_session_privacy(
         assert data['flags']['assignment'] == name
         assert data['session']['account']['hasFloraFeature'] == (name == 'b')
         assert data['session']['account']['isDelinquent'] == (name == 'a')
+        assert data['session']['accessToken'] == ''
         assert 'DO-NOT-EXPOSE' not in response.text
+        assert tokens[name] not in response.text
         assert 'private@example.test' not in response.text
         session = client.get('/api/auth/session').json()
         assert session['account'] == data['session']['account']
+        assert session['accessToken'] == ''
         assert session['sessionToken'] == ''
     assert calls == ['a', 'b']
     renewed = client.get('/api/auth/session?refresh=true&reason=integrity_state_missing&account_id=b',
@@ -203,7 +209,7 @@ def test_entry_preserves_bound_capabilities_and_session_privacy(
     assert renewed.status_code == 200
     assert renewed.headers['cache-control'] == 'no-store'
     assert renewed.json()['account']['id'] == 'a'
-    assert renewed.json()['accessToken'] != tokens['a']
+    assert renewed.json()['accessToken'] == ''
     assert 'DO-NOT-EXPOSE' not in renewed.text
     assert calls == ['a', 'b', 'a']
     import utils.globals as globals
@@ -217,9 +223,13 @@ def test_entry_preserves_bound_capabilities_and_session_privacy(
     frontend.invalidate_frontend_cache()
 
 
-def test_auth_verification_failure_does_not_return_success(client, monkeypatch):
+def test_auth_verification_failure_does_not_return_success(
+        client, monkeypatch, seed_account, seed_user, make_access_token):
     from fastapi import HTTPException
     from gateway import backend
+    token = make_access_token(plan_type='free')
+    seed_account(token, plan_type='free')
+    seed_user('seed-free', token, plan_type='free')
 
     async def unavailable(token):
         raise HTTPException(status_code=503, detail='Website session unavailable')

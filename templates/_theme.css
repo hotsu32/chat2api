@@ -50,6 +50,16 @@ a { color: inherit; }
 .nav-user { color: var(--gray); font-family: var(--mono); font-size: 12px; }
 .nav-signout { background: none; border: none; padding: 0; font: inherit; font-size: 13px; color: var(--gray); cursor: pointer; }
 .nav-signout:hover { color: var(--black); }
+@media (max-width: 960px) {
+  .nav { align-items: flex-start; flex-direction: column; gap: 16px; margin-bottom: 36px; }
+  .nav-links { width: 100%; flex-wrap: wrap; gap: 4px 20px; }
+  .nav-links a, .nav-signout { display: inline-flex; align-items: center; min-height: 44px; white-space: nowrap; }
+  .nav-user { flex-basis: 100%; overflow-wrap: anywhere; }
+  .brand { white-space: nowrap; }
+}
+@media (max-width: 480px) {
+  .page { padding: 28px 24px 64px; }
+}
 
 /* ---------------------------------------------------------------- 排版 */
 h1 { font-weight: 700; font-size: 40px; line-height: 1.08; letter-spacing: -0.035em; margin: 0 0 12px; }

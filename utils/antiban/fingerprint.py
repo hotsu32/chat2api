@@ -257,7 +257,13 @@ def _persist_fp() -> None:
 
 
 def ensure_extended(token: str) -> Dict:
-    """确保 fp_map[token] 含扩展字段；缺失则补齐并持久化。返回 fp 副本。"""
+    """确保 fp_map[token] 含扩展字段；缺失则补齐并持久化。返回 fp 副本。
+
+    注意：本函数写入的都是**浏览器画像**（structured metadata），与 chatgpt/fp.py
+    写入的 HTTP 头字段共用一个扁平命名空间。出网边界是 chatgpt.fp.FP_HEADER_FIELDS
+    白名单——调用方组 HTTP 头时必须走 chatgpt.fp.extract_header_fp，
+    绝不能把整条 fp 记录 update 进 headers（dict 值会让 curl_cffi 抛 AttributeError）。
+    """
     if not token:
         return {}
     fp = globals.fp_map.setdefault(token, {})

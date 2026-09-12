@@ -103,8 +103,14 @@ def _find_event_end(buf: bytes) -> int:
     return end
 
 
-def extract_data_json(event: bytes) -> Optional[dict]:
-    """Parse the ``data`` buffer of a complete SSE event as a JSON object.
+def is_complete_event(event: bytes) -> bool:
+    """Distinguish a terminated event from the partial EOF item we preserve."""
+    match = _EVENT_END_RE.search(event)
+    return match is not None and match.end() == len(event)
+
+
+def extract_data(event: bytes) -> Optional[str]:
+    """Parse the SSE data buffer, preserving multi-line field semantics.
 
     Follows the SSE field-parsing rules: every ``data`` field value in the
     event is collected and the values are joined with a single LF; exactly one
@@ -112,8 +118,7 @@ def extract_data_json(event: bytes) -> Optional[dict]:
     and ``event:``/``id:``/``retry:`` fields are ignored.  The joined buffer is
     parsed **once**.
 
-    Returns the decoded dict, or ``None`` for comments, ``[DONE]``, data that
-    is not a JSON object, and events with no data field at all.
+    Returns None for events with no data field; includes non-JSON terminals.
     """
     try:
         text = event.decode("utf-8", errors="replace")
@@ -139,7 +144,15 @@ def extract_data_json(event: bytes) -> Optional[dict]:
     # "data:  {...}" leaves a leading space here.  That is insignificant JSON
     # whitespace — treating it as non-JSON would silently drop a real native
     # event (this is what hid resume_conversation_token events).
-    payload = "\n".join(values).strip()
+    return "\n".join(values)
+
+
+def extract_data_json(event: bytes) -> Optional[dict]:
+    """Decode the joined data buffer once; non-object data returns None."""
+    data = extract_data(event)
+    if data is None:
+        return None
+    payload = data.strip()
     if not payload or payload == "[DONE]" or not payload.startswith("{"):
         return None
     try:

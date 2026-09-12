@@ -3,7 +3,8 @@
 复用 orchestrator 的 session + CSRF 模式，但作用域是「真实用户」而非「运营者」：
 
   - 密码用 PBKDF2 加盐哈希落库（不存明文）。
-  - 注册即生成 seed，落到 ``globals.seed_map`` + ``store.user_auth``；免费档默认（``default_tier_id``）。
+  - 注册即生成 seed，落到 ``globals.seed_map`` + ``store.user_auth``；
+    并发放 Plus 免费试用 3 次（``utils.trials``）。正式产品不提供 Free 档。
   - 登录后跳 ``/?token=<seed>`` 直接进聊天，全程无运营者介入。
   - 邮箱验证若缺 SMTP 资源 → 占位（``require_email_verification`` 默认 False，跳过验证）。
 
@@ -29,8 +30,9 @@ import utils.globals as globals
 import utils.mailer as mailer
 import utils.ratelimit as ratelimit
 import utils.store as store
+import utils.trials as trials
 from utils.Logger import logger
-from utils.tiers import default_tier_id, get_tier, normalize_tier_id, user_usage_total
+from utils.tiers import get_tier, normalize_tier_id, user_usage_total
 
 _PBKDF2_ITERATIONS = 100_000
 
@@ -224,6 +226,33 @@ REVOKED_DETAIL = "登录状态已失效，请重新登录"
 # 跳登录页时带上它，模板据此显示原因（值进 URL，保持 ASCII 短标记）
 REVOKED_QUERY = "reason=pw_changed"
 
+# 被封禁 / 冻结的账号是**另一回事**：不是「你的会话过期了」，而是「这个账号不能用了」。
+# 两者混用会让被封的人去改密码重试，然后反复撞在同一堵墙上。
+DISABLED_DETAIL = "账号已被停用"
+DISABLED_QUERY = "reason=disabled"
+
+# 这些 user_auth.status 值视为「登录态一律无效」。封禁走的是会话吊销（bump_pw_version）
+# 这条既有合同，但库里 status 与 cookie 版本是两份状态：万一 bump 失败或有人手工改库，
+# 这里再挡一道，方向是 fail-closed（宁可把一个状态异常的账号挡在门外，也不放进来）。
+#
+# **只有 banned**：`frozen` 属于 Seed 绑定的到期状态（见 utils/seed_lifecycle），
+# 它冻结的是绑定而不是账号 —— 订阅过期的用户必须还能登录并续费，把他一并锁在门外
+# 等于让「续费」这个唯一的恢复路径不可达。两者不是一回事，所以不合并。
+_REVOKED_STATUSES = frozenset({"banned"})
+
+
+def revoke_user_sessions(email: str) -> int:
+    """吊销该账号此前签发的**全部** web 会话，返回新的密码版本号。
+
+    实现就是既有的 ``store.bump_pw_version``：会话 token 里带 ``pwv``，版本一变，
+    所有旧 token 在 :func:`_current_email` 里都对不上号。不引入第二套会话表 ——
+    「改密即踢下线」这条路径已经被验证过，封禁复用同一条，行为一致且没有新状态。
+
+    ``StoreError`` 向上抛：吊销失败必须让调用方知道，绝不能报「已封禁」而实际上
+    对方手里的 cookie 还能用。
+    """
+    return store.bump_pw_version(email)
+
 
 def _set_session_cookies(request: Request, response: Response, email: str,
                          pw_version: Optional[int] = None) -> None:
@@ -252,6 +281,7 @@ def _current_email(request: Request) -> str:
 
     密码版本在这里比对：本函数本来就要查一次 ``user_auth``（确认账号还在），
     顺带核对 ``pwv`` 是零成本的，而放到 ``_verify_session`` 里则要额外查库。
+    账号状态也一并核对：封禁/冻结的账号即使持有未过期的旧 cookie 也不放行。
     """
     token = request.cookies.get(configs.user_session_cookie) or ""
     email, pwv = _verify_session(token) if token else (None, 0)
@@ -260,8 +290,10 @@ def _current_email(request: Request) -> str:
     row = store.get_user_auth(email)
     if not row:
         raise HTTPException(status_code=401, detail="未登录")
+    if (row.get("status") or "active").strip().lower() in _REVOKED_STATUSES:
+        raise HTTPException(status_code=401, detail=DISABLED_DETAIL)
     if pwv != int(row.get("pw_version") or 1):
-        # 该账号改过密码 —— 这张 token 是改密之前签发的，已被吊销
+        # 该账号改过密码（或被封禁触发了同样的吊销）—— 这张 token 是之前签发的，已失效
         raise HTTPException(status_code=401, detail=REVOKED_DETAIL)
     return email
 
@@ -387,20 +419,23 @@ async def register(request: Request):
 
     seed = pysecrets.token_hex(16)
     need_verify = configs.require_email_verification
-    # strict：写不进去就不能往下走。静默失败的话用户会拿到一张「查无此人」的会话
-    # cookie，之后每个页面 401 且没有任何解释 —— 看起来像注册成功了，其实没有。
+    # 注册与试用赠额同一事务：若赠额写入失败，user_auth 行一起回滚，不留无额度僵尸账号。
     try:
-        store.upsert_user_auth(
-            email, password_hash=hash_password(password), seed=seed,
-            tier_id=default_tier_id(), status="unverified" if need_verify else "active",
-            strict=True,
+        store.create_user_with_trial(
+            email,
+            password_hash=hash_password(password),
+            seed=seed,
+            status="unverified" if need_verify else "active",
+            trial_tier=trials.TRIAL_TIER,
+            trial_total=trials.SIGNUP_TRIAL_COUNT,
         )
-    except store.StoreError as e:
-        logger.error(f"[user] 注册写库失败 {email}: {e}")
+    except store.StoreError:
+        logger.error("[user] 注册写库失败")
         return fail("注册暂时不可用，请稍后重试", 503)
-    # 落到 seed_map + users，首请求由 _resolve_seed_account 分配号
-    globals.seed_map[seed] = {"token": "", "plan_type": None, "conversations": []}
-    globals.persist_seed_map()
+    # users 已与账号和试用额度一起提交；只发布这个 Seed，避免重写其他绑定/历史。
+    globals.seed_map[seed] = {
+        "token": "", "plan_type": trials.TRIAL_TIER, "status": "trial", "conversations": []
+    }
 
     # 4) 需验证邮箱：发验证信并停在提示页（不发登录 session）
     if need_verify:
@@ -422,8 +457,16 @@ async def signin_page(request: Request, reason: str = ""):
 
     区分「被踢下线」和「本来就没登录」：前者要给一句解释，否则用户在另一台设备上
     只看到莫名跳回登录页，会当成 bug 报上来，而不是「安全措施生效了」。
+
+    封禁是第三种情况，必须说成「账号被停用」而不是「密码变了」—— 后者会让被封的人
+    去走一遍找回密码，然后在成功改密后继续被挡，白跑一趟还以为是系统故障。
     """
-    notice = "密码已变更，此设备的登录状态已失效，请用新密码重新登录" if reason == "pw_changed" else None
+    if reason == "pw_changed":
+        notice = "密码已变更，此设备的登录状态已失效，请用新密码重新登录"
+    elif reason == "disabled":
+        notice = "该账号已被停用，如有疑问请联系客服"
+    else:
+        notice = None
     return _render_with_csrf(request, "signin.html", {"error": None, "notice": notice})
 
 
@@ -468,6 +511,11 @@ async def signin(request: Request):
 
     # 成功即清账号桶：否则本人 4 次笔误 + 攻击者补 1 次就被锁，太脆
     ratelimit.reset(_signin_email_key(email))
+
+    # 封禁 / 冻结账号：口令正确也不发会话。放在验密之后 —— 否则这个分支就成了
+    # 「输入任意密码即可查询该邮箱是否被封」的状态预言机。
+    if (row.get("status") or "active").strip().lower() in _REVOKED_STATUSES:
+        return fail("该账号已被停用，如有疑问请联系客服", 403)
 
     # 需邮箱验证但尚未验证 → 拦截（防止未验证账号直接使用）
     if configs.require_email_verification and (row.get("status") or "") != "active":
@@ -517,16 +565,33 @@ def _token_state(token: str, kind: str) -> str:
     return "ok"
 
 
+def account_is_disabled(email: str) -> bool:
+    """账号是否处于「停用」状态（封禁）。
+
+    封禁必须是一条**单向**的状态：任何「证明你是本人」的流程（验证邮箱、重置密码）
+    都只该恢复登录能力，而不该顺手把人解封。否则封禁形同虚设 —— 被封的人控制着
+    自己的邮箱，走一遍找回密码就把自己放回来了。
+
+    查不到行按「未停用」处理：调用方各自有「账号不存在」的处理，语义不在这里混淆。
+    """
+    row = store.get_user_auth(email) or {}
+    return (row.get("status") or "").strip().lower() in _REVOKED_STATUSES
+
+
 @app.get("/verify-email", response_class=HTMLResponse)
 async def verify_email_page(request: Request, token: str = ""):
-    """邮箱验证链接落地页：校验 token → 置 status=active。"""
+    """邮箱验证链接落地页：校验 token → 置 status=active（被封禁账号除外）。"""
     state = _token_state(token, "verify")
     email = ""
     if state == "ok":
         row = store.get_email_token(token)
         email = row.get("email") or ""
         store.mark_email_token_used(token)
-        store.upsert_user_auth(email, status="active")
+        if account_is_disabled(email):
+            # 验证邮箱只该把 unverified 变 active，不该覆盖 banned。
+            logger.warning("[user] verify-email ignored for a disabled account")
+        else:
+            store.upsert_user_auth(email, status="active")
     return _render_with_csrf(request, "verify_email.html", {"state": state, "email": email, "dev_link": ""})
 
 
@@ -592,6 +657,15 @@ async def reset_password(request: Request):
         )
     row = store.get_email_token(token)
     target = row.get("email")
+    # 被封禁 / 冻结的账号不能靠「重置密码」复活。写在最前面：不 bump、不作废 token、
+    # 不写新密码 —— 被封的人控制着自己的邮箱，这条路径若能把人放回来，封禁就是装饰。
+    if account_is_disabled(target):
+        logger.warning("[user] reset-password refused for a disabled account")
+        return _render_with_csrf(
+            request, "reset_password.html",
+            {"error": "该账号已被停用，如有疑问请联系客服", "token": "", "done": False},
+            status_code=403,
+        )
     # 先吊销会话再作废 token：bump 失败时 token 还活着，用户原地重试即可，
     # 不用重走一遍 forgot 流程 —— 别把罕见的 DB 故障摊给刚证明了邮箱所有权的人。
     try:
@@ -604,7 +678,7 @@ async def reset_password(request: Request):
             status_code=500,
         )
     store.mark_email_token_used(token)
-    # 重置密码即证明邮箱控制权 → 一并置为 active。
+    # 重置密码即证明邮箱控制权 → 一并置为 active（上一段已挡住停用账号）。
     # strict：写不进去就不能报「已完成」。静默失败的话页面说改好了，实际密码没变 ——
     # 用户拿新密码登录 401、旧密码却还能用，比直接报错难排查得多。
     try:

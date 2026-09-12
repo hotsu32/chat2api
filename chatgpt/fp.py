@@ -9,11 +9,67 @@ from ua_generator.options import Options
 
 import utils.globals as globals
 from utils import configs
+from utils.Logger import logger
 from utils.proxy_health import weighted_choice
 from utils.routing import get_bound_proxy
 
 MAX_SUPPORTED_CHROME_MAJOR = 124
 MIN_SUPPORTED_CHROME_MAJOR = 119
+
+# ---------------------------------------------------------------------------
+# Outbound HTTP header boundary
+# ---------------------------------------------------------------------------
+# 一个 fp_map 条目是单一扁平命名空间，却服务于需求相反的两类消费者：
+#   1) transport：稳定的标量，作为 HTTP 头离开本进程（下表 allowlist）；
+#   2) antiban / 浏览器画像：结构化元数据（screen/viewport/webgl/... 由
+#      utils.antiban.fingerprint.ensure_extended 写入），以及路由元数据
+#      （group/proxy_name/updated_at 由 utils.routing 写入）。
+# 只允许 allowlist 里的字段变成 HTTP 头。这里必须是白名单而不是黑名单：黑名单
+# 会腐烂——每新增一个画像字段都得靠每个调用点记得排除它，而漏排的代价是
+# curl_cffi 编码 dict 头抛 AttributeError，用户侧看到 502（见 reverseProxy）。
+FP_HEADER_FIELDS = frozenset({
+    "user-agent",
+    "oai-device-id",
+    "oai-session-id",
+    "sec-ch-ua",
+    "sec-ch-ua-arch",
+    "sec-ch-ua-bitness",
+    "sec-ch-ua-form-factors",
+    "sec-ch-ua-full-version",
+    "sec-ch-ua-full-version-list",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-model",
+    "sec-ch-ua-platform",
+    "sec-ch-ua-platform-version",
+})
+
+
+def extract_header_fp(fp):
+    """取出 fp 记录中可出网的 HTTP 头字段，返回新的 {小写名: str} 字典。
+
+    只有 str 原样透传；int/float 转字符串（float 必须转：curl_cffi 对 float 头值会抛
+    AttributeError，int 才能通过）；其余类型（dict/list/None/bool/其他对象）一律丢弃
+    并告警——JSON 序列化它们会向上游发出一个格式合法但语义错误的头，而这正是修复前
+    502 的成因。bool 也在丢弃之列：记录里没有任何布尔头字段，而布尔的文本形式是逐字段
+    约定的（sec-ch-ua-mobile 用 "?1"/"?0"，libcurl 发出来是 "1"/"0"），猜错就是又一
+    个"合法但错误"的头。画像字段不在白名单里，走不到这里就已经被排除了。
+    """
+    headers = {}
+    for key, value in (fp or {}).items():
+        name = str(key).lower()
+        if name not in FP_HEADER_FIELDS:
+            continue
+        if isinstance(value, str):
+            headers[name] = value
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            headers[name] = str(value)
+        else:
+            logger.warning(
+                f"[fp] dropped unsupported value for header field {name!r} "
+                f"({type(value).__name__})"
+            )
+    return headers
+
 
 # Static-asset fingerprint cache: CDN 静态资源请求 req_token=""，get_fp 每次走全新生成分支，
 # 随机 UA/impersonate/代理 → 连接池 key 每次不同 → 每个 JS/CSS 子资源一次完整 socks5h 握手。
@@ -204,8 +260,7 @@ def get_fp(req_token):
             # H4: 用户配置的 UA 若主版本号超过 curl_cffi 支持上限，自动降级避免 TLS/UA 错配
             picked_ua, clamped = _clamp_ua_to_supported(picked_ua)
             if clamped:
-                from utils.Logger import logger as _logger
-                _logger.warning(
+                logger.warning(
                     f"[fp] UA Chrome major > {MAX_SUPPORTED_CHROME_MAJOR}, "
                     f"clamped to avoid TLS mismatch"
                 )

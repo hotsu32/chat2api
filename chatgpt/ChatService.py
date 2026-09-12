@@ -9,10 +9,10 @@ from starlette.concurrency import run_in_threadpool
 from chatgpt.authorization import get_req_token
 from chatgpt.chatFormat import api_messages_to_chat, stream_response, format_not_stream_response, head_process_response
 from chatgpt.chatLimit import check_is_limit, handle_request_limit
-from chatgpt.fp import get_fp
+from chatgpt.fp import extract_header_fp, get_fp
 from chatgpt.proofofWork import get_config, get_dpl, get_answer_token, get_requirements_token
 from chatgpt.services import AuthMixin, FileMixin, ModelMixin
-from chatgpt.services._helpers import _sanitize_headers, _stringify_header_value
+from chatgpt.services._helpers import _stringify_header_value
 
 from utils.Client import Client
 from utils.Logger import logger
@@ -50,6 +50,10 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
         self.ws = None
         self.dynamic_model = False
         self.antiban_ctx = None
+        # 上游流式连接的状态：只有「开过且正常读完」的连接才可以还回连接池。
+        # 半途中断的流归还后会被下一个同 pool key 的请求拿来 drain（实测 ~4s 首字节）。
+        self._stream_started = False
+        self._stream_finished = False
         # 深度研究相关：system_hints 与请求体透传 / 模型名后缀双模式触发
         self.system_hints = []
         # Session sticky: 由 api 层 inject 后挂载，stream_response 嗅探时用于回写映射
@@ -58,6 +62,12 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
     async def initialize_request_context(self):
         # Antiban: 在读取 fp 之前获取上下文（bucket/geo/冷却/熔断）
         self.antiban_ctx = await antiban.acquire_context(self.req_token)
+
+        # 准入被拒（死号 / 桶降级 / 冷却 / 并发打满）→ 立即终止。
+        # 必须在构造 HTTP 客户端和任何上游动作之前：被拒的请求一个包都不该发出去。
+        denied = antiban.admission_error(self.antiban_ctx)
+        if denied:
+            raise denied
 
         self.fp = get_fp(self.req_token).copy()
         self.proxy_url = self.fp.pop("proxy_url", None)
@@ -69,12 +79,15 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
             if self.proxy_url != self.antiban_ctx.proxy_url:
                 logger.info(
                     f"[antiban] proxy overridden by bucket: "
-                    f"{self.proxy_url} -> {self.antiban_ctx.proxy_url}"
+                    f"{antiban.redact_proxy(self.proxy_url)} -> "
+                    f"{antiban.redact_proxy(self.antiban_ctx.proxy_url)}"
                 )
             self.proxy_url = self.antiban_ctx.proxy_url
 
-        logger.info(f"Request token: {self.req_token}")
-        logger.info(f"Request proxy: {self.proxy_url}")
+        # 凭据禁止入日志：token 用不可逆匿名标识，代理串（常内嵌 user:pass）只记摘要。
+        # token 前缀不算脱敏——前缀足以关联账号。
+        logger.info(f"Request account: {antiban.anon_id(self.req_token)}")
+        logger.info(f"Request proxy: {antiban.redact_proxy(self.proxy_url)}")
         logger.info(f"Request UA: {self.user_agent}")
         logger.info(f"Request impersonate: {self.impersonate}")
 
@@ -128,21 +141,7 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
         _pref_motion = self.fp.get("prefers_reduced_motion")
         if _pref_motion in ("no-preference", "reduce"):
             self.base_headers['sec-ch-prefers-reduced-motion'] = _pref_motion
-        # 过滤掉 fp 中的非 HTTP-header 内部指纹字段（screen/viewport 等仅供 PoW 与 contextual_info 使用）
-        for _internal_key in (
-            "screen", "hardware_concurrency", "device_memory", "pixel_ratio", "viewport",
-            # 扩展指纹字段：仅供 client_contextual_info / 未来 sentinel 字段使用，绝不能进 HTTP 头
-            "nav_platform", "languages", "max_touch_points", "webgl",
-            "color_scheme", "prefers_reduced_motion", "color_gamut",
-            "connection", "audio",
-            # T2/T3/T5/M1/M2 等纯指纹字段
-            "canvas_hash", "font_list_hash", "font_list_count", "audio_fp_hash",
-            "timezone", "intl_locale", "user_pace", "virtual_page_load_ms",
-            # D2/D3 深耕字段
-            "webgpu", "webrtc",
-        ):
-            self.fp.pop(_internal_key, None)
-        self.base_headers.update(_sanitize_headers(self.fp))
+        self.base_headers.update(extract_header_fp(self.fp))
 
         if self.access_token:
             self.base_url = self.host_url + "/backend-api"
@@ -170,6 +169,10 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
             )
 
     async def set_dynamic_data(self, data):
+        if not self.req_token:
+            # 分不到号（共享容量为 0 / 号池没有可用号 / 绑定为空）时不得静默回落成
+            # 匿名请求：那是既不受容量约束、也不计账的白送生成。fail-closed。
+            raise HTTPException(status_code=503, detail="Account capacity unavailable")
         await self.resolve_auth_context()
 
         self.data = data
@@ -198,7 +201,8 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
             self.max_tokens = 2147483647
 
         await self.initialize_request_context()
-        # 每号并发上限：槽位未占用（超限且排队超时）→ 503 让上游 failover 到别的号
+        # 并发槽位未占用（超限且排队超时）→ 503 让上游换号。
+        # acquire_context 已就拒绝原因抛出明确状态；此处是兜底不变量。
         if self.antiban_ctx and self.antiban_ctx.enabled and not self.antiban_ctx.concurrency_acquired:
             raise HTTPException(status_code=503, detail="Account concurrency limit reached")
         await get_dpl(self)
@@ -473,6 +477,9 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
 
             content_type = r.headers.get("Content-Type", "")
             if "text/event-stream" in content_type:
+                # 从这个分支起上游 body 是流：只要没读到协议终止分片（[DONE]），
+                # 这条连接就不能还回连接池 —— 包括「流还没被消费就被放弃」的情形。
+                self._stream_started = True
                 res, start = await head_process_response(r.aiter_lines())
                 if not start:
                     raise HTTPException(
@@ -480,10 +487,10 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
                         detail="Our systems have detected unusual activity coming from your system. Please try again later.",
                     )
                 if stream:
-                    return stream_response(self, res, self.resp_model, self.max_tokens)
+                    return self._tracked_stream(stream_response(self, res, self.resp_model, self.max_tokens))
                 else:
                     return await format_not_stream_response(
-                        stream_response(self, res, self.resp_model, self.max_tokens),
+                        self._tracked_stream(stream_response(self, res, self.resp_model, self.max_tokens)),
                         self.prompt_tokens,
                         self.max_tokens,
                         self.resp_model,
@@ -505,18 +512,46 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
                 pass
             raise HTTPException(status_code=500, detail=str(e))
 
+    async def _tracked_stream(self, generator):
+        """包一层记录上游流是否走完，供 close_client 决定复用还是丢弃连接。
+
+        判据是**协议终止分片或自然收尾**，不是「消费方读到哪」：
+        ``format_not_stream_response`` 读到 ``data: [DONE]`` 就 break，异步生成器
+        不会因此被关闭，正常结束的连接仍然必须能还回连接池。
+
+        反过来，客户端断连 / 生成器抛错会在 ``yield`` 处抛出 GeneratorExit 或异常，
+        那时上游响应还剩着没读完 —— 这种连接绝不能还给池子。
+        """
+        completed = False
+        try:
+            async for chunk in generator:
+                if isinstance(chunk, str) and chunk.startswith("data: [DONE]"):
+                    self._stream_finished = True
+                yield chunk
+            completed = True
+        finally:
+            self._stream_finished = self._stream_finished or completed
+
     async def close_client(self):
         # 释放并发槽位（若已占用）；幂等，异常吞掉不影响客户端清理
         try:
             antiban.release_context(self.antiban_ctx)
         except Exception:
             pass
-        if self.s:
-            await self.s.close()
-            del self.s
-        if self.ss:
-            await self.ss.close()
-            del self.ss
-        if self.ws:
-            await self.ws.close()
-            del self.ws
+        # 重复调用必须安全：异常路径下 api 层会在 except 和 finally 各关一次，
+        # 旧写法 del 后再次进入会抛 AttributeError，把真实错误盖掉。
+        for attr in ("s", "ss", "ws"):
+            client = getattr(self, attr, None)
+            if client is None:
+                continue
+            setattr(self, attr, None)
+            try:
+                # 半途中断的上游流硬关闭：归还连接池会让下一个同 pool key 的请求
+                # 先去 drain 掉被放弃的响应（实测首字节 ~4s vs ~0.2s），而硬关闭会让
+                # 上游立刻观察到断连并停止生成（见 tests/test_m2_stream_cancel.py）。
+                if attr == "s" and self._stream_started and not self._stream_finished:
+                    await client.discard()
+                else:
+                    await client.close()
+            except Exception:
+                pass

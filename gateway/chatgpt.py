@@ -12,7 +12,8 @@ from gateway.frontend_sync import (get_frontend_template, get_cached_frontend,
 from chatgpt.fp import get_fp
 from gateway.identity import build_session
 from gateway.login import login_html
-from gateway.reverseProxy import get_real_req_token
+from gateway.reverseProxy import get_real_req_token, resolve_seed_token
+from gateway.research_panel import PANEL_TAGS
 from utils.Logger import logger
 
 
@@ -117,6 +118,9 @@ async def chatgpt_html(request: Request):
     token = request.query_params.get("token")
     if not token:
         return RedirectResponse(url="/dashboard", status_code=302)
+    if token.startswith("frontend-proof-"):
+        from gateway.landing import require_dev_access
+        require_dev_access()
     if not _entitled(token):
         # 套餐过期 / 未购买：入口直接拦掉，不渲染聊天页。
         # seed 是永久凭据，收藏了带 token 的链接也绕不过去。
@@ -156,7 +160,11 @@ def _entitled(seed: str) -> bool:
 async def conversation_page(request: Request, conversation_id: str):
     """Reload an owned conversation without changing the bare-root contract."""
     import utils.globals as globals
-    token = request.cookies.get('token', '').strip()
+    # 走统一的身份解析入口，而不是直接读 cookie：会话归属键必须是**当前有效**的
+    # 身份，否则一次开发运行留下的公开别名（frontend-proof-*）在闸门关闭后仍然是
+    # 一把能问出「这个会话存在吗」的钥匙。resolve_seed_token 读的仍是 token cookie
+    # （仅在缺失时回退 Authorization 头），并对被禁用的别名 fail-closed。
+    token = resolve_seed_token(request)
     entry = globals.seed_map.get(token) or {}
     if conversation_id not in entry.get('conversations', []):
         raise HTTPException(status_code=404, detail='Conversation not found')
@@ -180,7 +188,10 @@ async def _render_account_page(request: Request, token: str):
     except Exception as e:
         if isinstance(e, HTTPException) and e.status_code == 503:
             return _website_unavailable()
-        logger.warning(f"[chatgpt_html] resolve seed account failed: {e}")
+        logger.warning(
+            f"[chatgpt_html] resolve seed account failed status="
+            f"{getattr(e, 'status_code', type(e).__name__)}"
+        )
         access_token = ""
     session = build_session(access_token)
     if not session:
@@ -201,7 +212,7 @@ async def _render_account_page(request: Request, token: str):
 
     # 清空本地存储，避免不同用户间的前端状态串扰
     clear_script = "<script>localStorage.clear();</script>"
-    html = html.replace("</head>", clear_script + "</head>", 1)
+    html = html.replace("</head>", clear_script + PANEL_TAGS + "</head>", 1)
 
     response = HTMLResponse(content=html, headers={'Cache-Control': 'no-store'})
     # 用户标识 cookie（SeedToken / access_token），gateway 反代时据此识别用户

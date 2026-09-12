@@ -22,6 +22,8 @@ from utils.routing import (
     update_single_binding,
 )
 import utils.globals as globals
+import utils.audit as audit
+import utils.store as store
 from chatgpt.refreshToken import rt2ac
 
 ADMIN_COOKIE_NAME = "admin_auth"
@@ -306,6 +308,10 @@ async def routing_admin_save(request: Request):
     except Exception as e:  # pragma: no cover
         logger.warning(f"[admin] antiban resync failed: {e}")
 
+    audit.record("pool.routing_saved", detail={
+        "count": len(proxies), "source": "direct" if not proxies else "proxy_pool",
+    })
+
     return JSONResponse(
         {
             "status": "success",
@@ -396,6 +402,12 @@ async def routing_admin_import_accounts(request: Request):
             proxy_url=proxy_url or None,
         )
 
+    # 审计：只记数量与来源，绝不记 token（account 行本身就是凭据）。
+    audit.record("pool.accounts_imported", detail={
+        "count": len(added), "outcome": f"updated={len(updated)}",
+        "group": group_name or "", "source": "json_body",
+    })
+
     return JSONResponse(
         {
             "status": "success",
@@ -458,6 +470,26 @@ async def routing_admin_delete_account(request: Request):
     if token not in globals.token_list:
         raise HTTPException(status_code=404, detail="token not found")
 
+    # 持久化先行：``token_list`` 只是缓存，进程重启时由 ``store.load_all`` 从
+    # SQLite 重建。只把 token 从内存里摘掉的话，``accounts`` 行仍是 healthy ——
+    # 路由按 ``accounts.status`` 选号，于是账号继续被派发，重启还会把它原样装回
+    # 池子。真正让账号下线的操作是把持久状态置为 ``disabled``，这一行留在库里
+    # 也把「删了哪个号」的历史与审计保住。
+    try:
+        durably_disabled = store.set_account_status(token, "disabled")
+    except store.StoreError as exc:
+        # 写失败时绝不谎报删除：内存原样保留，账号仍是可路由的旧状态。
+        logger.error(f"[admin] account removal persistence failed: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="账号状态持久化失败，账号未被移除，请重试",
+        )
+
+    if not durably_disabled:
+        # ``accounts`` 表里本就没有这一行（首启迁移前只存在于 token.txt 的历史
+        # 账号）。没有持久状态能把它带回来，下面的内存移除本身就是完整的。
+        logger.warning("[admin] account removal had no durable row to disable")
+
     globals.token_list[:] = [item for item in globals.token_list if item != token]
     remove_account_binding(token)
     if token in globals.refresh_map:
@@ -468,10 +500,17 @@ async def routing_admin_delete_account(request: Request):
         globals.persist_error_tokens()
     globals.persist_token_list()
 
+    # 审计：删号是不可逆操作，必须留痕。仍不记 token 本身 —— 主体走既有的
+    # ``audit.subject_id`` 契约（不可逆派生 id），运营者要定位时对同一个 token
+    # 求一次 subject_id 即可比对；「删的是哪一个账号」从而可回答，凭据原文不落库。
+    audit.record("pool.account_deleted", subject=audit.subject_id(token), detail={
+        "count": 1, "status": "disabled",
+    })
+
     return JSONResponse(
         {
             "status": "success",
-            "message": "账号已删除",
+            "message": "账号已删除（已停用并移出号池）",
         }
     )
 
@@ -1154,6 +1193,101 @@ async def _harvester_import_rt(sess, refresh_token: str) -> None:
     )
 
 
+# ------------------------------------------------------------------ SaaS 用户管理
+
+# 运营者可切换的用户状态。``banned`` 走的是与「改密踢下线」同一条会话吊销路径
+# （``gateway.user.revoke_user_sessions`` → ``store.bump_pw_version``），不新增会话表。
+_USER_STATUSES = ("active", "banned")
+
+
+def _mask_email(email: str) -> str:
+    """列表展示用的脱敏邮箱：``ab***@example.com``。"""
+    email = email or ""
+    local, _, domain = email.partition("@")
+    if not domain:
+        return "***"
+    return f"{local[:2]}***@{domain}"
+
+
+async def routing_admin_users(request: Request):
+    """已注册用户列表（脱敏邮箱 + 状态 + 档次），供封禁操作定位对象。
+
+    只回可操作的运营字段：**不含**密码哈希、seed、会话 token。
+    """
+    require_admin_auth(request)
+    rows = []
+    for row in store.list_user_auth():
+        rows.append({
+            "email": _mask_email(row.get("email") or ""),
+            "subject": audit.subject_id(row.get("email") or ""),
+            "status": row.get("status") or "active",
+            "tier_id": row.get("tier_id") or "",
+        })
+    return JSONResponse({"status": "success", "users": rows})
+
+
+async def routing_admin_user_status(request: Request):
+    """封禁 / 解封一个 SaaS 用户，并吊销其在所有设备上的 web 会话。
+
+    顺序是刻意的：先落库状态，再吊销会话。反过来会出现「会话已经踢掉、状态却没写进去」
+    的窗口 —— 用户可以立刻用密码重新登录回来，而运营者看到的是「封禁失败」。
+    现在的失败模式更安全：状态已 banned，即便吊销失败，``_current_email`` 的状态检查
+    仍然会挡住旧 cookie（那道检查不依赖 pw_version）。
+    """
+    require_admin_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    email = (body.get("email") or "").strip().lower()
+    status = (body.get("status") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    if status not in _USER_STATUSES:
+        raise HTTPException(status_code=400, detail="unsupported status")
+
+    if not store.get_user_auth(email):
+        raise HTTPException(status_code=404, detail="user not found")
+
+    subject = audit.subject_id(email)
+    try:
+        store.upsert_user_auth(email, status=status, strict=True)
+    except store.StoreError:
+        audit.record("user.status_changed", ok=False, subject=subject,
+                     detail={"status": status, "reason": "store_error"})
+        raise HTTPException(status_code=503, detail="用户状态未能保存")
+
+    revoked = 0
+    if status == "banned":
+        # 惰性导入：``gateway.user`` 只在 ENABLE_GATEWAY 时随 app 一起注册，
+        # 而本模块总是被导入。放在这里既不动全局导入顺序，也让测试能替换它。
+        from gateway.user import revoke_user_sessions
+        try:
+            revoked = revoke_user_sessions(email)
+        except store.StoreError:
+            # 状态已经生效；如实报告吊销未完成，让运营者知道还有旧 cookie 没被踢掉。
+            audit.record("user.status_changed", ok=False, subject=subject,
+                         detail={"status": status, "reason": "session_revocation_failed"})
+            raise HTTPException(status_code=503, detail="用户已封禁，但会话吊销未完成")
+
+    audit.record("user.status_changed", subject=subject, detail={
+        "status": status, "result": f"pw_version={revoked}", "source": "admin_api",
+    })
+    return JSONResponse({
+        "status": "success",
+        "subject": subject,
+        "user_status": status,
+        "sessions_revoked": revoked,
+    })
+
+
+async def routing_admin_audit(request: Request, limit: int = 100):
+    """最近的运营审计记录（号池 / 支付 / 用户）。不含任何凭据与邮箱原文。"""
+    require_admin_auth(request)
+    return JSONResponse({"status": "success", "events": audit.recent(limit)})
+
+
 app.add_api_route("/admin/routing", routing_admin_page, methods=["GET"], response_class=HTMLResponse)
 app.add_api_route("/admin/routing/data", routing_admin_data, methods=["GET"])
 app.add_api_route("/admin/routing/save", routing_admin_save, methods=["POST"])
@@ -1177,6 +1311,9 @@ app.add_api_route("/admin/harvester/report", routing_admin_harvester_report, met
 app.add_api_route("/admin/harvester/authorize/start", routing_admin_harvester_authorize_start, methods=["POST"])
 app.add_api_route("/admin/harvester/authorize/exchange", routing_admin_harvester_authorize_exchange, methods=["POST"])
 app.add_api_route("/admin/harvester/import-cookie", routing_admin_harvester_import_cookie, methods=["POST"])
+app.add_api_route("/admin/users", routing_admin_users, methods=["GET"])
+app.add_api_route("/admin/users/status", routing_admin_user_status, methods=["POST"])
+app.add_api_route("/admin/audit", routing_admin_audit, methods=["GET"])
 
 if api_prefix:
     app.add_api_route(f"/{api_prefix}/admin/routing", routing_admin_page, methods=["GET"], response_class=HTMLResponse)
@@ -1202,3 +1339,6 @@ if api_prefix:
     app.add_api_route(f"/{api_prefix}/admin/harvester/authorize/start", routing_admin_harvester_authorize_start, methods=["POST"])
     app.add_api_route(f"/{api_prefix}/admin/harvester/authorize/exchange", routing_admin_harvester_authorize_exchange, methods=["POST"])
     app.add_api_route(f"/{api_prefix}/admin/harvester/import-cookie", routing_admin_harvester_import_cookie, methods=["POST"])
+    app.add_api_route(f"/{api_prefix}/admin/users", routing_admin_users, methods=["GET"])
+    app.add_api_route(f"/{api_prefix}/admin/users/status", routing_admin_user_status, methods=["POST"])
+    app.add_api_route(f"/{api_prefix}/admin/audit", routing_admin_audit, methods=["GET"])

@@ -73,6 +73,40 @@ def _post(client, cookies=None):
                        cookies=cookies or {'token': SEED}, json=_body())
 
 
+@pytest.mark.parametrize('message', [{'author': None}, 'unexpected-shape', {'author': []}])
+def test_unfamiliar_event_does_not_truncate_actual_gateway_response(
+        client, mock_upstream, bound_account, monkeypatch, message):
+    unexpected = 'data: ' + json.dumps({'type': 'message', 'message': message}) + '\n\n'
+    later = 'data: ' + json.dumps({'type': 'future_progress', 'value': 'still-running'}) + '\n\n'
+    monkeypatch.setattr(mock_upstream, 'conversation_sse',
+                        (unexpected + later).encode() + mock_upstream.conversation_sse)
+    response = _post(client)
+    assert response.status_code == 200
+    assert 'still-running' in response.text
+    assert response.text.count('[DONE]') == 1
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+def test_missing_entitlement_rejected_before_upstream_authentication(
+        client, mock_upstream, bound_account, monkeypatch, path):
+    from utils import store
+    from gateway import reverseProxy, f_conversation_gateway
+
+    store.upsert_user_auth('no-entitlement@example.test', seed=SEED, status='active')
+    attempts = []
+
+    async def forbidden_auth(_token):
+        attempts.append(True)
+        raise AssertionError('Unauthorized generation reached upstream authentication')
+
+    monkeypatch.setattr(reverseProxy, 'verify_token', forbidden_auth)
+    monkeypatch.setattr(f_conversation_gateway, 'verify_token', forbidden_auth)
+    response = client.post(path, cookies={'token': SEED}, json=_body())
+    assert response.status_code == 402
+    assert attempts == []
+    assert mock_upstream.records == []
+
+
 # ---------------------------------------------------------------------------
 # Account identity: which account the upstream request is charged to
 # ---------------------------------------------------------------------------
@@ -213,3 +247,210 @@ def test_unbound_seed_is_refused_rather_than_borrowing_an_account(
     resp = _post(client)
     assert resp.status_code >= 400
     assert not _upstream(mock_upstream, '/backend-api/conversation')
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+def test_capacity_denial_precedes_upstream_authentication(
+        client, mock_upstream, bound_account, monkeypatch, path):
+    from utils.antiban import guard
+    from gateway import reverseProxy, f_conversation_gateway
+    attempts = []
+
+    async def deny(token):
+        return guard.AntibanContext(token=token, enabled=True, admission_denied=True,
+                                    denial_reason='cooldown', denial_status=503)
+
+    async def forbidden_auth(token):
+        attempts.append(True)
+        raise AssertionError('Capacity denial reached authentication')
+
+    monkeypatch.setattr(guard, 'acquire_context', deny)
+    monkeypatch.setattr(reverseProxy, 'verify_token', forbidden_auth)
+    monkeypatch.setattr(f_conversation_gateway, 'verify_token', forbidden_auth)
+    response = client.post(path, cookies={'token': SEED}, json=_body())
+    assert response.status_code == 503
+    assert attempts == []
+    assert mock_upstream.records == []
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+@pytest.mark.parametrize('auth_fails', [False, True])
+def test_generation_releases_admission_on_response_or_auth_failure(
+        client, mock_upstream, bound_account, monkeypatch, path, auth_fails):
+    from utils.antiban import guard
+    from gateway import reverseProxy, f_conversation_gateway
+    from fastapi import HTTPException
+    acquired, released = [], []
+
+    async def admit(token):
+        ctx = guard.AntibanContext(token=token, enabled=True)
+        acquired.append(ctx)
+        return ctx
+
+    async def failed_auth(token):
+        raise HTTPException(401, 'Synthetic auth failure')
+
+    monkeypatch.setattr(guard, 'acquire_context', admit)
+    monkeypatch.setattr(guard, 'release_context', released.append)
+    if auth_fails:
+        monkeypatch.setattr(reverseProxy, 'verify_token', failed_auth)
+        monkeypatch.setattr(f_conversation_gateway, 'verify_token', failed_auth)
+    response = client.post(path, cookies={'token': SEED}, json=_body())
+    assert response.status_code == (401 if auth_fails else 200)
+    assert len(acquired) == 1
+    assert released == acquired
+    if not auth_fails:
+        assert '[DONE]' in response.text
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+def test_upstream_stream_error_keeps_status_and_reaches_capacity_feedback(
+        client, mock_upstream, bound_account, monkeypatch, path):
+    from utils.antiban import guard
+    handler = mock_upstream.RequestHandlerClass
+    original_send = handler._send
+    reported = []
+
+    def send_rate_limit(self, code, body, content_type='application/json', extra_headers=None):
+        if self.path.split('?')[0] == '/backend-api/conversation':
+            code, body = 429, b'data: {"error":{"code":"rate_limit"}}\n\ndata: [DONE]\n\n'
+        return original_send(self, code, body, content_type, extra_headers)
+
+    async def record_error(ctx, status, detail=None):
+        reported.append(status)
+
+    monkeypatch.setattr(handler, '_send', send_rate_limit)
+    monkeypatch.setattr(guard, 'report_error', record_error)
+    response = client.post(path, cookies={'token': SEED}, json=_body())
+    assert response.status_code == 429
+    assert reported == [429]
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+def test_transport_failure_diagnostics_do_not_expose_exception_content(
+        client, mock_upstream, bound_account, monkeypatch, caplog, path):
+    from gateway import reverseProxy, f_conversation_gateway
+    import logging
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError('connection reset SECRET-DIAGNOSTIC-CONTENT')
+
+    monkeypatch.setattr(reverseProxy, '_request_with_retry', fail)
+    monkeypatch.setattr(f_conversation_gateway.Client, 'post_stream', fail)
+    with caplog.at_level(logging.INFO):
+        response = client.post(path, cookies={'token': SEED}, json=_body())
+    assert response.status_code == 502
+    assert 'SECRET-DIAGNOSTIC-CONTENT' not in response.text
+    assert 'SECRET-DIAGNOSTIC-CONTENT' not in caplog.text
+
+
+@pytest.fixture
+def trial_account(bound_account):
+    from utils import store
+    store.upsert_user_auth('trial@example.test', password_hash='synthetic-hash',
+                           seed=SEED, status='active', strict=True)
+    store.create_trial_grant('trial@example.test', SEED, 'plus', 3)
+    return bound_account
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+def test_full_renewed_account_rejected_before_any_upstream_request(
+        client, mock_upstream, bound_account, path):
+    import time
+    from utils import store
+    store.upsert_user_auth('renewed@example.test', seed=SEED, status='active')
+    store.upsert_user(SEED, status='frozen')
+    store.create_order('renewed-order', 'renewed@example.test', 'plus-shared-1m', '1', status='pending')
+    store.activate_order('renewed-order', int(time.time()) + 86400)
+    for peer in ('peer-1', 'peer-2'):
+        store.upsert_user(peer, current_account=bound_account, status='active')
+    response = client.post(path, cookies={'token': SEED}, json=_body())
+    assert response.status_code == 503
+    assert mock_upstream.records == []
+    assert store.get_user(SEED)['status'] == 'frozen'
+    assert store.get_user(SEED)['current_account'] == bound_account
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+def test_trial_allows_three_complete_replies_then_rejects_fourth(
+        client, mock_upstream, trial_account, path):
+    from utils import trials
+    for used in (1, 2, 3):
+        response = client.post(path, cookies={'token': SEED}, json=_body())
+        assert response.status_code == 200
+        assert 'Hello, world' in response.text
+        state = trials.trial_state('trial@example.test', strict=True)
+        assert state['used'] == used
+        assert state['reserved'] == 0
+    response = client.post(path, cookies={'token': SEED}, json=_body())
+    assert response.status_code == 402
+    assert len(_upstream(mock_upstream, '/backend-api/conversation')) == 3
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+@pytest.mark.parametrize('stream', [b'', b'data: [DONE]\n\n',
+    b'data: {"error":{"code":"upstream_error"}}\n\ndata: [DONE]\n\n',
+    b'data: {"message":{"author":{"role":"assistant"},"content":{"parts":["partial"]},"status":"in_progress"}}\n\n'])
+def test_unsuccessful_trial_stream_releases_credit(
+        client, mock_upstream, trial_account, monkeypatch, path, stream):
+    from utils import trials
+    monkeypatch.setattr(mock_upstream, 'conversation_sse', stream)
+    response = client.post(path, cookies={'token': SEED}, json=_body())
+    assert response.status_code == 200
+    state = trials.trial_state('trial@example.test', strict=True)
+    assert state['used'] == 0
+    assert state['remaining'] == 3
+    assert state['reserved'] == 0
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+def test_all_trial_credits_in_flight_reject_before_network(
+        client, mock_upstream, trial_account, path):
+    from utils import trials
+    reservations = [trials.reserve(SEED) for _ in range(3)]
+    try:
+        response = client.post(path, cookies={'token': SEED}, json=_body())
+        assert response.status_code == 402
+        assert mock_upstream.records == []
+    finally:
+        for reservation in reservations:
+            trials.release(reservation, SEED)
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+def test_trial_preserves_unknown_content_shape_without_charging(
+        client, mock_upstream, trial_account, monkeypatch, path):
+    from utils import trials
+    event = {'message': {'author': {'role': 'assistant'}, 'status': 'finished_successfully',
+                         'end_turn': True, 'content': {'parts': 7}}}
+    monkeypatch.setattr(mock_upstream, 'conversation_sse',
+        ('data: ' + json.dumps(event) + '\n\ndata: [DONE]\n\n').encode())
+    response = client.post(path, cookies={'token': SEED}, json=_body())
+    assert response.status_code == 200
+    assert '[DONE]' in response.text
+    assert trials.trial_state('trial@example.test', strict=True)['used'] == 0
+
+
+@pytest.mark.parametrize('path', ['/backend-api/conversation', '/backend-api/f/conversation'])
+@pytest.mark.parametrize('batched', [False, True])
+def test_trial_settles_v1_delta_reply_without_rewriting_stream(
+        client, mock_upstream, trial_account, monkeypatch, path, batched):
+    from utils import trials
+    initial = {'v': {'message': {'author': {'role': 'assistant'},
+        'status': 'in_progress', 'end_turn': False, 'content': {'parts': ['']}}}}
+    operations = [
+        {'p': '/message/content/parts/0', 'o': 'append', 'v': 'Hello'},
+        {'v': ', world'},  # v1 keeps the preceding path and operation
+        {'p': '/message/status', 'o': 'replace', 'v': 'finished_successfully'},
+        {'p': '/message/end_turn', 'o': 'replace', 'v': True},
+    ]
+    events = [initial] + ([{'o': 'patch', 'v': operations}] if batched else operations)
+    stream = b'event: delta_encoding\ndata: "v1"\n\n'
+    stream += b''.join(('data: ' + json.dumps(e) + '\n\n').encode() for e in events)
+    stream += b'data: [DONE]\n\n'
+    monkeypatch.setattr(mock_upstream, 'conversation_sse', stream)
+    body = {**_body(), 'supported_encodings': ['v1']}
+    response = client.post(path, cookies={'token': SEED}, json=body)
+    assert response.status_code == 200
+    assert response.content == stream
+    assert trials.trial_state('trial@example.test', strict=True)['used'] == 1

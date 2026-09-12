@@ -13,6 +13,9 @@
 
 注意 ``None`` 与 ``""`` 语义相反，调用方必须用 ``is None`` 区分，不能用真值判断。
 
+权益有两个来源，优先级固定：**已支付且未过期的订单 > 注册试用**
+（见 :mod:`utils.trials`）。付费期内不消耗试用；付费到期后也不回落到没用完的试用。
+
 档次解析必须走 ``plans.parse_plan_id``：``orders.tier_id`` 存的是 plan_id
 （形如 ``plus-solo-1m``），而 ``tiers.normalize_tier_id("plus-solo-1m")`` 不在档位
 目录里会**回落 free**，误用会让所有付费用户被降级。
@@ -96,13 +99,25 @@ def tier_expiry(email: str, tier: str, now: Optional[int] = None) -> Optional[in
 
 
 def effective_tier_for_email(email: str, now: Optional[int] = None) -> str:
-    """该邮箱当前生效的档次（多单取最高档）；无有效套餐返回 ``""``。"""
+    """该邮箱当前生效的档次（多单取最高档）；无有效套餐时回落到注册试用。
+
+    优先级：**已支付且未过期的订单 > 注册试用**。买过就按买的档次算，试用既不参与
+    比较也不被消耗。
+
+    「曾经买过但已过期」不回落到试用：到期用户手里那份没用完的注册试用是入场券，
+    不是续费通道；让它接管会把「到期」变成「再送 3 次」，到期门禁形同虚设。
+    判据是有没有过任何 paid 订单，而不是当前有没有有效订单。
+    """
     best, best_rank = "", -1
     for o in active_orders(email, now):
         rank = _TIER_RANK.get(o["_tier"], -1)
         if rank > best_rank:
             best, best_rank = o["_tier"], rank
-    return best
+    if best:
+        return best
+    from utils import trials as _trials
+
+    return _trials.trial_tier(email, strict=True)
 
 
 def effective_tier(seed: str, now: Optional[int] = None) -> Optional[str]:

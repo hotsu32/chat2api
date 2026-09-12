@@ -89,6 +89,6 @@ class ModelMixin:
         # 深度研究：模型名后缀识别（双模式触发之二）
         # 当模型名包含 deep-research / deepresearch 时，自动注入 system_hints=["research"]
         lower_origin = (self.origin_model or "").lower()
-        if "deep-research" in lower_origin or "deepresearch" in lower_origin:
+        if lower_origin == "research" or "deep-research" in lower_origin or "deepresearch" in lower_origin:
             if "research" not in self.system_hints:
                 self.system_hints = list(self.system_hints) + ["research"]

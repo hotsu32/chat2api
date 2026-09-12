@@ -1,9 +1,25 @@
 {% extends "base.html" %}
 {% block title %}Dashboard · Chat-Share{% endblock %}
+{% block extra_css %}
+.trial-card { border-top: 1px solid var(--line); padding: 28px 0; margin-top: 24px; max-width: 680px; }
+.trial-label { font-size: 22px; font-weight: 600; margin-bottom: 16px; }
+.trial-meta { display: flex; flex-wrap: wrap; gap: 12px; color: var(--gray); font-size: 14px; margin-bottom: 20px; }
+.trial-status-msg { line-height: 1.7; margin-bottom: 20px; }
+.trial-cta-row { display: flex; flex-wrap: wrap; gap: 16px; }
+.trial-card .plan-cta { min-height: 44px; }
+/* 已付款但账号未绑定：说明文字 + 44px 触控目标的重试按钮，沿用既有按钮样式 */
+.plan-pending { color: var(--gray); font-size: 13px; line-height: 1.7; margin-bottom: 12px; }
+.plan-pending + .inline-form .btn { min-height: 44px; }
+{% endblock %}
 {% block content %}
 <div class="mono-label">Dashboard</div>
 <h1>你的套餐入口</h1>
 <p class="lede">点一下就进入聊天，全程不用记任何口令。</p>
+
+{# 分配重试的结果/失败原因；只是告知，用 .notice 而不是 .error #}
+{% if fulfilment_msg %}
+<div class="notice" style="max-width:680px">{{ fulfilment_msg }}</div>
+{% endif %}
 
 {% if subscriptions %}
 <div class="cards">
@@ -16,16 +32,89 @@
       <span class="{{ 'ok' if sub.healthy else 'warn' }}"><span class="sq"></span>{{ sub.status_text }}</span>
       <span>有效期至 {{ sub.expires_at }} · 剩 {{ sub.days_left }} 天</span>
     </div>
-    {% if sub.healthy %}
+    {% if sub.serviceable %}
     <a class="plan-cta" href="/?token={{ seed }}">进入 ChatGPT <span class="arr">→</span></a>
+    {% elif sub.healthy %}
+    {# 已付款但账号还没绑上：不给入口（进去必然失败），给一个可反复点击的重试 #}
+    <p class="plan-pending">账号分配尚未完成，暂时无法进入聊天。</p>
+    <form class="inline-form" method="post" action="/api/fulfillment/retry">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn btn-ghost" type="submit">重试分配</button>
+    </form>
     {% else %}
     <a class="plan-cta" href="{{ sub.renew_url }}">套餐已过期 · 去续费 <span class="arr">→</span></a>
     {% endif %}
   </div>
   {% endfor %}
 </div>
-{% else %}
-<div class="empty">还没有套餐。<a href="/store" style="color:#000;border-bottom:1px solid #000;text-decoration:none">去超市选购 →</a></div>
+{% endif %}
+
+{# 试用区块：仅在无有效付费套餐时展示 #}
+{% if not has_paid_plan %}
+  {% if not trial_db_ok %}
+  {# DB 故障：明确告知而非展示虚假的零余额 #}
+  <div class="trial-card trial-unavailable">
+    <div class="trial-label">Plus 免费试用</div>
+    <p class="trial-status-msg">余额暂时无法查询，请稍后刷新。</p>
+  </div>
+
+  {% elif trial_granted %}
+    {% if trial_exhausted %}
+    {# 赠额全部已结算用完 #}
+    <div class="trial-card trial-exhausted">
+      <div class="trial-label">Plus 免费试用</div>
+      <p class="trial-status-msg">{{ trial_total }} 次试用已用完。购买套餐后可在有效期内不限次数对话。</p>
+      <div class="trial-cta-row">
+        <a class="plan-cta" href="/store?plan=plus-solo-1m">购买 Plus <span class="arr">→</span></a>
+        <a class="plan-cta plan-cta-alt" href="/store?plan=pro-solo-1m">购买 Pro <span class="arr">→</span></a>
+      </div>
+    </div>
+
+    {% elif trial_busy %}
+    {# 有余额但全被在途请求占住 #}
+    <div class="trial-card trial-busy">
+      <div class="trial-label">Plus 免费试用</div>
+      <div class="trial-meta">
+        <span>共 {{ trial_total }} 次 · 已用 {{ trial_used }} 次 · 进行中 {{ trial_reserved }} 次</span>
+      </div>
+      <p class="trial-status-msg">当前有请求正在生成，请等待完成后再发起新对话。</p>
+    </div>
+
+    {% elif trial_entry_enabled %}
+    {# 正常可用：有余额且账号有效 #}
+    <div class="trial-card trial-active">
+      <div class="trial-label">Plus 免费试用</div>
+      <div class="trial-meta">
+        <span>共 {{ trial_total }} 次 · 已用 {{ trial_used }} 次 · 剩余 {{ trial_remaining }} 次</span>
+        {% if trial_reserved > 0 %}
+        <span class="trial-inflight">进行中 {{ trial_reserved }} 次</span>
+        {% endif %}
+      </div>
+      <a class="plan-cta" href="/?token={{ seed }}">开始试用 <span class="arr">→</span></a>
+    </div>
+
+    {% elif not trial_capacity_configured %}
+    {# 部署侧未配置共享容量：fail-closed，如实说「容量未开放」而不是甩锅给账号状态 #}
+    <div class="trial-card trial-inactive">
+      <div class="trial-label">Plus 免费试用</div>
+      <p class="trial-status-msg">试用容量暂未开放，请稍后重试。购买套餐后可立即使用。</p>
+      <div class="trial-cta-row">
+        <a class="plan-cta" href="/store?plan=plus-solo-1m">购买 Plus <span class="arr">→</span></a>
+      </div>
+    </div>
+
+    {% else %}
+    {# 有试用记录但不满足准入条件（账号未验证/已到期/已付费路径兜底）#}
+    <div class="trial-card trial-inactive">
+      <div class="trial-label">Plus 免费试用</div>
+      <p class="trial-status-msg">当前账号状态不支持使用试用额度。</p>
+    </div>
+    {% endif %}
+
+  {% else %}
+  {# 无 trial_grants 行 = 裸 DAO 建的账号，无赠额 #}
+  <div class="empty">还没有套餐。<a href="/store" style="color:#000;border-bottom:1px solid #000;text-decoration:none">去超市选购 →</a></div>
+  {% endif %}
 {% endif %}
 
 <div class="foot-links">

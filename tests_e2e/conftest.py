@@ -74,6 +74,9 @@ os.environ["REGISTER_RATE_LIMIT"] = "0"
 # Checkout is fail-closed without a provider; the mock one keeps the purchase
 # path exercisable without any real money movement.
 os.environ["PAYMENT_PROVIDER"] = "mock"
+os.environ["APP_ENV"] = "test"
+# Synthetic binding capacity only; this is not a measured production limit.
+os.environ["FLEET_MAX_SHARED_SEEDS_PER_ACCOUNT"] = "2"
 os.environ["PROXY_URL"] = ""
 os.environ["SENTINEL_PROXY_URL"] = ""
 os.environ["OPENAI_AUTH_TOKEN_URL"] = "https://auth.example/oauth/token"
@@ -88,6 +91,7 @@ import utils.globals as globals  # noqa: E402
 import utils.ratelimit as ratelimit  # noqa: E402
 import utils.store as store  # noqa: E402
 import utils.usage as usage  # noqa: E402
+from chatgpt.authorization import OPERATOR_SEED_STATUS  # noqa: E402
 import app  # noqa: E402,F401  -- registers gateway routes (must be last)
 
 from starlette.testclient import TestClient  # noqa: E402
@@ -392,7 +396,12 @@ def seed_account():
 @pytest.fixture
 def seed_user():
     """Return a helper: ``seed_user(seed, token, plan_type)`` -> writes a seed_map
-    entry (sticky binding) + persists the user row."""
+    entry (sticky binding) + persists the user row.
+
+    Operator-style Seeds (no ``user_auth`` row) are authorized by the explicit
+    grant marker that only the authenticated ``POST /seedtoken`` import writes,
+    so the helper stamps it too — see ``chatgpt/authorization.py``.
+    """
     def _seed(seed, token, plan_type="plus", conversations=None):
         globals.seed_map[seed] = {
             "token": token,
@@ -400,5 +409,6 @@ def seed_user():
             "conversations": conversations or [],
         }
         globals.persist_seed_map()
+        store.upsert_user(seed, status=OPERATOR_SEED_STATUS)
         return seed
     return _seed

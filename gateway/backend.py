@@ -14,9 +14,10 @@ import utils.globals as globals
 from utils import resp_cache
 from app import app
 from chatgpt.authorization import verify_token
-from chatgpt.fp import get_fp
+from chatgpt.fp import extract_header_fp, get_fp
 from chatgpt.proofofWork import get_answer_token, get_config, get_requirements_token
 from gateway.chatgpt import chatgpt_html
+from gateway.conversation_scope import body_conversation_id, conversation_is_foreign
 from gateway.identity import build_session
 from gateway import resource_proxy
 from gateway.reverseProxy import chatgpt_reverse_proxy, content_generator, get_real_req_token, headers_reject_list, \
@@ -46,6 +47,20 @@ def has_direct_access_token(token: str) -> bool:
     return len(token) == 45 or token.startswith("eyJhbGciOi")
 
 
+# 会话列表只返回前端真正消费的字段。存储条目里另有内部路由事实（`account` 就是号池
+# 账号 token），而 PATCH 会把客户端 body 原样并进条目 —— 「条目里有什么」不是有界集合，
+# 所以这里必须是白名单投影而不是黑名单剔除。
+_CONVERSATION_LIST_FIELDS = (
+    "id", "title", "create_time", "update_time", "is_archived",
+    "conversation_template_id", "gizmo_id", "async_status",
+)
+
+
+def project_conversation(conversation: dict) -> dict:
+    """Project a stored conversation entry onto the fields the list may expose."""
+    return {field: conversation.get(field) for field in _CONVERSATION_LIST_FIELDS}
+
+
 # 账号对象里会暴露持有者真实身份的字段 → 匿名化值。
 # 仅用于 /backend-api/accounts/check 的 account 对象（此处字段语义明确，无歧义）。
 _ACCOUNT_IDENTITY_FIELDS = {
@@ -58,6 +73,40 @@ _ACCOUNT_IDENTITY_FIELDS = {
     "phone_number": "",
     "picture": "",
 }
+
+
+def sanitize_account_object(account: dict) -> dict:
+    """Anonymize one upstream account object in place.
+
+    ``account_id`` / ``plan_type`` stay: they are the capability metadata the
+    frontend keys on.  Everything that names the pool account holder is replaced,
+    and ``account_user_id`` is normalized to the mirror's synthetic form so the
+    holder's own user handle cannot be read back out of it.
+    """
+    account_id = account.get("account_id")
+    account["account_user_id"] = f"user-chatgpt__{account_id}"
+    for field, value in _ACCOUNT_IDENTITY_FIELDS.items():
+        if field in account:
+            account[field] = value
+    return account
+
+
+def sanitize_account_check(payload):
+    """Anonymize every account object of an upstream accounts/check payload.
+
+    Shared by every route that returns one of these payloads, so a new caller
+    cannot re-open the identity leak by forgetting the scrub.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, dict):
+        return payload
+    for entry in accounts.values():
+        account = entry.get("account") if isinstance(entry, dict) else None
+        if isinstance(account, dict):
+            sanitize_account_object(account)
+    return payload
 
 
 @app.get("/backend-api/accounts/check/v4-2023-04-27")
@@ -76,11 +125,8 @@ async def check_account(request: Request):
             account = check_account_info["accounts"][key]["account"]
             account_id = account.get("account_id")
             seed_entry["user_id"] = account.get("account_user_id", "").split("__")[0]
-            account["account_user_id"] = f"user-chatgpt__{account_id}"
             # 抹除 account 对象内其余 owner 标识字段，避免持有者真实身份泄漏给镜像用户
-            for field, value in _ACCOUNT_IDENTITY_FIELDS.items():
-                if field in account:
-                    account[field] = value
+            sanitize_account_object(account)
         globals.persist_seed_map()
         return check_account_info
 
@@ -178,10 +224,10 @@ async def get_conversations(request: Request):
                 continue
             if is_archived == "true":
                 if conversation.get("is_archived", False):
-                    items.append(conversation)
+                    items.append(project_conversation(conversation))
             else:
                 if not conversation.get("is_archived", False):
-                    items.append(conversation)
+                    items.append(project_conversation(conversation))
         items = items[int(offset):int(offset) + int(limit)]
         conversations = {
             "items": items,
@@ -193,6 +239,12 @@ async def get_conversations(request: Request):
         return Response(content=json.dumps(conversations, indent=4), media_type="application/json")
     else:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+@app.api_route("/backend-api/conversation/init", methods=["GET", "POST"])
+async def initialize_conversation(request: Request):
+    # Account-scoped initialization is not a saved conversation called "init".
+    return await chatgpt_reverse_proxy(request, "backend-api/conversation/init")
 
 
 @app.get("/backend-api/conversation/{conversation_id}")
@@ -268,7 +320,9 @@ async def get_me(request: Request):
 @app.get("/backend-api/tasks")
 async def get_me(request: Request):
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if len(token) == 45 or token.startswith("eyJhbGciOi"):
+    # This account-wide list has no verified per-Seed task filter yet. A mirror
+    # bootstrap JWT must not bypass the existing Seed-only restriction.
+    if has_direct_access_token(token) and not request.cookies.get("token", "").strip():
         return await chatgpt_reverse_proxy(request, "backend-api/tasks")
     else:
         tasks = {
@@ -540,7 +594,7 @@ if no_sentinel:
             key: value for key, value in request.headers.items()
             if (key.lower() in headers_accept_list)
         }
-        headers.update(fp)
+        headers.update(extract_header_fp(fp))
         headers.update({"authorization": f"Bearer {access_token}"})
         session_id = hashlib.md5(req_token.encode()).hexdigest()
         proxy_url = proxy_url.replace("{}", session_id) if proxy_url else None
@@ -640,7 +694,7 @@ if no_sentinel:
             key: value for key, value in request.headers.items()
             if (key.lower() in headers_accept_list)
         }
-        headers.update(fp)
+        headers.update(extract_header_fp(fp))
         headers.update({"authorization": f"Bearer {access_token}"})
 
         try:
@@ -754,6 +808,21 @@ async def reverse_proxy(request: Request, path: str):
     # 仅真正「无 seed cookie + 直连 access token」的客户端放行（否则浏览器带号池
     # accessToken 时会被误判为直连而绕过 403）。
     if seed or not has_direct_access_token(token):
+        match = re.match(r"^(?:backend-api|backend-alt)/conversation/([^/]+)(?:/|$)", path)
+        if match and path not in ('backend-api/conversation/init', 'backend-alt/conversation/init'):
+            # Progress/status and document subpaths carry the same private
+            # conversation data as the exact detail route. Check before proxy.
+            entry = globals.seed_map.get(seed or resolve_seed_token(request)) or {}
+            if match.group(1) not in entry.get('conversations', []):
+                raise HTTPException(status_code=404, detail="Conversation not found")
+        if path in ("backend-api/conversation", "backend-alt/conversation"):
+            # 续聊：这一条的会话归属只在请求体里，路径上没有 id，因此上面的正则匹配
+            # 不到。只有「已属于另一个 Seed」才拒绝——镜像没有记录的会话仍然放行，
+            # 首轮新建与历史兼容都依赖这一点（content_generator 会在流里认领它）。
+            requester = seed or resolve_seed_token(request)
+            conversation_id = body_conversation_id(await request.body())
+            if conversation_is_foreign(conversation_id, requester):
+                raise HTTPException(status_code=404, detail="Conversation not found")
         for banned_path in banned_paths:
             if re.match(banned_path, path):
                 raise HTTPException(status_code=403, detail="Forbidden")
