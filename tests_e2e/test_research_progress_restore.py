@@ -273,8 +273,16 @@ def _research_payload():
     }
 
 
-def _research_stream(with_sources=True):
-    """A research turn shaped after the capture, plus the observed terminal."""
+RESEARCH_REPORT = '最终研究报告：结论正文。'
+
+
+def _research_stream(with_sources=True, with_report=False):
+    """A research turn shaped after the capture, plus the observed terminal.
+
+    ``with_report`` appends the observed answer frame: the assistant message
+    that carries ``is_complete``, ``end_turn``, ``citations`` and a body.  It is
+    off by default so the frame counts the other tests assert stay exact.
+    """
     frames = [
         # deep_research_version is the observed marker that upstream is running
         # the research variant, and content_type=thoughts is an observed value.
@@ -292,16 +300,30 @@ def _research_stream(with_sources=True):
                     {'url': 'https://a.test/1'}, {'url': 'https://a.test/1'},
                     {'url': 'https://a.test/2'}]}] if with_sources else []),
                 'citations': [], 'search_result_groups': []}}}}),
+        # The answer frame the official page replaces with its own region; the
+        # mirror shows the body instead.  ``chatgpt_sdk`` is the widget metadata
+        # the capture records on this frame.
+        json.dumps({'c': 13, 'v': {'conversation_id': CONVERSATION, 'message': {
+            'author': {'role': 'assistant', 'name': None},
+            'content': {'content_type': 'text', 'language': 'zh-CN', 'text': RESEARCH_REPORT},
+            'end_turn': True, 'status': 'finished_successfully',
+            'metadata': {'is_complete': True, 'finish_details': {'type': 'stop'},
+                         'citations': [], 'content_references': [],
+                         'chatgpt_sdk': {'resource_name': 'deep_research'}}}}})
+        if with_report else None,
         json.dumps({'conversation_id': CONVERSATION, 'type': 'server_ste_metadata',
                     'metadata': {'tool_name': 'web.run', 'tool_invoked': True}}),
         json.dumps({'conversation_id': CONVERSATION, 'type': 'message_stream_complete'}),
         '[DONE]',
     ]
+    frames = [frame for frame in frames if frame is not None]
     return ('data: ' + '\n\ndata: '.join(frames) + '\n\n').encode('utf-8')
 
 
-def _research_turn(client, cookies, monkeypatch, mock_upstream, with_sources=True):
-    monkeypatch.setattr(mock_upstream, 'conversation_sse', _research_stream(with_sources))
+def _research_turn(client, cookies, monkeypatch, mock_upstream, with_sources=True,
+                   with_report=False):
+    monkeypatch.setattr(mock_upstream, 'conversation_sse',
+                        _research_stream(with_sources, with_report))
     return client.post('/backend-api/f/conversation', cookies=cookies,
                        json=_research_payload())
 
@@ -415,6 +437,103 @@ def test_the_active_route_reports_which_conversation_the_panel_is_showing(
     assert body['conversation_id'] == CONVERSATION
 
 
+# ---------------------------------------------------------------------------
+# The answer the official region hides
+# ---------------------------------------------------------------------------
+# Live gap, 2026-09-13: a real Pro research turn streamed and completed, and the
+# page still showed no report -- the official research region is keyed on a model
+# identifier a normal browser cannot resolve.  These tests drive the same shape
+# through the real routes and assert the mirror's own panel path carries the
+# answer, bounded, owner-scoped, and restorable after a refresh.
+
+PROJECTION = f'/backend-api/research-progress/{CONVERSATION}/projection'
+
+
+def test_a_completed_turn_exposes_the_answer_body_the_official_region_hides(
+        client, mock_upstream, bound_account, monkeypatch):
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_report=True).status_code == 200
+    body = client.get(PROJECTION, cookies={'token': SEED}).json()
+    projection = body['projection']
+    assert projection['report'] == RESEARCH_REPORT
+    assert projection['report_final'] is True
+    assert projection['report_truncated'] is False
+    assert body['state'] == 'complete' and projection['finished'] is True
+    # The answer is the assistant's; the user's own question was echoed upstream
+    # in the same stream and must not appear anywhere in the projection.
+    rendered = json.dumps(body, ensure_ascii=False)
+    assert 'research this' not in rendered
+    assert 'observed-marker' not in rendered
+    assert 'chatgpt_sdk' not in rendered
+    assert 'a.test' not in rendered
+
+
+def test_the_report_restores_after_a_refresh_without_touching_upstream(
+        client, mock_upstream, bound_account, monkeypatch):
+    """The refresh path is the one a real user hits: it must show the answer."""
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_report=True).status_code == 200
+    before = len(mock_upstream.records)
+    first = client.get(PROJECTION, cookies={'token': SEED}).json()
+    second = client.get(PROJECTION, cookies={'token': SEED}).json()
+    assert first == second
+    assert first['projection']['report'] == RESEARCH_REPORT
+    assert len(mock_upstream.records) == before, 'a restore must not re-run the turn'
+
+
+def test_the_report_route_stays_owner_scoped(client, mock_upstream, bound_account, monkeypatch):
+    """One Seed's answer must not be readable by another on the same account."""
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_report=True).status_code == 200
+    assert client.get(PROJECTION, cookies={'token': OTHER_SEED}).status_code == 404
+    assert client.get(PROJECTION).status_code == 404
+    assert client.get('/backend-api/research-progress/active',
+                      cookies={'token': OTHER_SEED}).json() == {'research': False}
+
+
+def test_a_turn_with_no_answer_body_reports_none_rather_than_inventing_one(
+        client, mock_upstream, bound_account, monkeypatch):
+    """The mirror's honest fallback: a terminal state with an empty report.
+
+    This is exactly the ``sources=0`` shape the live gap reported.  Nothing in
+    the stream carried an answer, so the panel must say so instead of showing a
+    body, a stage or a summary the upstream never sent.
+    """
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream).status_code == 200
+    projection = client.get(PROJECTION, cookies={'token': SEED}).json()['projection']
+    assert projection['report'] == ''
+    assert projection['report_final'] is False
+    assert projection['report_truncated'] is False
+    assert projection['finished'] is True, 'the turn still reached its terminal'
+
+
+def test_citations_are_counted_when_the_stream_evidenced_them(
+        client, mock_upstream, bound_account, monkeypatch):
+    """Sources stay a count, and the answer body is never a source carrier."""
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_sources=True, with_report=True).status_code == 200
+    projection = client.get(PROJECTION, cookies={'token': SEED}).json()['projection']
+    assert projection['sources'] == 2
+    assert projection['sources_evidenced'] is True
+    assert projection['report'] == RESEARCH_REPORT, \
+        'the report is the assistant body, never a citation list'
+
+
+def test_zero_sources_are_reported_as_zero_when_upstream_listed_none(
+        client, mock_upstream, bound_account, monkeypatch):
+    """The live gap's own shape: an evidenced, empty source list.
+
+    It must stay a zero -- an empty citation list is a fact, and the report is
+    still shown next to it.
+    """
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_sources=False, with_report=True).status_code == 200
+    projection = client.get(PROJECTION, cookies={'token': SEED}).json()['projection']
+    assert projection['sources'] == 0
+    assert projection['sources_evidenced'] is True
+    assert projection['report'] == RESEARCH_REPORT
+
+
 def test_the_phase_log_records_the_projection_in_counts_only(
         client, mock_upstream, bound_account, monkeypatch, caplog):
     """The one line a real deployment has to prove retention happened.
@@ -435,8 +554,29 @@ def test_the_phase_log_records_the_projection_in_counts_only(
     # Six frames were sent and six were retained: one per message frame plus the
     # stream_complete frame and the [DONE] terminal.
     assert 'retained_events=6' in line
+    # No answer frame in this stream, so the measured report length is zero --
+    # and it is a length, not the answer.
+    assert 'report_chars=0' in line and 'report_final=False' in line
     for leak in (SEED, 'a.test', 'observed-marker', 'research this',
                  'private-session', 'PRIVATE-SESSION', 'cf-value'):
+        assert leak not in line, leak
+
+
+def test_the_phase_log_measures_a_real_report_without_printing_it(
+        client, mock_upstream, bound_account, monkeypatch, caplog):
+    """A real deployment needs to tell "no report" from "report never printed"."""
+    import logging
+    with caplog.at_level(logging.INFO):
+        assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                              with_report=True).status_code == 200
+    lines = [record.getMessage() for record in caplog.records
+             if 'phase=research_progress' in record.getMessage()]
+    assert len(lines) == 1, caplog.text[-2000:]
+    line = lines[0]
+    assert f'report_chars={len(RESEARCH_REPORT)}' in line, line
+    assert 'report_final=True' in line, line
+    assert 'retained_events=7' in line, line
+    for leak in (RESEARCH_REPORT, '报告', 'a.test', 'research this', SEED):
         assert leak not in line, leak
 
 

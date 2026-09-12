@@ -623,7 +623,10 @@ async def f_conversation(request: Request):
             # Whether the mirror kept anything a reloading browser can restore,
             # in counts only: no event text, no metadata values, no prompt.  A
             # research turn that streams correctly but retains nothing is a
-            # silent failure, and this is the line that would show it.
+            # silent failure, and this is the line that would show it.  The
+            # report is measured, never printed: its length and whether upstream
+            # marked that frame as the end of the turn are what decide whether a
+            # real deployment's panel will show an answer at all.
             if recorder.research:
                 record = (research_progress_store.projection_snapshot(
                     recorder.conversation_id, recorder.owner)
@@ -636,6 +639,8 @@ async def f_conversation(request: Request):
                             f"retained_events={(record or {}).get('events_seen', 0)} "
                             f"sources={projection.get('sources', 0)} "
                             f"sources_reported={projection.get('sources_evidenced', False)} "
+                            f"report_chars={len(projection.get('report') or '')} "
+                            f"report_final={projection.get('report_final', False)} "
                             f"finished={projection.get('finished', False)}")
 
     if "stream" in content_type or "text/event-stream" in content_type:

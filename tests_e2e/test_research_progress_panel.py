@@ -151,3 +151,71 @@ def test_mobile_panel_stays_bounded_and_operable(client):
 def test_panel_never_claims_official_parity(client):
     js = _js(client)
     assert "不构成官方进度" in js
+
+
+# ---------------------------------------------------------------------------
+# The answer the official region does not render
+# ---------------------------------------------------------------------------
+# Live gap, 2026-09-13: the turn streamed and completed, and the page showed no
+# report at all.  The panel now renders the assistant's own body.  These tests
+# pin the properties that make that safe to ship: it is written as text, it is
+# labelled by what upstream actually marked, and a turn with no body says so.
+
+def test_panel_writes_the_report_as_text_and_never_as_markup(client):
+    """The body is upstream content; writing it as markup would execute it."""
+    js = _js(client)
+    assert "c2a-rp-body" in js
+    for forbidden in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
+                      "createContextualFragment"):
+        assert forbidden not in js, f"the report must be written as text, not via {forbidden}"
+    # The existing helper is text-only, and the report goes through it.
+    assert "e.textContent=String(text)" in js
+    assert "setText(box.querySelector('.c2a-rp-body'),text||'上游未提供可显示的报告正文')" in js
+
+
+def test_panel_labels_the_report_by_what_upstream_actually_marked(client):
+    """A body without the end-of-turn evidence must not be called a finished report."""
+    js = _js(client)
+    assert "function reportTitle(p){if(p.report_final===true)return '研究报告';" in js
+    assert "return '研究报告（最后收到的正文）'}" in js
+
+
+def test_panel_says_so_when_the_stream_carried_no_answer_body(client):
+    """An empty box is a claim; the honest fallback is a sentence."""
+    js = _js(client)
+    assert "上游未提供可显示的报告正文" in js
+    assert "if(!text&&p.finished!==true){box.hidden=true;return}" in js
+
+
+def test_panel_marks_a_truncated_report_rather_than_hiding_the_cut(client):
+    js = _js(client)
+    assert "p.report_truncated===true?'报告过长，此处只显示开头部分':''" in js
+
+
+def test_the_report_is_rendered_from_the_projection_and_nothing_else(client):
+    """No second source of truth: the panel reads ``p.report`` only.
+
+    The forensic event buffer is a separate route on purpose; a panel that read
+    it would put whole upstream bodies into the page.
+    """
+    js = _js(client)
+    assert "const text=typeof p.report==='string'?p.report:''" in js
+    assert "/events" not in js and "/snapshot" not in js
+
+
+def test_the_report_region_is_created_only_when_it_is_needed(client):
+    """A turn with no answer keeps exactly the panel it had before."""
+    js = _js(client)
+    assert "function reportBox(root){let box=root.querySelector('.c2a-rp-report');if(box)return box;" in js
+    assert "box.hidden=true" in js
+    css = _css(client)
+    assert "#c2a-rp .c2a-rp-report[hidden]{display:none}" in css
+
+
+def test_the_report_block_wraps_and_does_not_fight_the_panel_bounds(client):
+    """Long unbroken reports must wrap, and the panel keeps its own scroller."""
+    css = _css(client)
+    assert "white-space:pre-wrap" in css
+    assert "word-break:break-word" in css
+    assert "overflow:auto" in css, "the panel remains the single scroll container"
+    assert "!important" not in css

@@ -19,6 +19,15 @@ supported mirror path: it is driven by the server-side projection of the real
 upstream stream, so progress is visible whether or not the official component
 decides to render.  A regression test asserts no module in the gateway rewrites
 or fetches the sentinel.
+
+The panel also renders the answer itself.  A real turn measured on 2026-09-13
+streamed its answer and completed, yet the page showed no report at all: the
+official region never resolved, and the mirror's own panel had nothing but an
+event count.  The projection now carries the assistant's own visible text, and
+this panel writes it with ``textContent`` -- never as markup -- bounded and
+labelled by whether upstream itself marked the frame as the end of the turn.
+When upstream sent no answer body, the panel says exactly that instead of
+showing an empty box.
 """
 
 from fastapi.responses import Response
@@ -29,8 +38,8 @@ from app import app
 # ``?v=`` is a cache key for a browser that already holds an older copy; the
 # response itself is no-cache, so the two only ever reinforce each other.
 PANEL_TAGS = (
-    '<link rel="stylesheet" href="/_chat-share/research-panel.css?v=3">'
-    '<script src="/_chat-share/research-panel.js?v=3" defer></script>'
+    '<link rel="stylesheet" href="/_chat-share/research-panel.css?v=4">'
+    '<script src="/_chat-share/research-panel.js?v=4" defer></script>'
 )
 
 
@@ -51,6 +60,13 @@ background:transparent;color:#aaa;font-size:20px;cursor:pointer}
 #c2a-rp .c2a-rp-evidence{margin:0 0 10px;color:#8f8f8f;font-size:11px;
 word-break:break-word}
 #c2a-rp .c2a-rp-note{margin:10px 0 0;color:#7d7d7d;font-size:11px}
+#c2a-rp .c2a-rp-report{margin:10px 0;padding:10px 12px;border-radius:12px;
+background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08)}
+#c2a-rp .c2a-rp-report[hidden]{display:none}
+#c2a-rp .c2a-rp-report-title{margin:0 0 6px;font-size:11px;font-weight:600;color:#c9c9c9}
+#c2a-rp .c2a-rp-body{margin:0;color:#e8e8e8;font-size:12px;white-space:pre-wrap;
+word-break:break-word}
+#c2a-rp .c2a-rp-report-note{margin:6px 0 0;color:#8f8f8f;font-size:11px}
 #c2a-rp dl{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:0}
 #c2a-rp dt{color:#929292;font-size:11px}
 #c2a-rp dd{margin:2px 0 0;font-variant-numeric:tabular-nums}
@@ -93,6 +109,31 @@ const dl=node('dl');dl.append(part('来源','sources'));dl.append(part('事件',
 dl.append(part('耗时','elapsed'));root.append(dl);
 root.append(node('p','c2a-rp-note','镜像仅显示上游实际报告的活动，不构成官方进度。'));
 document.body.append(root);return root}
+/* The report region exists because the official one does not render in a normal
+   browser (see the asset header): the answer the upstream already sent is shown
+   here instead, as text.  It is created lazily so a turn with no answer keeps
+   exactly the panel it had before. */
+function reportBox(root){let box=root.querySelector('.c2a-rp-report');if(box)return box;
+box=node('section','c2a-rp-report');box.hidden=true;
+box.append(node('p','c2a-rp-report-title','研究报告'));
+box.append(node('p','c2a-rp-body',''));
+box.append(node('p','c2a-rp-report-note',''));
+root.insertBefore(box,root.querySelector('.c2a-rp-evidence'));return box}
+/* Wording is chosen by what upstream actually sent, never by what the mirror
+   would like to have received: a body upstream did not mark as the end of the
+   turn is described as what it is -- the last body received -- rather than
+   being called a finished report, and a turn that streamed no body at all says
+   so instead of showing an empty box. */
+function reportTitle(p){if(p.report_final===true)return '研究报告';
+return '研究报告（最后收到的正文）'}
+function applyReport(root,p){const box=reportBox(root);
+const text=typeof p.report==='string'?p.report:'';
+if(!text&&p.finished!==true){box.hidden=true;return}
+box.hidden=false;
+setText(box.querySelector('.c2a-rp-report-title'),text?reportTitle(p):'研究报告');
+setText(box.querySelector('.c2a-rp-body'),text||'上游未提供可显示的报告正文');
+setText(box.querySelector('.c2a-rp-report-note'),
+text&&p.report_truncated===true?'报告过长，此处只显示开头部分':'')}
 /* Terminal wording is derived from the state the mirror recorded, not from the
    last activity label: a turn can end while its last activity was still
    "writing", and showing that as the outcome is what made cancellation and
@@ -115,6 +156,7 @@ const p=data.projection,root=ensure(),state=p.finished?(data.state||'complete'):
 root.hidden=false;root.dataset.finished=String(p.finished===true);root.dataset.state=state;
 if(state!==lastState){lastState=state;setText(root.querySelector('.c2a-rp-state'),headline(state))}
 setText(root.querySelector('.c2a-rp-action'),'最近活动：'+(p.action||'等待上游事件'));
+applyReport(root,p);
 setText(root.querySelector('.c2a-rp-evidence'),evidenceText(p));
 setText(root.querySelector('[data-key="sources"]'),sourcesText(p));
 setText(root.querySelector('[data-key="events"]'),Number.isFinite(data.events_seen)?data.events_seen:'—');

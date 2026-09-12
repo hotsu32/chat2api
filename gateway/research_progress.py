@@ -16,6 +16,10 @@ negotiates through ``supported_encodings``.  Everything below therefore keys off
   browser that reloads can ask the mirror instead of re-running the turn;
 * retention is bounded in three dimensions (events, bytes, conversations) and
   what survives the bound is the newest state plus the terminal event;
+* the assistant's own visible answer is projected as bounded text, because the
+  official research region does not render it in a normal browser (measured on
+  a real turn) -- see the report section below for what may and may not be
+  shown;
 * the terminal marker reaches the browser exactly once per turn.
 
 Nothing here claims a research turn *succeeded*.  A synthetic stream proves the
@@ -267,6 +271,9 @@ PROJECTION_KEYS = frozenset({
     "sources_evidenced",   # upstream listed sources at all (count may be 0)
     "urls_moderated",      # count of url_moderation frames
     "research_confirmed",  # deep_research_version metadata was observed
+    "report",              # the assistant's own visible answer text, bounded
+    "report_final",        # that text came from the frame that ended the turn
+    "report_truncated",    # the answer was longer than the bound
     "started_at",          # epoch seconds the turn began
     "elapsed_ms",          # frozen once the turn is terminal
     "finished_at",         # epoch seconds the terminal signal was observed
@@ -307,6 +314,116 @@ def _token(value):
         return ""
     value = value.strip()
     return value if _TOKEN_RE.match(value) else ""
+
+
+# ---------------------------------------------------------------------------
+# The report: the assistant's own visible answer, bounded
+# ---------------------------------------------------------------------------
+# Measured on a real turn (2026-09-13): the request was a research turn, the
+# upstream stream completed, and the browser still rendered no answer -- because
+# the official bundle draws its own research region for this message and that
+# region is keyed on a model identifier a normal browser cannot resolve, so the
+# region resolved to a browser error page.  The answer itself was already in the
+# stream the mirror forwarded.  This projection is where it becomes visible.
+#
+# The answer body is the observed ``content`` of an assistant message: ``text``
+# (the answer frame, fixture index 12) or a ``parts`` array of strings (every
+# other message frame in the capture).  What may be shown is decided only by
+# evidence the capture contains:
+#
+# * only an assistant-authored message may speak -- the user's own question is
+#   replayed upstream as an ``input_message`` with a body of its own, and it is
+#   not the answer;
+# * a message the capture marks ``is_visually_hidden_from_conversation`` is
+#   internal and is not shown;
+# * reasoning is not the answer -- the official UI does not show the model's
+#   ``thoughts`` either;
+# * a tool node's payload is not the answer (``web.run`` was the observed tool
+#   recipient, and tool frames carry ``invoked_resource`` / ``invoked_plugin``);
+# * the body is bounded and stripped of control characters, so one upstream
+#   frame cannot make the panel unbounded or unrenderable.
+#
+# Nothing here invents an answer: no frame carries one, the projection carries
+# an empty string, and the panel says so in words.
+MAX_REPORT_CHARS = 6000
+MAX_REPORT_PARTS = 64
+# What is *built* before bounding, so an overflow is still visible to the bound.
+_REPORT_BUILD_LIMIT = MAX_REPORT_CHARS * 2
+_REPORT_TRUNCATION = "\n\n[报告内容过长，此处已截断]"
+
+# Content types whose body is not the user-facing answer.  Both values are
+# observed under the capture's ``content_type`` key.  The comparison uses the
+# raw value rather than ``_token``: a protocol token never contains ``_``, so
+# ``_token`` would silently drop ``reasoning_recap`` instead of excluding it.
+NON_REPORT_CONTENT_TYPES = frozenset({"thoughts", "reasoning_recap"})
+
+# A tool recipient is namespace-qualified (``web.run`` is the observed one).
+_TOOL_RECIPIENT_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+_TOOL_METADATA_KEYS = ("invoked_resource", "invoked_plugin")
+
+# Everything a terminal or a browser would act on, minus the two whitespace
+# characters a report legitimately uses.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _normalised_content_type(content) -> str:
+    value = content.get("content_type") if isinstance(content, dict) else None
+    return value.strip().lower() if isinstance(value, str) else ""
+
+
+def _is_hidden_message(metadata) -> bool:
+    """The capture's own "do not show this one" flag."""
+    return (isinstance(metadata, dict)
+            and metadata.get("is_visually_hidden_from_conversation") is True)
+
+
+def _is_tool_frame(recipient: str, metadata) -> bool:
+    """Whether this message is a tool node rather than the assistant's answer."""
+    if recipient and _TOOL_RECIPIENT_RE.match(recipient):
+        return True
+    if not isinstance(metadata, dict):
+        return False
+    return any(metadata.get(key) for key in _TOOL_METADATA_KEYS)
+
+
+def _report_body(message) -> str:
+    """The visible body of one message, or "" when it has none.
+
+    Bounded while it is built, not after: a ``parts`` array is upstream-sized,
+    and the join must not run over an unbounded list to then throw it away.  The
+    build limit is deliberately twice the render limit, so a body that overflows
+    still *looks* like one to ``_bound_report`` after control characters are
+    stripped, and the truncation is reported instead of being silently lost.
+    """
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, dict):
+        return ""
+    if _normalised_content_type(content) in NON_REPORT_CONTENT_TYPES:
+        return ""
+    text = content.get("text")
+    if isinstance(text, str) and text.strip():
+        return text[:_REPORT_BUILD_LIMIT]
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    collected, total = [], 0
+    for part in parts[:MAX_REPORT_PARTS]:
+        if not isinstance(part, str) or not part:
+            continue
+        collected.append(part)
+        total += len(part)
+        if total > _REPORT_BUILD_LIMIT:
+            break
+    return "\n".join(collected)
+
+
+def _bound_report(text: str):
+    """Sanitise and bound one report body. Returns ``(text, truncated)``."""
+    cleaned = _CONTROL_CHARS_RE.sub(
+        "", text.replace("\r\n", "\n").replace("\r", "\n"))
+    if len(cleaned) <= MAX_REPORT_CHARS:
+        return cleaned, False
+    return cleaned[:MAX_REPORT_CHARS].rstrip() + _REPORT_TRUNCATION, True
 
 
 def _message_of(payload):
@@ -400,6 +517,9 @@ def project_event(payload, kind=None) -> dict:
         "source_digests": [],
         "urls_moderated": 0,
         "research_confirmed": False,
+        "report": "",
+        "report_final": False,
+        "report_truncated": False,
         "terminal_state": "",
     }
     if not isinstance(payload, dict):
@@ -476,6 +596,17 @@ def project_event(payload, kind=None) -> dict:
         elif _has_error(payload):
             terminal_state = "failed"
 
+        # The answer body, from the same evidence the terminal detection uses:
+        # only an assistant message may speak, hidden and tool messages may not,
+        # and the frame that ends the turn is the one that settles the report.
+        report, report_truncated, report_final = "", False, False
+        if assistant_message and not _is_hidden_message(metadata) \
+                and not _is_tool_frame(recipient, metadata):
+            body = _report_body(message)
+            if body:
+                report, report_truncated = _bound_report(body)
+                report_final = assistant_answer
+
         projection.update({
             "action": action or ACTION_WAITING,
             "tool": tool,
@@ -486,6 +617,9 @@ def project_event(payload, kind=None) -> dict:
             "source_digests": sorted(sources),
             "urls_moderated": 1 if event_type == "url_moderation" else 0,
             "research_confirmed": "deep_research_version" in metadata,
+            "report": report,
+            "report_final": report_final,
+            "report_truncated": report_truncated,
             "terminal_state": terminal_state,
         })
     except Exception:
@@ -664,6 +798,12 @@ class _Progress:
         self.sources_evidenced = False
         self.urls_moderated = 0
         self.research_confirmed = False
+        # The assistant's own visible answer.  Bounded in ``project_event``
+        # before it ever reaches here, and only ever overwritten by a frame
+        # that carries an answer -- never cleared by a frame that has none.
+        self.report = ""
+        self.report_final = False
+        self.report_truncated = False
 
     def projection(self, now):
         """The browser-facing view: whitelisted keys, no upstream text."""
@@ -678,6 +818,9 @@ class _Progress:
             "sources_evidenced": self.sources_evidenced,
             "urls_moderated": self.urls_moderated,
             "research_confirmed": self.research_confirmed,
+            "report": self.report,
+            "report_final": self.report_final,
+            "report_truncated": self.report_truncated,
             "started_at": self.started_at,
             "elapsed_ms": max(0, int((end - self.started_at) * 1000)),
             "finished_at": self.finished_at,
@@ -727,6 +870,9 @@ class ResearchProgressStore:
                 # turn must not be inherited by this one.
                 record.started_at = record.updated_at
                 record.finished_at = None
+                record.report = ""
+                record.report_final = False
+                record.report_truncated = False
                 record.research = record.research or bool(research)
                 if research:
                     record.action = ACTION_STARTING
@@ -780,6 +926,18 @@ class ResearchProgressStore:
             record.research_confirmed = True
         record.urls_moderated += projection.get("urls_moderated") or 0
         record.source_digests.update(projection.get("source_digests") or ())
+        # Report precedence, decided by evidence rather than by arrival order:
+        # the frame that ends the turn carries the answer and outranks any
+        # interim body, while a later interim frame must not overwrite it.  Two
+        # frames of the same rank are ordered by arrival, so a streamed answer
+        # that grows frame by frame settles on its last and longest version.
+        report = projection.get("report") or ""
+        if report:
+            settled = bool(projection.get("report_final"))
+            if settled or not (record.report and record.report_final):
+                record.report = report
+                record.report_final = settled
+                record.report_truncated = bool(projection.get("report_truncated"))
         terminal_state = projection.get("terminal_state")
         if terminal_state in TERMINAL_STATES:
             self._mark_terminal(record, terminal_state)

@@ -41,7 +41,8 @@ _HTML = """<!doctype html>
 
 def _frame(*, state="streaming", action="正在分析资料", sources=0, evidenced=False,
            finished=False, events=3, elapsed_ms=4200, started_at=1000.0,
-           finished_at=None, tool="", markers=(), content_types=("thoughts",)):
+           finished_at=None, tool="", markers=(), content_types=("thoughts",),
+           report="", report_final=False, report_truncated=False):
     return {
         "research": True,
         "conversation_id": "conv-abc",
@@ -59,6 +60,9 @@ def _frame(*, state="streaming", action="正在分析资料", sources=0, evidenc
             "sources_evidenced": evidenced,
             "urls_moderated": 0,
             "research_confirmed": True,
+            "report": report,
+            "report_final": report_final,
+            "report_truncated": report_truncated,
             "started_at": started_at,
             "elapsed_ms": elapsed_ms,
             "finished_at": finished_at,
@@ -74,6 +78,21 @@ _WITH_SOURCES = _frame(action="正在检索网络资料", sources=2, evidenced=T
 _FINISHED = _frame(state="complete", action="研究已完成", sources=2, evidenced=True,
                    finished=True, events=9, elapsed_ms=12000, started_at=1000.0,
                    finished_at=1013.0, tool="web.run", markers=["search"])
+
+# The assistant's own body, as the mirror projects it: markup included on
+# purpose, so a browser test can prove it is rendered as text and not parsed.
+REPORT_BODY = ('<img src=x onerror="window.__reportExecuted=1"> 报告正文：开头段落。\n'
+               + '\n'.join(f'段落 {i} 的内容，用于验证换行与滚动。' for i in range(2, 40)))
+_REPORTED = _frame(state="complete", action="研究已完成", sources=0, evidenced=True,
+                   finished=True, events=21, elapsed_ms=31000, started_at=1000.0,
+                   finished_at=1031.0, report=REPORT_BODY, report_final=True,
+                   report_truncated=True)
+
+# The same body, but upstream never marked that frame as the end of the turn:
+# the panel must describe what it received rather than call it a finished report.
+_UNMARKED = _frame(state="complete", action="研究已完成", finished=True,
+                   events=9, elapsed_ms=12000, started_at=1000.0,
+                   finished_at=1013.0, report="最后收到的正文", report_final=False)
 
 # Each scenario is the ordered response list for /active; the last entry repeats.
 SCENARIOS = {
@@ -91,6 +110,11 @@ SCENARIOS = {
     "desktop": [_STREAMING],
     "malformed": ["RAW:not json at all", 500, _STREAMING],
     "restore": [{"research": False}],
+    "report": [_REPORTED],
+    "mobile_report": [_REPORTED],
+    "unmarked_report": [_UNMARKED],
+    "no_report": [_frame(state="complete", action="研究已完成", finished=True,
+                         elapsed_ms=5000, started_at=1000.0, finished_at=1005.0)],
 }
 
 # The restore scenario answers on the per-conversation route instead.
@@ -197,7 +221,9 @@ def _run_probe(scenario, timeout=180):
 
 @pytest.mark.parametrize("scenario", ["sequence", "idle", "error", "cancelled",
                                       "unreported", "empty_sources", "malformed",
-                                      "restore", "mobile", "desktop"])
+                                      "restore", "mobile", "desktop", "report",
+                                      "mobile_report", "no_report",
+                                      "unmarked_report"])
 def test_browser_scenario(scenario):
     report = _run_probe(scenario)
     assert report["failures"] == [], report
@@ -212,6 +238,39 @@ def test_sequence_reaches_a_terminal_state_then_stops_polling():
                  "terminal_elapsed_frozen", "terminal_stops_polling",
                  "no_ratio_in_rendered_text"):
         assert checks[name]["ok"] is True, {name: checks[name]}
+
+
+def test_the_answer_the_official_region_hides_is_rendered_by_the_panel():
+    """The live gap, end to end in a real browser.
+
+    A Pro research turn completed and the page showed no report, because the
+    official research region does not resolve in a normal browser.  The mirror's
+    panel must render the body the upstream stream carried -- as text, labelled
+    by what upstream marked, with the terminal state still readable.
+    """
+    checks = _run_probe("report")["checks"]
+    for name in ("report_rendered", "report_markup_not_parsed", "report_labelled_final",
+                 "report_truncation_noted", "terminal_headline_still_shown",
+                 "no_ratio_in_rendered_text", "report_panel_stays_bounded",
+                 "no_uncaught_page_error"):
+        assert checks[name]["ok"] is True, {name: checks[name]}
+
+
+def test_a_finished_turn_with_no_body_says_so_instead_of_showing_a_blank_box():
+    """The honest fallback the sources=0 gap actually hit."""
+    checks = _run_probe("no_report")["checks"]
+    for name in ("report_box_shown_for_a_finished_turn", "no_report_says_so",
+                 "no_report_has_no_truncation_note", "no_report_keeps_the_rest_of_the_panel"):
+        assert checks[name]["ok"] is True, {name: checks[name]}
+
+
+def test_the_report_does_not_cover_the_composer_on_a_phone():
+    """A long body must not be able to push the panel over the composer."""
+    report = _run_probe("mobile_report")
+    geometry = report["geometry"]
+    assert geometry["overlaps"] is False, geometry
+    assert geometry["panel"]["bottom"] <= geometry["composer"]["top"], geometry
+    assert report["checks"]["report_panel_stays_bounded"]["ok"] is True, report["checks"]
 
 
 def test_phone_layout_keeps_the_composer_reachable():
