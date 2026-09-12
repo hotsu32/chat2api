@@ -334,8 +334,6 @@ def test_usage_page_counts_more_than_500_events(client):
 
 def test_usage_page_collapses_unknown_kinds_on_same_day(client):
     """同日多个未知 kind 映射为一个公开的其他类型。"""
-    import utils.usage as usage
-
     email = "usage-unknown@example.com"
     _register(client, email, "password123")
     seed = store.get_user_auth(email)["seed"]
@@ -346,7 +344,7 @@ def test_usage_page_collapses_unknown_kinds_on_same_day(client):
     ])
     page = client.get("/usage")
     assert page.status_code == 200
-    assert page.text.count("其他") == 1
+    assert page.text.count(">其他<") == 1
     assert ">2<" in page.text
 
 
