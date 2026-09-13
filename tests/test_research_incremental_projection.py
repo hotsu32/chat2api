@@ -367,6 +367,24 @@ def test_unrelated_nested_error_fields_do_not_fail_a_healthy_snapshot():
     assert view["projection"]["action"] == rp.ACTION_DONE
 
 
+@pytest.mark.parametrize("value", [False, 0, [], {}])
+def test_falsy_error_values_do_not_fail_a_healthy_envelope(value):
+    """The protocol uses null/empty values for no error, not falsy sentinels."""
+    message = assistant_message(
+        status="finished_successfully",
+        end_turn=True,
+        metadata={"is_complete": True},
+    )
+    store, view = run([{"v": {
+        "conversation_id": CONVERSATION,
+        "error": value,
+        "error_code": None,
+        "message": message,
+    }}])
+    assert store.snapshot(CONVERSATION)["state"] == "complete"
+    assert view["projection"]["action"] == rp.ACTION_DONE
+
+
 def test_a_cancelled_patch_is_not_a_completion():
     frames = [replace("/message", assistant_message()),
               replace("/message/status", "cancelled")]

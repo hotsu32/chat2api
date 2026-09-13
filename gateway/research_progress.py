@@ -487,14 +487,18 @@ def _has_error(payload) -> bool:
             if envelope:
                 for key in ("error", "error_code"):
                     value = candidate.get(key)
-                    if value is not None and value != "":
+                    if isinstance(value, str):
+                        present = bool(value.strip())
+                    else:
+                        present = value not in (None, False, 0, [], {})
+                    if present:
                         return True
             value = candidate.get("v")
             if isinstance(value, (dict, list)):
                 pending.append((value, False, depth + 1))
         elif isinstance(candidate, list):
             pending.extend((value, False, depth + 1)
-                           for value in candidate[:128]
+                           for value in candidate[:MAX_PATCH_OPS]
                            if isinstance(value, (dict, list)))
     return False
 
