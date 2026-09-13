@@ -27,6 +27,10 @@ from utils.Logger import logger
 # 反向依赖 circuit 会形成循环（circuit 已经 import cooldown）。
 REASON_RATE_LIMIT = "rate_limit"
 REASON_CF_CHALLENGE = "cf_challenge"
+REASON_POW_CHALLENGE = "pow_challenge"
+REASON_TURNSTILE_CHALLENGE = "turnstile_challenge"
+REASON_ARKOSE_CHALLENGE = "arkose_challenge"
+REASON_ACCOUNT_UNAVAILABLE = "account_unavailable"
 REASON_CHAT_LIMIT = "chat_limit"
 REASON_DEGRADED_QUALITY = "degraded_quality"
 REASON_UPSTREAM_5XX = "upstream_5xx"
@@ -55,6 +59,10 @@ _cooldown_events: Dict[str, int] = {}
 EXTEND_REASONS = frozenset({
     REASON_RATE_LIMIT,
     REASON_CF_CHALLENGE,
+    REASON_POW_CHALLENGE,
+    REASON_TURNSTILE_CHALLENGE,
+    REASON_ARKOSE_CHALLENGE,
+    REASON_ACCOUNT_UNAVAILABLE,
     REASON_CHAT_LIMIT,
     REASON_DEGRADED_QUALITY,
     REASON_UPSTREAM_5XX,

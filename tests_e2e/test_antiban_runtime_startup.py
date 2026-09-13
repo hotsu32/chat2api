@@ -408,3 +408,68 @@ def test_single_worker_declaration_is_accepted(fake_upstream, tmp_path):
     assert markers["ENABLED"] == "True"
     assert "[antiban] coordination=single_process capacity_scope=process" in result.stderr
     assert fake_upstream.records == ["/"]
+
+
+# ---------------------------------------------------------------------------
+# 形态二之补：worker 声明读不出正整数 / 声明了用不上的协调层
+#
+# 这两类都不能被读成「单进程」：
+#   * WEB_CONCURRENCY=0 在 gunicorn 里是「按 CPU 数展开」，不是「一个 worker」；
+#   * auto / 4,4 这类值既不是 1 也不是可解析的整数。
+# 声明了共享协调层同理：本层没有协调客户端，静默按进程内状态跑就是 fail open。
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("declaration", ["0", "auto", "4,4"])
+def test_unusable_worker_declaration_refuses_startup(fake_upstream, tmp_path, declaration):
+    result = _run_child(_DRIVER_REFUSE, fake_upstream.url, tmp_path,
+                        {"WEB_CONCURRENCY": declaration})
+    markers = _markers(result.stdout)
+
+    assert markers.get("DONE") == "1", f"child did not finish:\n{result.stdout}\n{result.stderr}"
+    failure = markers.get("STARTUP_FAILURE", "")
+    assert "UncoordinatedMultiWorkerError" in failure, f"startup did not fail closed: {failure!r}"
+    assert "WEB_CONCURRENCY" in failure, "the refusal must name the variable to fix"
+
+    assert fake_upstream.records == []
+    assert json.loads(markers["VIOLATIONS"]) == []
+    assert "multi_process_uncoordinated" in result.stderr
+
+
+def test_declared_coordinator_refuses_startup_without_leaking_its_credentials(fake_upstream, tmp_path):
+    """声明了协调层但本层没有客户端：拒绝启动，且不得把端点（含密码）写进日志。"""
+    result = _run_child(
+        _DRIVER_REFUSE, fake_upstream.url, tmp_path,
+        {"ANTIBAN_COORDINATOR_URL": "redis://coordinator-user:coordinator-secret@"
+                                    "coordinator.test:6379/0"},
+    )
+    markers = _markers(result.stdout)
+
+    assert markers.get("DONE") == "1", f"child did not finish:\n{result.stdout}\n{result.stderr}"
+    failure = markers.get("STARTUP_FAILURE", "")
+    assert "UnusableCoordinatorError" in failure, f"startup did not fail closed: {failure!r}"
+    assert "ANTIBAN_COORDINATOR_URL" in failure, "the refusal must name the variable to remove"
+
+    log = result.stdout + result.stderr
+    for needle in ("coordinator-secret", "coordinator-user", "coordinator.test", "6379"):
+        assert needle not in log, f"the coordinator endpoint leaked {needle!r}"
+
+    # 拒绝发生在任何外发之前
+    assert fake_upstream.records == []
+    assert json.loads(markers["VIOLATIONS"]) == []
+
+
+def test_declared_coordinator_never_starts_a_multi_worker_deployment(fake_upstream, tmp_path):
+    """声明协调层不能解锁多 Worker：两件事都不成立就必须起不来。"""
+    result = _run_child(
+        _DRIVER_REFUSE, fake_upstream.url, tmp_path,
+        {"WEB_CONCURRENCY": "4",
+         "ANTIBAN_COORDINATOR_URL": "redis://coordinator.test:6379/0"},
+    )
+    markers = _markers(result.stdout)
+
+    assert markers.get("DONE") == "1"
+    failure = markers.get("STARTUP_FAILURE", "")
+    assert "UnusableCoordinatorError" in failure, (
+        f"a declared coordinator must not unlock multi-worker startup: {failure!r}"
+    )
+    assert fake_upstream.records == []

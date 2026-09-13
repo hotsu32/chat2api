@@ -201,6 +201,16 @@ def get_bucket_meta(bucket_id: Optional[str]) -> Dict:
     return globals.antiban_bucket.get("buckets", {}).get(bucket_id, {})
 
 
+def has_buckets() -> bool:
+    """池子里是否存在任何桶。
+
+    准入层用它区分两种「分不到桶」：池子是空的（没配代理，没有绑定契约可违约）
+    与池子有桶但一个都接纳不了（严格绑定被违反）。判据只看桶是否存在，不看状态——
+    后者由 circuit.bucket_ineligible_reason 负责。
+    """
+    return bool(globals.antiban_bucket.get("buckets"))
+
+
 def mark_used(token: str) -> None:
     if not configs.enable_antiban or not token:
         return

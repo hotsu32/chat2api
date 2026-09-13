@@ -20,17 +20,23 @@
   本层状态全部是**进程内**字典。多 Worker 部署下每号并发上限、冷却与熔断状态
   都是「每 Worker 一份」，实际并发 = worker 数 × 上限。
 
-  因此当前契约是 fail closed：声明 worker 数 > 1 且没有共享协调层时，
-  init() 直接抛 UncoordinatedMultiWorkerError，启动即失败——宁可起不来，
-  也不在无法兑现保护的情况下假装受保护。单 Worker（或未声明 worker 数）正常启用。
-  coordination 字段把部署形态变成可查询事实，供指标与排查使用。
+  因此当前契约是 fail closed，三种形态都在启动期拒绝：
+    * 声明 worker 数 > 1 且没有共享协调层 → UncoordinatedMultiWorkerError；
+    * 声明了 worker 数但读不出正整数（0 / auto）→ 同上。0 不是「一个 worker」，
+      主流服务器把它当成「由框架决定」，而框架的决定通常是多进程；
+    * 声明了共享协调层（ANTIBAN_COORDINATOR_URL）→ UnusableCoordinatorError。
+      本层没有协调层客户端，声明它并不能让容量变成全局的；静默按进程内状态运行
+      才是 fail open，所以宁可起不来。
+  单 Worker（或未声明 worker 数）正常启用。coordination 字段把部署形态、
+  worker 声明状态与「有没有声明协调层」变成可查询事实，供指标与排查使用。
+  任何情况下本层都**不**声称 capacity_is_global。
 """
 
 from utils.antiban import bucket as _bucket
 from utils.antiban import circuit as _circuit
 from utils.antiban import cooldown as _cooldown
 from utils.antiban import guard as _guard
-from utils.antiban.guard import UncoordinatedMultiWorkerError, acquire_context, admission_error, anon_id, coordination_status, redact_proxy, release_context, report_error, report_network_error, report_success, init, sniff_account_warning  # noqa: F401
+from utils.antiban.guard import CoordinationConfigError, UncoordinatedMultiWorkerError, UnusableCoordinatorError, acquire_context, admission_error, anon_id, coordination_status, redact_proxy, release_context, report_error, report_network_error, report_success, init, sniff_account_warning  # noqa: F401
 
 
 def _bucket_status_counts():

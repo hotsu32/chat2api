@@ -402,6 +402,36 @@ def test_transport_failure_is_filed_as_network_and_degrades_only_at_the_threshol
     assert circuit.get_circuit_stats().get('network_error.reset') == 3
 
 
+def test_a_degraded_exit_stops_admitting_its_own_accounts(
+        client, mock_upstream, account, bound_bucket, monkeypatch):
+    """降级不是记账：同一条出口上的号必须**真的**不再出网。
+
+    The refinement: the request that follows must be refused at admission (503
+    with the bucket reason) rather than reaching the request layer, which is
+    still patched to fail and would answer 502. Only the status tells the two
+    apart, and only 503 proves the degradation gate is load-bearing.
+    """
+    from gateway import reverseProxy
+
+    def fail(*args, **kwargs):
+        raise ConnectionResetError('connection reset by peer')
+
+    monkeypatch.setattr(reverseProxy, '_request_with_retry', fail)
+
+    with _shared_loop(client):
+        for _ in range(3):
+            assert _post(client).status_code == 502
+            _forget_fingerprint_profile(account)
+        assert bucket.get_bucket_meta(BUCKET_ID)['status'] == 'degraded'
+
+        refused = _post(client)
+
+    assert refused.status_code == 503, 'a degraded exit still carried traffic'
+    assert 'bucket_degraded' in refused.text
+    assert guard.get_admission_stats().get('bucket_degraded', 0) >= 1
+    assert _semaphore(account)._value == configs.account_max_concurrency, 'a denied request held a slot'
+
+
 def test_mid_stream_failure_is_filed_as_network_without_a_success(
         client, mock_upstream, account, bound_bucket, monkeypatch):
     """Once a stream has started the status is already 200 and committed, so an

@@ -2,11 +2,17 @@
 
 错误分级（每一类都映射到一个**枚举**，日志与指标只出现枚举，不出现上游原文）：
   403 + cf_chl_opt   → bucket 降级 CIRCUIT_403_COOLDOWN；桶内账号一并延长冷却
+  403 + 挑战族       → PoW / Turnstile / Arkose 各自归类，账号退避（上游确证的挑战）
   429 rate-limit     → 账号指数退避冷却（1800→3600→7200s 封顶）
   401 invalid_grant  → 加入 error_token_list，等 refreshToken 恢复
   account_deactivated→ 永久黑名单 antiban_dead.json
+  account unavailable→ 账号退避（临时不可用，不等于封号）
   5xx                → 轻度退避
   200 成功           → 重置账号退避等级
+
+死号复活不是本模块的自由行为：revive_token 要求**刚发生的认证探针证据**
+（store 里新鲜的 healthy 判定），探针成功的持续时长（dwell）由号池探活负责。
+定时自愈只恢复桶，不复活死号。
 
 脱敏约束：detail 可能是上游响应正文（含会话内容、账号信息）。它只用于**分类**，
 分类结果是枚举；原文不进日志、不进持久化的 dead 记录、不进指标。
@@ -36,12 +42,28 @@ _NETWORK_ERROR_COOLDOWN = 300
 
 # 错误分类枚举。UI/运维按此区分业务状态，因此必须保留；上游原文一律丢弃。
 REASON_CF_CHALLENGE = "cf_challenge"
+REASON_POW = "pow_challenge"
+REASON_TURNSTILE = "turnstile_challenge"
+REASON_ARKOSE = "arkose_challenge"
 REASON_RATE_LIMIT = "rate_limit"
 REASON_AUTH_INVALID = "auth_invalid"
 REASON_ACCOUNT_DEAD = "account_deactivated"
+REASON_ACCOUNT_UNAVAILABLE = "account_unavailable"
 REASON_UPSTREAM_5XX = "upstream_5xx"
 REASON_UNCLASSIFIED = "unclassified"
 REASON_NETWORK = "network_error"
+
+# 桶降级事件的指标前缀：`_count` 的键空间已经有 reason[:status]，这里再加一个
+# 有界的事件族，好让「熔断真的动作了」可以在指标里查到（只有日志等于查不到）。
+EVENT_BUCKET_DEGRADED = "bucket_degraded"
+
+# 挑战族：上游明确告知「你得先过这一关」。它们的降载动作一致（账号退避），
+# 但**必须分开计数**：PoW 失败、Turnstile 要求、Arkose 要求对应不同的运维动作，
+# 合并成一个 unclassified 就只剩「上游拒绝了」这一条信息。
+_CHALLENGE_REASONS = frozenset({REASON_POW, REASON_TURNSTILE, REASON_ARKOSE})
+
+# 上游确证、但不足以判死的拒绝 → 账号退避（不降级整桶：这些是账号/会话级信号）。
+_COOLDOWN_REASONS = _CHALLENGE_REASONS | frozenset({REASON_ACCOUNT_UNAVAILABLE})
 
 # 允许写入持久化 dead 记录与日志的死号原因。未知一律归一到 unclassified，
 # 防止调用方把上游响应片段当作 reason 传进来并落盘。
@@ -104,12 +126,41 @@ _NETWORK_KIND_MAP = {
 # 否则运维只能回去读源码。signal 是识别依据，action 是触发的降载动作。
 _ERROR_CLASSES: List[Dict[str, str]] = [
     {"reason": REASON_CF_CHALLENGE, "signal": "403 + cf_chl_opt", "action": "degrade_bucket"},
+    {"reason": REASON_POW, "signal": "403 + proof of work", "action": "extend_cooldown"},
+    {"reason": REASON_TURNSTILE, "signal": "403 + turnstile required", "action": "extend_cooldown"},
+    {"reason": REASON_ARKOSE, "signal": "403 + arkose required", "action": "extend_cooldown"},
     {"reason": REASON_RATE_LIMIT, "signal": "429 / rate-limit", "action": "extend_cooldown"},
     {"reason": REASON_AUTH_INVALID, "signal": "401 + invalid_grant", "action": "error_token_list"},
     {"reason": REASON_ACCOUNT_DEAD, "signal": "account_deactivated / banned", "action": "mark_dead"},
+    {"reason": REASON_ACCOUNT_UNAVAILABLE, "signal": "account unavailable", "action": "extend_cooldown"},
     {"reason": REASON_UPSTREAM_5XX, "signal": "5xx", "action": "extend_cooldown"},
     {"reason": REASON_NETWORK, "signal": "transport failure", "action": "degrade_bucket"},
     {"reason": REASON_UNCLASSIFIED, "signal": "anything else", "action": "count_only"},
+]
+
+# 分类依据：上游**确证**的标记 → (枚举, 是否要求 403)。顺序即优先级：越具体的越先判。
+# 三档可信度：
+#   机器令牌（cf_chl_opt / ark0se / proofofwork / account_deactivated ...）：
+#     响应正文里出现即成立，与状态码无关——自然语言里不会出现这些串。
+#     这类标记**不能**要求 403：挑战页也可能是 503，只认 403 就会把它降级成
+#     upstream_5xx（轻度退避），恰好漏掉最该做的整桶降级。
+#   自然语言（turnstile / arkose / proof of work）：只有 403 才算挑战，其它状态码
+#     的正文里可能出现同一个词（429 的正文提到 turnstile 仍然是频控）。
+#   账号状态（account_deactivated / account unavailable）：与状态码无关。
+# 约束：detail 只用于匹配，匹配结果才是枚举——原文一律不进日志/指标/落盘。
+_CLASSIFY_MARKERS: List[tuple] = [
+    ("cf_chl_opt", REASON_CF_CHALLENGE, False),
+    ("cf-chl", REASON_CF_CHALLENGE, False),
+    ("ark0se", REASON_ARKOSE, False),
+    ("proofofwork", REASON_POW, False),
+    ("turnstile", REASON_TURNSTILE, True),
+    ("arkose", REASON_ARKOSE, True),
+    ("proof of work", REASON_POW, True),
+    ("account_deactivated", REASON_ACCOUNT_DEAD, False),
+    ("account unavailable", REASON_ACCOUNT_UNAVAILABLE, False),
+    ("account_unavailable", REASON_ACCOUNT_UNAVAILABLE, False),
+    ("account is unavailable", REASON_ACCOUNT_UNAVAILABLE, False),
+    ("account not available", REASON_ACCOUNT_UNAVAILABLE, False),
 ]
 
 
@@ -329,14 +380,60 @@ def mark_dead(token: str, reason: str = "") -> None:
     logger.error(f"[antiban] {anon_id(token)} marked dead: reason={reason}")
 
 
+# 复活证据的新鲜度上限：store 里那条 healthy 判定必须来自**刚发生**的探针。
+# 无限期的 healthy 行只证明「历史上健康过」，不构成放回流量的证据。
+#
+# 为什么这个上界不会把恢复卡死：号池探活是在**同一轮扫描里**先条件写入 healthy
+# （store.apply_health_probe 写 status 与 last_health_check），紧接着调用本函数。
+# 所以「能触发复活的那次写入」与复活之间没有 dwell 间隔——dwell 是探针在写入
+# healthy 之前自己等满的。这个上界只会拒绝「与本轮无关的旧判定」。
+_REVIVE_EVIDENCE_MAX_AGE_SECONDS = 300
+# 允许的时钟偏移：判定时间戳落在未来超过这个量即视为不可信（否则一个坏掉的
+# 未来时间戳会让证据永久新鲜）。
+_REVIVE_EVIDENCE_CLOCK_SKEW_SECONDS = 60
+
+
+def _has_fresh_probe_evidence(token: str) -> bool:
+    """库里是否存在「刚由认证探针写入的 healthy 判定」。
+
+    这是复活的第二把锁：调用方（号池探活）负责 dwell 与条件写，这里负责
+    「没有证据就不放行」——revive_token 是公开原语，裸调用本身不携带任何证据。
+    读不到（异常 / 没有记录 / 判定不新鲜 / 字段畸形）一律按无证据处理：
+    复活失败是可重试的，把一个被封的号放回流量不是。
+    """
+    try:
+        from utils import store
+        account = store.get_account(token) or {}
+    except Exception as e:
+        # 只记异常类型：异常原文可能带上游/凭据片段
+        logger.error(f"[antiban] revive evidence unreadable: {type(e).__name__}")
+        return False
+    if str(account.get("status") or "").strip().lower() != "healthy":
+        return False
+    checked_at = account.get("last_health_check")
+    if isinstance(checked_at, bool) or not isinstance(checked_at, (int, float)):
+        return False
+    if not math.isfinite(float(checked_at)):
+        return False
+    age = time.time() - float(checked_at)
+    return -_REVIVE_EVIDENCE_CLOCK_SKEW_SECONDS <= age <= _REVIVE_EVIDENCE_MAX_AGE_SECONDS
+
+
 def revive_token(token: str, reason: str = "probe_recovered") -> bool:
     """Remove the legacy dead marker after the canonical probe transition.
 
-    The caller owns the evidence gate.  Fleet health invokes this only after an
-    authenticated probe has stayed successful for the dwell window and the
-    guarded SQLite transition to ``healthy`` succeeded.
+    The caller owns the dwell gate; this function owns the evidence gate and
+    refuses to revive without a *fresh* healthy verdict persisted by an
+    authenticated probe.  A bare call carries no evidence, so it must not be
+    able to put a restricted account back into routing.
     """
     if not token or token not in globals.antiban_dead_tokens:
+        return False
+    if not _has_fresh_probe_evidence(token):
+        _count("revive.refused_no_evidence")
+        logger.warning(
+            f"[antiban] {anon_id(token)} revive refused: no fresh authenticated-probe verdict"
+        )
         return False
     del globals.antiban_dead_tokens[token]
     try:
@@ -367,15 +464,31 @@ def _cooldown_bucket_accounts(bucket_id: str, seconds: int, reason: str) -> None
 
 
 def classify_response_error(status_code: int, detail) -> str:
-    """把上游错误归一成枚举。detail 只读不留存。"""
+    """把上游错误归一成枚举。detail 只读不留存。
+
+    判定顺序（先硬证据后正文标记，避免正文里的词把状态码结论吃掉）：
+      1. 429 / rate-limit——状态码本身就是频控证据；
+      2. 401 + invalid_grant|unauthorized——凭据失效，走 refresh 恢复路径；
+      3. 正文标记（挑战族 / 账号停用 / 账号不可用）；
+      4. banned；5. 5xx；其余 unclassified（仍可计数，不猜类别）。
+
+    状态类规则排在标记之前：正文里恰好提到某个标记词，不足以覆盖「这是一个 429 /
+    一个 invalid_grant」这种更硬的证据。反之标记要求 403 而未满足时**跳过该标记
+    继续往下找**，不是就地放弃：否则 401 + "turnstile ... account unavailable"
+    会在 turnstile 处停住，永远看不到后面那个更明确的账号状态标记。
+    """
     detail_str = (str(detail) if detail is not None else "").lower()
-    if status_code == 403 and "cf_chl_opt" in detail_str:
-        return REASON_CF_CHALLENGE
     if status_code == 429 or "rate-limit" in detail_str:
         return REASON_RATE_LIMIT
     if status_code == 401 and ("invalid_grant" in detail_str or "unauthorized" in detail_str):
         return REASON_AUTH_INVALID
-    if "account_deactivated" in detail_str or "banned" in detail_str:
+    for marker, reason, requires_403 in _CLASSIFY_MARKERS:
+        if marker not in detail_str:
+            continue
+        if requires_403 and status_code != 403:
+            continue
+        return reason
+    if "banned" in detail_str:
         return REASON_ACCOUNT_DEAD
     if 500 <= status_code < 600:
         return REASON_UPSTREAM_5XX
@@ -395,6 +508,14 @@ def handle_response_error(token: str, bucket_id: Optional[str], status_code: int
         if bucket_id:
             _bucket.degrade_bucket(bucket_id, configs.circuit_403_cooldown)
             _cooldown_bucket_accounts(bucket_id, configs.circuit_403_cooldown, REASON_CF_CHALLENGE)
+            _count(f"{EVENT_BUCKET_DEGRADED}.{REASON_CF_CHALLENGE}")
+        return reason
+
+    # 挑战族（PoW/Turnstile/Arkose）与账号暂时不可用 → 账号退避。
+    # 这些是账号/会话级信号，不降级整桶：同一出口上的其它号未必被挑战。
+    if reason in _COOLDOWN_REASONS:
+        if token:
+            cooldown.extend_cooldown(token, configs.circuit_403_cooldown, reason=reason)
         return reason
 
     # 频控 → 账号指数退避
@@ -436,17 +557,25 @@ def handle_network_error(token: str, bucket_id: Optional[str], error_kind: str =
     与 handle_response_error 区分：那是 HTTP 状态码，这是 transport 失败。
     error_kind 是调用方的 `type(e).__name__`（任意文本），先归一到枚举再入
     指标与日志：未注册的值一律 other，既封住基数也封住文本泄漏面。
+
+    计数与降级分开：计数属于「发生了什么」，降级属于「拿哪条出口补偿」。
+    号还没绑桶时（严格绑定下会被准入层拒绝，但已绑桶的号也可能在分配失败时
+    落到这里）没有出口可降级，**但失败本身必须被计数**——否则「绑不上桶的号
+    在一个打不出去的出口上连续失败」在指标里完全不可见，正好是最该看见的一段。
     """
-    if not configs.enable_antiban or not bucket_id:
+    if not configs.enable_antiban:
         return
     kind = normalize_network_kind(error_kind)
     _count(f"{REASON_NETWORK}.{kind}")
+    if not bucket_id:
+        return
     count = _bucket_network_errors.get(bucket_id, 0) + 1
     _bucket_network_errors[bucket_id] = count
     if count >= _NETWORK_ERROR_THRESHOLD:
         _bucket.degrade_bucket(bucket_id, _NETWORK_ERROR_COOLDOWN)
         _cooldown_bucket_accounts(bucket_id, _NETWORK_ERROR_COOLDOWN, REASON_NETWORK)
         _bucket_network_errors[bucket_id] = 0
+        _count(f"{EVENT_BUCKET_DEGRADED}.{REASON_NETWORK}")
         logger.warning(
             f"[antiban] bucket degraded after {_NETWORK_ERROR_THRESHOLD}x network errors "
             f"reason={REASON_NETWORK} kind={kind}"
