@@ -12,6 +12,7 @@ from starlette.concurrency import run_in_threadpool
 
 import utils.globals as globals
 from utils import resp_cache
+from utils.antiban.guard import redact_proxy
 from app import app
 from chatgpt.authorization import verify_token
 from chatgpt.fp import extract_header_fp, get_fp
@@ -45,6 +46,45 @@ chatgpt_paths = ["c/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-
 
 def has_direct_access_token(token: str) -> bool:
     return len(token) == 45 or token.startswith("eyJhbGciOi")
+
+
+def _anon(value: str) -> str:
+    """不可逆账号摘要：日志里只出现它，绝不出现 token 本身。
+
+    token 前缀不算脱敏（可直接比对、跨请求关联账号），因此与
+    ``refreshToken._anon`` / ``antiban.anon_id`` 同构，只用 sha256 前 12 位。
+    """
+    return hashlib.sha256((value or "").encode()).hexdigest()[:12]
+
+
+def log_conversation_request_diagnostics(req_token, proxy_url, impersonate, user_agent):
+    """记录出站请求的诊断事实——只记匿名摘要，不记凭据。
+
+    ``req_token`` 是号池账号凭据（``resolve_seed_token`` → 账号 token），
+    ``proxy_url`` 常内嵌 ``user:pass``，两者本身就是完整凭据。日志同时进
+    ``utils/log_buffer``（管理后台「运行日志」面板，可下载、无脱敏），所以原值
+    与「前 8 位」这类伪脱敏前缀都不得入日志。排查需要的区分度由
+    匿名摘要 + 代理出口摘要提供，请求画像（UA / impersonate）原样保留。
+    """
+    logger.info(f"Request account: {_anon(req_token)}")
+    logger.info(f"Request proxy: {redact_proxy(proxy_url)}")
+    logger.info(f"Request UA: {user_agent}")
+    logger.info(f"Request impersonate: {impersonate}")
+
+
+def safe_exception_label(exc: Exception) -> str:
+    """异常的可记录标签。
+
+    第三方异常的 message 由库拼装，可能是**凭据原文**：代理串本身就是凭据，
+    curl 在代理配置错误时会把整条 URL 回显进 message（实测
+    ``Unsupported proxy syntax in 'http://user:pass@host:99999'``），因此只保留
+    类名。本地自造的 HTTPException 保留状态码与 detail —— 这条路径上只有本地
+    词表（见两处 ``raise HTTPException``），保留它们才能区分 sentinel / proof-of-work
+    失败。
+    """
+    if isinstance(exc, HTTPException):
+        return f"HTTPException status={exc.status_code} detail={exc.detail}"
+    return type(exc).__name__
 
 
 # 会话列表只返回前端真正消费的字段。存储条目里另有内部路由事实（`account` 就是号池
@@ -628,7 +668,7 @@ if no_sentinel:
                                                 json={"url": "https://chatgpt.com", "p": p, "dx": turnstile_dx, "ua": user_agent})
                         turnstile_token = res.json().get("t")
                 except Exception as e:
-                    logger.info(f"Turnstile ignored: {e}")
+                    logger.info(f"Turnstile ignored: {safe_exception_label(e)}")
 
             proofofwork = resp.get('proofofwork', {})
             proofofwork_required = proofofwork.get('required')
@@ -648,7 +688,7 @@ if no_sentinel:
                 "turnstile_token": turnstile_token
             }
         except Exception as e:
-            logger.error(f"Sentinel failed: {e}")
+            logger.error(f"Sentinel failed: {safe_exception_label(e)}")
 
         return {
             "arkose": {
@@ -726,7 +766,7 @@ if no_sentinel:
                                                     json={"url": "https://chatgpt.com", "p": p, "dx": turnstile_dx, "ua": user_agent})
                             turnstile_token = res.json().get("t")
                     except Exception as e:
-                        logger.info(f"Turnstile ignored: {e}")
+                        logger.info(f"Turnstile ignored: {safe_exception_label(e)}")
 
                 proofofwork = resp.get('proofofwork', {})
                 proofofwork_required = proofofwork.get('required')
@@ -751,7 +791,7 @@ if no_sentinel:
                     "openai-sentinel-turnstile-token": sentinel_tokens.get("turnstile_token", "")
                 })
         except Exception as e:
-            logger.error(f"Sentinel failed: {e}")
+            logger.error(f"Sentinel failed: {safe_exception_label(e)}")
             return Response(status_code=403, content="Sentinel failed")
 
         params = dict(request.query_params)
@@ -782,10 +822,7 @@ if no_sentinel:
         r = await client.post_stream(f"{host_url}{request.url.path}", params=params, headers=headers,
                                      cookies=request_cookies, data=data, stream=True, allow_redirects=False)
         rheaders = r.headers
-        logger.info(f"Request token: {req_token}")
-        logger.info(f"Request proxy: {proxy_url}")
-        logger.info(f"Request UA: {user_agent}")
-        logger.info(f"Request impersonate: {impersonate}")
+        log_conversation_request_diagnostics(req_token, proxy_url, impersonate, user_agent)
         if x_sign:
             rheaders.update({"x-sign": x_sign})
         if 'stream' in rheaders.get("content-type", ""):

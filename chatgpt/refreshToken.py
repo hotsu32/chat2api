@@ -28,6 +28,37 @@ def _anon(value: str) -> str:
     return hashlib.sha256((value or "").encode()).hexdigest()[:12]
 
 
+# 上游 403 的「拒签」标记。命中后会进 error_token_list（不再重试这个号），
+# 因此这一判定必须保留；但判定结果是**枚举**，日志里只出现枚举本身。
+_REJECTION_MARKERS = ("invalid_grant", "access_denied", "refresh_token_expired")
+
+
+class RefreshFailure(Exception):
+    """刷新失败的有界异常：message 只由固定词表 + 状态码拼成。
+
+    上游响应原文会经由三个出口外泄——日志、``refresh_map["last_error"]``
+    （落盘）与 ``HTTPException.detail``（回给调用方）。所以失败原因必须是
+    枚举分类，不能是 body 片段。
+    """
+
+
+def _refresh_failure(code: str, status: int, content_type: str = "") -> RefreshFailure:
+    return RefreshFailure(
+        f"{code} status={status or 'n/a'} ctype={content_type or 'n/a'}"
+    )
+
+
+def _safe_failure_reason(exc: Exception) -> str:
+    """失败原因的可持久化形态：自造的有界 message，或第三方异常的类名。
+
+    ``str(exc)`` 对其他异常不安全——传输层异常（代理错误等）会把内嵌
+    ``user:pass`` 的代理 URL 带进 message。类名是有界枚举，足够归因。
+    """
+    if isinstance(exc, RefreshFailure):
+        return str(exc)[:200]
+    return type(exc).__name__
+
+
 def persist_refresh_map():
     globals.persist_refresh_map()
 
@@ -81,7 +112,7 @@ def _extract_rotated_cookie(response, original_cookie):
                     if suffix.isdigit():
                         chunks[int(suffix)] = value
     except Exception as e:
-        logger.warning(f"[rotated_cookie] parse cookies failed: {e!r}")
+        logger.warning(f"[rotated_cookie] parse cookies failed kind={type(e).__name__}")
         return None
 
     if not chunks:
@@ -409,15 +440,15 @@ async def chat_refresh(refresh_token):
     refresh_meta["last_proxy"] = proxy_url or ""
     globals.refresh_map[refresh_token] = refresh_meta
     client = Client(proxy=proxy_url, impersonate=None)
-    token_prefix = refresh_token[:8]
     try:
         r = await client.post(openai_auth_token_url, data=form_body, headers=headers, timeout=15)
         raw_text = (r.text or "").strip()
         content_type = r.headers.get("content-type", "")
 
-        # 诊断日志：每次刷新都记录上游返回的关键元数据
+        # 诊断日志：每次刷新都记录上游返回的关键元数据。账号以不可逆摘要标识
+        # （前缀可跨请求关联账号，不算脱敏）；body 只记录长度，不记录内容。
         logger.info(
-            f"[chat_refresh] token={token_prefix}... status={r.status_code} "
+            f"[chat_refresh] account={_anon(refresh_token)} status={r.status_code} "
             f"ctype={content_type} body_len={len(raw_text)} proxy={'yes' if proxy_url else 'no'} "
             f"endpoint={openai_auth_token_url}"
         )
@@ -425,46 +456,37 @@ async def chat_refresh(refresh_token):
         # 200 路径：仍需防御解析
         if r.status_code == 200:
             if not raw_text:
-                raise Exception("OpenAI returned empty body with status 200")
+                raise _refresh_failure("empty_body", 200, content_type)
             try:
                 payload = json.loads(raw_text)
             except json.JSONDecodeError:
-                raise Exception(
-                    f"OpenAI non-JSON response (status 200, ctype={content_type}): "
-                    f"{raw_text[:200]}"
-                )
+                raise _refresh_failure("non_json", 200, content_type)
             if "access_token" not in payload:
-                raise Exception(
-                    f"OpenAI JSON missing access_token: keys={list(payload.keys())} "
-                    f"body={raw_text[:200]}"
-                )
+                raise _refresh_failure("missing_access_token", 200, content_type)
             return payload["access_token"]
 
-        # 非 200 路径：详细分流并记录
-        error_body_hint = raw_text[:300] if raw_text else "(empty body)"
-        if "invalid_grant" in raw_text or "access_denied" in raw_text or "refresh_token_expired" in raw_text:
+        # 非 200 路径：分类失败原因（枚举），不复制上游 body。
+        rejection = next((marker for marker in _REJECTION_MARKERS if marker in raw_text), None)
+        if rejection:
             if refresh_token not in globals.error_token_list:
                 globals.error_token_list.append(refresh_token)
                 persist_error_tokens()
-            raise Exception(
-                f"OpenAI rejected refresh_token (status {r.status_code}): {error_body_hint}"
-            )
-        raise Exception(
-            f"OpenAI refresh failed (status {r.status_code}, ctype={content_type}): {error_body_hint}"
-        )
+            raise _refresh_failure(f"refresh_rejected reason={rejection}", r.status_code, content_type)
+        raise _refresh_failure("upstream_status", r.status_code, content_type)
     except Exception as e:
         now = int(time.time())
+        reason = _safe_failure_reason(e)
         refresh_meta = globals.refresh_map.get(refresh_token, {})
         refresh_meta.update({
-            "last_error": str(e)[:300],
+            "last_error": reason,
             "last_error_at": now,
             "fail_count": int(refresh_meta.get("fail_count", 0)) + 1,
             "last_proxy": proxy_url or "",
         })
         globals.refresh_map[refresh_token] = refresh_meta
         persist_refresh_map()
-        logger.error(f"[chat_refresh] token={token_prefix}... failed: {str(e)[:400]}")
-        raise HTTPException(status_code=500, detail=str(e)[:300])
+        logger.error(f"[chat_refresh] account={_anon(refresh_token)} failed={reason}")
+        raise HTTPException(status_code=500, detail="Account refresh unavailable") from None
     finally:
         await client.close()
         del client
