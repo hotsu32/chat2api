@@ -198,6 +198,51 @@ def trial_tier(email: str, strict: bool = False) -> str:
     return TRIAL_TIER
 
 
+def trial_blocked_reason(email: str, strict: bool = False) -> str:
+    """该账号现在**为什么**用不了试用；``""`` 表示可以正常准入。
+
+    返回值是固定匿名代码，可以直接进日志与页面，不含邮箱 / seed / 账号：
+
+      - ``""``                     可以准入（有余额、账号有效、没有付费历史）；
+      - ``"paid_active"``          当前有有效付费订单 —— ``reserve`` 返回 ``None``
+        （不走试用账），**不是**拒绝，页面不该把它渲染成错误；
+      - ``"subscription_expired"`` 曾付费且已到期，不回落试用；
+      - ``"account_not_active"``   未验证 / 封禁 / 冻结 / 无 user_auth 行；
+      - ``"not_granted"``          没有与当前 seed 匹配的 plus 赠额行；
+      - ``"exhausted"``            赠额已结算用完。
+
+    存在的理由：模板的兜底分支把「买过但到期」和「账号被封」渲染成同一句话，
+    到期用户的账号明明是 active 的，却被告知「账号状态不支持使用试用额度」，
+    于是去找客服解封一个根本没被封的账号。本函数把原因拆开，文案才有得选。
+
+    判据与 :func:`reserve` **同源**：``reserve`` 返回 ``None`` 的账号这里是
+    ``paid_active``，抛 ``TrialDenied`` 的账号这里是同一个 ``reason``。测试
+    ``test_blocked_reason_agrees_with_what_reserve_actually_decides`` 钉住这条对应关系，
+    否则控制台会对着用户说一个与实际准入不一致的理由。
+
+    本函数**只用于展示**，不放行任何请求。``strict=True`` 时数据层故障抛
+    :class:`utils.store.StoreError` —— 不能用「查不到」冒充「账号不可用」。
+    """
+    from utils import store as _store
+
+    if not email:
+        return "account_not_active"
+    row = _user_row(email=email, strict=strict)
+    if not row or (row.get("status") or "") not in _CONSUMABLE_STATUS:
+        return "account_not_active"
+    if _has_ever_purchased(email, strict=strict):
+        from utils import entitlements as _ent
+        if _ent.active_orders(email):
+            return "paid_active"
+        return "subscription_expired"
+    grant = _store.get_trial_grant(email, strict=strict)
+    if (not grant or grant['seed'] != row.get('seed') or grant['tier'] != TRIAL_TIER):
+        return "not_granted"
+    if grant['total'] - grant['used'] <= 0:
+        return "exhausted"
+    return ""
+
+
 def reserve(seed: str) -> Optional[str]:
     """请求准入：占住一次试用额度，返回预留 id；三种结局彼此可分。
 

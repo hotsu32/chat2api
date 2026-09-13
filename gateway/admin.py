@@ -23,7 +23,9 @@ from utils.routing import (
 )
 import utils.globals as globals
 import utils.audit as audit
+import utils.entitlements as entitlements
 import utils.store as store
+import utils.trials as trials
 from chatgpt.refreshToken import rt2ac
 
 ADMIN_COOKIE_NAME = "admin_auth"
@@ -1209,20 +1211,138 @@ def _mask_email(email: str) -> str:
     return f"{local[:2]}***@{domain}"
 
 
-async def routing_admin_users(request: Request):
-    """已注册用户列表（脱敏邮箱 + 状态 + 档次），供封禁操作定位对象。
+# 扫描的审计条数上限：分配失败是低频事件，500 条足够覆盖运营台一屏用户。
+# 读一次、按 subject 建索引，避免每个用户各扫一遍审计库。
+_FAILURE_AUDIT_SCAN = 500
 
-    只回可操作的运营字段：**不含**密码哈希、seed、会话 token。
+# 分配失败 → 最近一次原因。与 ``gateway.saas._ALLOCATION_MESSAGES`` 是同一套匿名
+# 代码，但这里保留**代码**而不是翻译成文案：运营者要对日志和告警，不是给用户看。
+_ALLOCATION_FAILURE_ACTION = "payment.awaiting_allocation"
+
+
+def _recent_allocation_failures(limit: int = _FAILURE_AUDIT_SCAN) -> dict:
+    """``{subject: {"reason", "at"}}`` —— 每个用户最近一次账号分配失败。
+
+    分配失败**不落库**（见 ``gateway.saas._fulfil_order``：不为它新增列），但每次
+    失败都会写一条 ``payment.awaiting_allocation`` 审计。运营者问「这个人付了钱
+    为什么还不能用」，那条记录就是唯一且权威的答案 —— 所以这里读审计，而不是
+    再造一份状态。新在前，第一次出现即为最近一次。
+    """
+    failures = {}
+    for event in audit.recent(limit):
+        if event.get("action") != _ALLOCATION_FAILURE_ACTION:
+            continue
+        subject = event.get("subject") or ""
+        if subject and subject not in failures:
+            failures[subject] = {
+                "reason": (event.get("detail") or {}).get("reason") or "",
+                "at": event.get("at"),
+            }
+    return failures
+
+
+def _operator_lifecycle(email: str, seed: str) -> dict:
+    """运营者视图里的生命周期事实：试用 / 到期 / 冻结 / 续费。
+
+    全部从既有真相源现算（``trial_grants`` / ``orders`` / ``users``），不新增列、
+    不缓存、不新增第二份状态：运营台看到的状态与用户实际享受的权益必须是同一套
+    判据推导出来的，否则它迟早会与准入裁决漂移。
+
+    读取一律 ``strict=True``：查不到和「没有」在这里是两件事，把数据库故障显示成
+    「无试用 / 未付费」会让运营者据此做出错误的处置。失败时 ``lifecycle_ok=False``，
+    其余字段留空 —— 页面上就是「未知」，而不是「零」。
+
+    刻意**不**返回任何凭据：seed、号池账号 token、密码哈希一个都不进这个结构。
+    """
+    now = int(time.time())
+    trial = trials.trial_state(email, strict=True)
+    block_reason = trials.trial_blocked_reason(email, strict=True)
+
+    orders = store.list_orders(email=email, strict=True)
+    paid = [o for o in orders if (o.get("status") or "") == "paid"]
+    active = entitlements.active_orders(email, now)
+    expiries = [int(o.get("expires_at") or 0) for o in paid if o.get("expires_at")]
+    last_expires = max(expiries) if expiries else None
+    current = active[0] if active else None
+
+    row = store.get_user(seed) if seed else None
+    return {
+        "lifecycle_ok": True,
+        "trial": {
+            "granted": trial["granted"],
+            "tier": trial["tier"],
+            "total": trial["total"],
+            "used": trial["used"],
+            "reserved": trial["reserved"],
+            "remaining": trial["remaining"],
+            "exhausted": bool(trial["granted"] and trial["admission_balance"] <= 0),
+            # 不能用试用的真实原因（"" = 可以用；"paid_active" = 当前付费，不算异常）
+            "block_reason": block_reason,
+        },
+        "subscription": {
+            "active": bool(current),
+            "tier": (current or {}).get("_tier") or "",
+            "expires_at": (current or {}).get("_expires") or last_expires,
+            "expires_on": _fmt_ts((current or {}).get("_expires") or last_expires),
+            "days_left": max(0, ((current or {}).get("_expires", 0) - now + 86399) // 86400)
+            if current else 0,
+        },
+        "seed": {
+            "status": (row or {}).get("status") or "",
+            "plan_type": (row or {}).get("plan_type") or "",
+            # frozen 是 Seed 绑定的到期状态，与 user_auth.status 是两件事：
+            # 冻结的是绑定，不是账号 —— 用户仍然必须能登录并续费。
+            "frozen": ((row or {}).get("status") or "") == "frozen",
+            "bound": bool((row or {}).get("current_account")),
+        },
+        "renewal": {
+            "paid_orders": len(paid),
+            "last_expires_at": last_expires,
+            "last_expires_on": _fmt_ts(last_expires),
+            # 到期且当前无有效订单 = 需要续费（这是「到期冻结」的运营侧信号）
+            "renewal_due": bool(paid) and not active,
+        },
+    }
+
+
+def _fmt_ts(ts) -> str:
+    """时间戳 → ``YYYY-MM-DD``；空值返回空串（不返回 "None" 或 1970）。"""
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        return ""
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+async def routing_admin_users(request: Request):
+    """已注册用户列表（脱敏邮箱 + 状态 + 档次 + 生命周期），供封禁与排障定位对象。
+
+    只回可操作的运营字段：**不含**密码哈希、seed、号池账号 token、会话 token。
+    生命周期部分见 :func:`_operator_lifecycle`。
     """
     require_admin_auth(request)
+    failures = _recent_allocation_failures()
     rows = []
     for row in store.list_user_auth():
-        rows.append({
-            "email": _mask_email(row.get("email") or ""),
-            "subject": audit.subject_id(row.get("email") or ""),
+        email = row.get("email") or ""
+        subject = audit.subject_id(email)
+        entry = {
+            "email": _mask_email(email),
+            "subject": subject,
             "status": row.get("status") or "active",
             "tier_id": row.get("tier_id") or "",
-        })
+            # 分配失败原因取自审计（见 _recent_allocation_failures），与生命周期
+            # 的存储读分开：审计库不可用时不该把整张用户表一起打成未知。
+            "failure": failures.get(subject) or {"reason": "", "at": None},
+        }
+        try:
+            entry.update(_operator_lifecycle(email, row.get("seed") or ""))
+        except store.StoreError:
+            # 单个用户的账面读不出来时，如实标为未知，而不是回一份零值让他
+            # 看起来「没买过、没试用」。列表的其余部分照常给出。
+            logger.error("[admin] user lifecycle unavailable")
+            entry["lifecycle_ok"] = False
+        rows.append(entry)
     return JSONResponse({"status": "success", "users": rows})
 
 

@@ -121,12 +121,15 @@
             const harvAuthStartApi = `${basePath}/admin/harvester/authorize/start`;
             const harvAuthExchangeApi = `${basePath}/admin/harvester/authorize/exchange`;
             const harvImportCookieApi = `${basePath}/admin/harvester/import-cookie`;
+            const saasUsersApi = `${basePath}/admin/users`;
 
             const summaryGrid = document.getElementById('summaryGrid');
             const ipGrid = document.getElementById('ipGrid');
             const accountsTable = document.getElementById('accountsTable');
             const usersTable = document.getElementById('usersTable');
             const usersCount = document.getElementById('usersCount');
+            const saasUsersTable = document.getElementById('saasUsersTable');
+            const saasUsersCount = document.getElementById('saasUsersCount');
             const usageChartCanvas = document.getElementById('usageChart');
             const rulesTable = document.getElementById('rulesTable');
             const alertsList = document.getElementById('alertsList');
@@ -572,9 +575,93 @@
                 `).join('');
             }
 
+            // 试用不可用的原因代码 -> 运营者看得懂的一句话（码值与
+            // utils/trials.trial_blocked_reason 一一对应，不回显任何账号信息）。
+            const SAAS_BLOCK_REASONS = {
+                '': '可用',
+                'paid_active': '付费中，不消耗试用',
+                'subscription_expired': '套餐已到期',
+                'account_not_active': '账号非活跃',
+                'not_granted': '无赠额',
+                'exhausted': '已用完',
+            };
+
+            function saasTrialCell(u) {
+                if (u.lifecycle_ok === false) return '<span class="text-slate-400">未知</span>';
+                const t = u.trial || {};
+                if (!t.granted) return '<span class="text-slate-400">无赠额</span>';
+                const reason = SAAS_BLOCK_REASONS[t.block_reason] || t.block_reason || '可用';
+                const tone = t.block_reason ? 'text-slate-500' : 'text-emerald-600';
+                return `<span class="font-semibold ${tone}">${Number(t.used || 0)}/${Number(t.total || 0)}</span>`
+                    + `<div class="text-xs text-slate-500">${escapeHtml(reason)}</div>`;
+            }
+
+            function saasSubscriptionCell(u) {
+                if (u.lifecycle_ok === false) return '<span class="text-slate-400">未知</span>';
+                const s = u.subscription || {};
+                const r = u.renewal || {};
+                if (!s.active) {
+                    const label = r.renewal_due ? '待续费' : '未订阅';
+                    const last = r.last_expires_on ? `上次至 ${escapeHtml(r.last_expires_on)}` : '';
+                    return `<span class="text-slate-500">${label}</span><div class="text-xs text-slate-400">${last}</div>`;
+                }
+                return `<span class="font-semibold text-emerald-600">${escapeHtml(s.tier || '-')}</span>`
+                    + `<div class="text-xs text-slate-500">至 ${escapeHtml(s.expires_on || '-')} · 剩 ${Number(s.days_left || 0)} 天</div>`;
+            }
+
+            function saasSeedCell(u) {
+                if (u.lifecycle_ok === false) return '<span class="text-slate-400">未知</span>';
+                const s = u.seed || {};
+                // frozen 是 Seed 绑定的到期状态，不是账号封禁：用户仍可登录并续费。
+                if (s.frozen) {
+                    return '<span class="font-semibold text-orange-600">已冻结</span>'
+                        + '<div class="text-xs text-slate-500">续费后恢复</div>';
+                }
+                return `<span class="text-slate-700">${escapeHtml(s.status || '-')}</span>`
+                    + `<div class="text-xs text-slate-500">${escapeHtml(s.plan_type || '-')} · ${s.bound ? '已绑定' : '未绑定'}</div>`;
+            }
+
+            function renderSaasUsers(users) {
+                if (saasUsersCount) saasUsersCount.textContent = `${users.length} 个账号`;
+                if (!saasUsersTable) return;
+                if (!users.length) {
+                    saasUsersTable.innerHTML = `<tr><td colspan="6" class="py-14 text-center text-slate-400">暂无注册用户。</td></tr>`;
+                    return;
+                }
+                saasUsersTable.innerHTML = users.map((u) => {
+                    const f = u.failure || {};
+                    const failure = f.reason
+                        ? `<span class="font-mono text-xs text-red-600">${escapeHtml(f.reason)}</span>`
+                        : '<span class="text-slate-400">-</span>';
+                    return `
+                    <tr class="border-b border-slate-100 hover:bg-slate-50">
+                        <td class="py-3 pl-4 pr-3 font-mono text-xs text-slate-500">${escapeHtml(u.email || '-')}</td>
+                        <td class="px-3 py-3">${escapeHtml(u.status || '-')}</td>
+                        <td class="px-3 py-3">${saasTrialCell(u)}</td>
+                        <td class="px-3 py-3">${saasSubscriptionCell(u)}</td>
+                        <td class="px-3 py-3">${saasSeedCell(u)}</td>
+                        <td class="py-3 pl-3 pr-4">${failure}</td>
+                    </tr>`;
+                }).join('');
+            }
+
+            async function loadSaasUsers() {
+                // 单独取数：它失败时只让这块显示「加载失败」，不拖垮主面板。
+                try {
+                    const resp = await fetch(saasUsersApi);
+                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                    const data = await resp.json();
+                    renderSaasUsers(data.users || []);
+                } catch (e) {
+                    if (saasUsersTable) {
+                        saasUsersTable.innerHTML = `<tr><td colspan="6" class="py-14 text-center text-slate-400">SaaS 账号状态加载失败：${escapeHtml(e.message)}</td></tr>`;
+                    }
+                    if (saasUsersCount) saasUsersCount.textContent = '--';
+                }
+            }
+
             let usageChart = null;
-            function renderUsageChart(users) {
-                if (!usageChartCanvas || typeof Chart === 'undefined') return;
+            function renderUsageChart(users) {                if (!usageChartCanvas || typeof Chart === 'undefined') return;
                 const labels = users.map((u) => u.seed_masked || '-');
                 const data = users.map((u) => Number(u.usage_count || 0));
                 if (usageChart) {
@@ -1751,6 +1838,7 @@
             loadDashboard().catch((error) => {
                 statusText.textContent = `加载失败: ${error.message}`;
             });
+            loadSaasUsers();
         });
     </script>
 </head>
@@ -1898,6 +1986,33 @@
                                 </tr>
                             </thead>
                             <tbody id="usersTable"></tbody>
+                        </table>
+                    </div>
+
+                    <!-- SaaS 账号生命周期：订阅 / 试用 / 冻结 / 续费 / 分配失败原因。
+                         数据来自 GET /admin/users（已登录用户，不是号池 Seed 绑定）。 -->
+                    <div class="mb-4 mt-8 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                        <div>
+                            <p class="text-sm font-semibold text-blue-600">SaaS Accounts</p>
+                            <h2 class="mt-1 text-2xl font-black tracking-tight text-slate-950">SaaS 账号状态</h2>
+                            <p class="mt-1 text-sm text-slate-500">注册用户的试用余额、套餐到期、Seed 冻结与续费状态，以及付款后的账号分配失败原因。</p>
+                        </div>
+                        <span class="text-sm text-slate-500"><span id="saasUsersCount" class="font-semibold text-slate-700">--</span></span>
+                    </div>
+
+                    <div class="glass-panel overflow-hidden rounded-3xl">
+                        <table class="admin-table w-full min-w-[880px] text-sm">
+                            <thead class="bg-slate-50/80">
+                                <tr class="text-left">
+                                    <th class="py-3 pl-4 pr-3">用户</th>
+                                    <th class="px-3 py-3">账号状态</th>
+                                    <th class="px-3 py-3">试用</th>
+                                    <th class="px-3 py-3">套餐到期</th>
+                                    <th class="px-3 py-3">Seed</th>
+                                    <th class="py-3 pl-3 pr-4">失败原因</th>
+                                </tr>
+                            </thead>
+                            <tbody id="saasUsersTable"></tbody>
                         </table>
                     </div>
                 </section>

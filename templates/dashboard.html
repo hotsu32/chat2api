@@ -93,6 +93,16 @@
       <a class="plan-cta" href="/?token={{ seed }}">开始试用 <span class="arr">→</span></a>
     </div>
 
+    {% elif trial_block_reason == "subscription_expired" %}
+    {# 买过但已到期：原因是「到期」而不是「账号状态」，恢复动作是页面上方的续费 #}
+    <div class="trial-card trial-inactive">
+      <div class="trial-label">Plus 免费试用</div>
+      <p class="trial-status-msg">套餐已到期，注册赠额不用于续费。续费后即刻恢复使用。</p>
+      <div class="trial-cta-row">
+        <a class="plan-cta" href="/store?plan=plus-solo-1m">续费 Plus <span class="arr">→</span></a>
+      </div>
+    </div>
+
     {% elif not trial_capacity_configured %}
     {# 部署侧未配置共享容量：fail-closed，如实说「容量未开放」而不是甩锅给账号状态 #}
     <div class="trial-card trial-inactive">
@@ -104,7 +114,7 @@
     </div>
 
     {% else %}
-    {# 有试用记录但不满足准入条件（账号未验证/已到期/已付费路径兜底）#}
+    {# 有试用记录但不满足准入条件（账号未验证 / 封禁 / 冻结）#}
     <div class="trial-card trial-inactive">
       <div class="trial-label">Plus 免费试用</div>
       <p class="trial-status-msg">当前账号状态不支持使用试用额度。</p>

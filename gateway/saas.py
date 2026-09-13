@@ -390,6 +390,13 @@ def _fulfil_order(order_id: str) -> dict:
     outcome["reason"] = reason
     if not ok:
         logger.error("[saas] paid order awaiting account allocation")
+        # 失败原因不落库（不为它新增列），但**必须可检索**：运营台要能回答
+        # 「这个人付了钱为什么还不能用」。记在这里而不是回调处理里 ——
+        # 两条结算路径（mock 直结 / 渠道回调）都会走到这一步，只记回调路径
+        # 会让本地联调与任何非回调结算的失败在运营台上完全不可见。
+        audit.record("payment.awaiting_allocation", ok=False,
+                     subject=audit.subject_id(order.get("email") or ""),
+                     detail={"order_id": order_id, "reason": reason})
     return outcome
 
 
@@ -501,6 +508,12 @@ async def dashboard_page(request: Request, fulfil: str = ""):
             "trial_remaining": ts["remaining"],
             "trial_admission_balance": ts["admission_balance"],
             "trial_capacity_configured": capacity > 0,
+            # 入口不可用时的**真实原因**（匿名代码，见 trials.trial_blocked_reason）。
+            # 模板原来只有一个兜底分支，把「买过但到期」和「未验证/被封禁」渲染成
+            # 同一句「当前账号状态不支持使用试用额度」—— 到期用户的账号是 active 的，
+            # 这句话会把他推去找客服解封一个根本没被封的账号。判据与 reserve 同源，
+            # 所以页面说得出的原因，就是准入裁决会给出的那一个。
+            "trial_block_reason": trials.trial_blocked_reason(email, strict=True),
             # entry_enabled: 有试用权益且至少有一次未被在途占住的额度
             "trial_entry_enabled": (
                 eff == "plus"
@@ -754,9 +767,7 @@ async def api_payment_callback(request: Request):
             "currency": payment.expected_currency(), "tier_id": order.get("tier_id"),
             "source": "provider_callback",
         })
-    if not outcome["allocated"]:
-        audit.record("payment.awaiting_allocation", ok=False, subject=subject,
-                     detail={"order_id": order_id, "reason": outcome["reason"]})
+    # 分配失败的审计由 _fulfil_order 记（两条结算路径共用一处），此处不重复记。
     return {"ok": True, "fulfilled": outcome["allocated"]}
 
 

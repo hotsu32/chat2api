@@ -351,6 +351,98 @@ def test_reserve_with_unknown_seed_returns_none(db):
     assert trials.reserve("") is None
 
 
+# ------------------------------------- 试用入口不可用的原因（页面文案的唯一真相源）
+
+def test_blocked_reason_is_empty_when_the_trial_is_usable(db):
+    _register_like(db)
+    assert trials.trial_blocked_reason(TRIAL_EMAIL) == ""
+
+
+def test_blocked_reason_reports_exhaustion_after_the_third_settlement(db):
+    email, seed = _register_like(db)
+    for _ in range(3):
+        assert trials.settle(trials.reserve(seed), seed) is True
+    assert trials.trial_blocked_reason(email) == "exhausted"
+
+
+@pytest.mark.parametrize("status", ["unverified", "banned", "frozen"])
+def test_blocked_reason_names_an_inactive_account_not_an_expired_one(db, status):
+    _register_like(db, email=f"reason-{status}@example.com",
+                   seed=f"seed-reason-{status}", status=status)
+    assert trials.trial_blocked_reason(f"reason-{status}@example.com") == "account_not_active"
+
+
+def test_blocked_reason_separates_expired_subscription_from_inactive_account(db):
+    """「买过但到期」与「账号被封」必须给出不同的原因。
+
+    模板只有一个兜底分支时，两者会渲染成同一句「当前账号状态不支持使用试用额度」——
+    到期用户的账号明明是 active 的，他会去找客服解封一个根本没被封的账号。
+    """
+    email, _seed = _register_like(db)
+    _paid_order(db, email, expires_at=1)  # 早已过期
+    assert trials.trial_blocked_reason(email) == "subscription_expired"
+
+
+def test_blocked_reason_reports_an_active_subscription_as_paid_not_blocked(db):
+    email, _seed = _register_like(db)
+    _paid_order(db, email, expires_at=2_000_000_000)
+    assert trials.trial_blocked_reason(email) == "paid_active"
+
+
+def test_blocked_reason_without_a_grant_row_is_not_granted(db):
+    db.upsert_user_auth("reason-bare@example.com", password_hash="x",
+                        seed="seed-reason-bare", status="active")
+    assert trials.trial_blocked_reason("reason-bare@example.com") == "not_granted"
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("fresh", ""),
+    ("exhausted", "exhausted"),
+    ("expired", "subscription_expired"),
+    ("inactive", "account_not_active"),
+    ("paid", "paid_active"),
+])
+def test_blocked_reason_agrees_with_what_reserve_actually_decides(db, scenario, expected):
+    """页面给出的原因必须与真正的准入裁决同源，否则控制台会对着用户撒谎。
+
+    映射是硬契约：``reserve`` 返回 ``None``（付费免扣）的账号，原因是
+    ``paid_active``；``reserve`` 抛 ``TrialDenied`` 的账号，原因就是同一个 ``reason``；
+    能正常准入的账号原因为空串。
+    """
+    email, seed = _register_like(db)
+    if scenario == "exhausted":
+        for _ in range(3):
+            assert trials.settle(trials.reserve(seed), seed) is True
+    elif scenario == "expired":
+        _paid_order(db, email, expires_at=1)  # 早已过期
+    elif scenario == "inactive":
+        db.upsert_user_auth(email, status="banned")
+    elif scenario == "paid":
+        _paid_order(db, email, expires_at=2_000_000_000)
+
+    assert trials.trial_blocked_reason(email) == expected
+    if expected == "paid_active":
+        assert trials.reserve(seed) is None
+    elif expected == "":
+        assert trials.reserve(seed), "原因为空串就必须真的能拿到预留"
+    else:
+        # 用 ``trials.TrialDenied`` 而不是模块级导入的名字：本文件里
+        # ``test_grant_survives_module_reload`` 会 reload 该模块，reload 之后
+        # 模块级导入的类对象与被抛出的不再是同一个（属性查找才是当下那个）。
+        with pytest.raises(trials.TrialDenied) as exc:
+            trials.reserve(seed)
+        assert exc.value.reason == expected, \
+            f"页面原因 {expected!r} 与实际拒绝 {exc.value.reason!r} 不一致"
+
+
+def test_blocked_reason_strict_propagates_store_error(db, monkeypatch):
+    """展示层读不到账时必须报错，不能把「查不到」说成「账号不可用」。"""
+    _register_like(db)
+    _break_db(monkeypatch)
+    with pytest.raises(StoreError):
+        trials.trial_blocked_reason(TRIAL_EMAIL, strict=True)
+
+
 # ------------------------------------------------ 数据层故障不得伪装成放行
 
 def test_reserve_raises_store_error_when_db_is_down(db, monkeypatch):

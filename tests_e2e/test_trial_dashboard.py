@@ -172,6 +172,42 @@ def test_expired_paid_with_reservations_does_not_offer_waiting_for_trial(client)
         trials.release(rid, seed)
 
 
+def test_expired_paid_with_unused_trial_blames_the_subscription_not_the_account(client):
+    """付费到期 + 试用未用：必须说「套餐已到期」，不能赖到账号状态上。
+
+    试用区块只有一个兜底分支时，「买过但到期」和「未验证 / 被封禁」会渲染成同一句
+    「当前账号状态不支持使用试用额度」—— 到期用户的 user_auth.status 明明是 active，
+    他会去找客服解封一个根本没被封的账号，而真正的恢复动作是页面上方的续费。
+    """
+    _register(client, "trial-expired-msg@example.com")
+    _make_paid("trial-expired-msg@example.com", "plus-solo-1m", days_left=-1)
+
+    body = client.get("/dashboard").text
+    # 试用区块必须给出「到期」这个真实原因（而不是账号状态）
+    assert "注册赠额不用于续费" in body, "试用区块没有说明到期才是原因"
+    assert "当前账号状态不支持使用试用额度" not in body
+    # 恢复路径仍在页面上：续费入口
+    assert "续费" in body
+
+
+def test_unverified_account_keeps_the_account_state_reason(client):
+    """未验证账号的原因**不能**被上一条改动带偏：它确实是账号状态问题。"""
+    email = "trial-unverified-msg@example.com"
+    store.create_user_with_trial(
+        email, password_hash="pbkdf2_sha256$1$00$00", seed="seed-unverified-msg",
+        status="unverified", trial_tier=trials.TRIAL_TIER,
+        trial_total=trials.SIGNUP_TRIAL_COUNT,
+    )
+    globals.seed_map["seed-unverified-msg"] = {"token": "", "plan_type": None,
+                                               "conversations": []}
+    from gateway.user import _issue_session
+    client.cookies.set(configs.user_session_cookie, _issue_session(email, pw_version=1))
+
+    body = client.get("/dashboard").text
+    assert "当前账号状态不支持使用试用额度" in body
+    assert "注册赠额不用于续费" not in body
+
+
 @pytest.mark.parametrize("status,slug", [
     ("unverified", "unverified"),
     # email suffix must NOT contain "banned" — the nav renders the email address

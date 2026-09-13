@@ -22,6 +22,7 @@ import utils.audit as audit
 import utils.configs as configs
 import utils.payment as payment
 import utils.store as store
+import utils.trials as trials
 
 
 # --------------------------------------------------------------------- helpers
@@ -368,6 +369,163 @@ def test_unknown_user_and_unknown_status_are_rejected(client, admin_headers):
     assert client.post("/admin/users/status", headers=admin_headers,
                        json={"email": "gate-badstatus@example.com",
                              "status": "deleted"}).status_code == 400
+
+
+# ------------------------------------------------- operator lifecycle visibility
+
+def _operator_user(client, admin_headers, email):
+    """运营视图里该用户的记录。
+
+    按 ``subject`` 定位而不是按邮箱：运营接口只回脱敏邮箱，而 subject 是与审计
+    记录同一套的匿名 id，这样才能把「这个人」和「他的失败记录」对上。
+    """
+    body = client.get("/admin/users", headers=admin_headers).json()
+    assert body["status"] == "success"
+    entry = next((u for u in body["users"]
+                  if u["subject"] == audit.subject_id(email)), None)
+    assert entry is not None, f"运营视图里找不到 {email} 的记录"
+    return entry
+
+
+def _expire_order(order_id, seconds_ago=60):
+    """时间旅行：把已支付订单的到期时间挪到过去（到期靠算不靠扫表）。"""
+    with store._connect() as conn:
+        conn.execute("UPDATE orders SET expires_at=? WHERE order_id=?",
+                     (int(time.time()) - seconds_ago, order_id))
+
+
+def _checkout(client, plan_id):
+    """走 mock 渠道下单：auto_settle 立刻结算并尝试分配（无真实扣款）。"""
+    client.get(f"/checkout?plan={plan_id}")
+    csrf = client.cookies.get(configs.user_csrf_cookie) or ""
+    return client.post("/api/checkout",
+                       data={"plan": plan_id, "csrf_token": csrf},
+                       follow_redirects=False)
+
+
+def _exhaust_trial(seed, email):
+    for _ in range(trials.trial_state(email)["remaining"]):
+        assert trials.settle(trials.reserve(seed), seed) is True
+
+
+def test_operator_user_view_exposes_trial_expiry_frozen_and_renewal(
+        client, admin_headers, seed_account):
+    """运营者必须能在后台回答「这个用户为什么不能用」。
+
+    走一遍 注册 → 试用耗尽 → 购买 → 到期冻结 → 续费，每一步都在**运营接口**上
+    断言：试用余额、套餐到期、Seed 冻结、续费次数与到期续费提示。
+    运营台看不到这些，排障就只能靠用户口述和翻日志。
+    """
+    seed_account("op-lifecycle-plus", plan_type="plus")
+    email = "op-lifecycle@example.com"
+    _register(client, email)
+    seed = store.get_user_auth(email)["seed"]
+
+    # 1) 新注册：三次 Plus 试用全额可用
+    entry = _operator_user(client, admin_headers, email)
+    assert entry["lifecycle_ok"] is True
+    assert entry["trial"]["granted"] is True
+    assert entry["trial"]["tier"] == "plus"
+    assert (entry["trial"]["total"], entry["trial"]["used"]) == (3, 0)
+    assert entry["trial"]["remaining"] == 3
+    assert entry["trial"]["exhausted"] is False
+    assert entry["subscription"]["active"] is False
+    assert entry["seed"]["frozen"] is False
+    assert entry["renewal"]["paid_orders"] == 0
+    assert entry["renewal"]["renewal_due"] is False
+
+    # 2) 三次试用结算完：运营台要看到「耗尽」以及原因代码
+    _exhaust_trial(seed, email)
+    entry = _operator_user(client, admin_headers, email)
+    assert entry["trial"]["used"] == 3
+    assert entry["trial"]["remaining"] == 0
+    assert entry["trial"]["exhausted"] is True
+    assert entry["trial"]["block_reason"] == "exhausted"
+
+    # 3) 购买 Plus：订阅生效、到期时间与「已付订单数」都要可见
+    assert _checkout(client, "plus-shared-1m").status_code == 303
+    entry = _operator_user(client, admin_headers, email)
+    assert entry["subscription"]["active"] is True
+    assert entry["subscription"]["tier"] == "plus"
+    assert entry["subscription"]["expires_at"] > int(time.time())
+    assert entry["subscription"]["days_left"] >= 28
+    assert entry["renewal"]["paid_orders"] == 1
+    assert entry["renewal"]["renewal_due"] is False
+    assert entry["seed"]["frozen"] is False
+    order_id = store.list_orders(email=email)[0]["order_id"]
+
+    # 4) 到期：Seed 冻结（订单仍是付款历史，不删不改）
+    _expire_order(order_id)
+    from utils import seed_lifecycle
+    seed_lifecycle.freeze_if_expired(seed)
+    entry = _operator_user(client, admin_headers, email)
+    assert entry["subscription"]["active"] is False
+    assert entry["renewal"]["renewal_due"] is True
+    assert entry["renewal"]["last_expires_at"] is not None
+    assert entry["seed"]["frozen"] is True
+    assert store.get_order(order_id)["status"] == "paid", "到期不得删除付款记录"
+
+    # 5) 续费：订阅恢复、冻结解除、订单数 +1
+    assert _checkout(client, "plus-shared-1m").status_code == 303
+    entry = _operator_user(client, admin_headers, email)
+    assert entry["subscription"]["active"] is True
+    assert entry["renewal"]["paid_orders"] == 2
+    assert entry["renewal"]["renewal_due"] is False
+    assert entry["seed"]["frozen"] is False
+
+
+def test_operator_user_view_reports_why_account_allocation_failed(client, admin_headers):
+    """分配失败不落库，但每次都会写一条审计 —— 运营台要把它读出来。
+
+    用户付了钱却进不去，运营者必须能直接看到失败原因（匿名代码），而不是
+    只能回一句「再试试」。
+    """
+    # 故意不播任何 plus 健康账号：付款会成功，分配必然失败
+    email = "op-alloc-failed@example.com"
+    _register(client, email)
+    assert _checkout(client, "plus-shared-1m").status_code == 303
+
+    assert store.get_order(store.list_orders(email=email)[0]["order_id"])["status"] == "paid"
+
+    entry = _operator_user(client, admin_headers, email)
+    assert entry["failure"]["reason"], "运营视图没有给出分配失败原因"
+    assert entry["failure"]["at"] is not None
+    # 原因必须是固定匿名代码，不能回显任何账号 / 邮箱 / 异常原文
+    assert email not in str(entry)
+    assert entry["failure"]["reason"] in (
+        "capacity_unconfigured", "capacity_exceeded", "exclusive_conflict",
+        "account_unknown", "account_not_healthy", "cross_tier",
+        "auth_not_active", "operator_seed", "no_seed", "no_entitlement",
+        "store_error",
+    )
+
+
+def test_operator_user_view_never_exposes_seeds_accounts_or_hashes(client, admin_headers, seed_account):
+    """运营用户列表不是第二份凭据库：seed、账号 token、密码哈希一个都不能出现。"""
+    seed_account("op-secret-account-token", plan_type="plus")
+    email = "op-secret@example.com"
+    _register(client, email)
+    seed = store.get_user_auth(email)["seed"]
+    assert _checkout(client, "plus-shared-1m").status_code == 303
+    # 下单成功 = 该 Seed 已绑到真实号池账号
+    assert store.get_user(seed)["current_account"] == "op-secret-account-token"
+
+    payload = client.get("/admin/users", headers=admin_headers).text
+    assert seed not in payload, "运营视图泄露了 seed"
+    assert "op-secret-account-token" not in payload, "运营视图泄露了账号 token"
+    assert "password_hash" not in payload
+    assert "pbkdf2" not in payload
+    assert email not in payload, "运营视图泄露了邮箱原文"
+
+
+def test_admin_console_renders_the_saas_lifecycle_panel(client, admin_headers):
+    """运营台页面必须真的渲染出这块面板，并且指向真实的运营接口。"""
+    page = client.get("/admin/routing", headers=admin_headers)
+    assert page.status_code == 200
+    body = page.text
+    assert 'id="saasUsersTable"' in body
+    assert 'id="saasUsersCount"' in body
+    assert "/admin/users" in body
 
 
 # ------------------------------------------------------------------- audit log
