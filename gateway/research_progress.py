@@ -613,6 +613,10 @@ def new_delta_state() -> dict:
         "is_complete": False,
         "hidden": False,
         "terminal": "",
+        # Frame-level error evidence is turn-scoped.  Keep only its presence,
+        # never the upstream error text or code, so later completion patches
+        # cannot overwrite a failure with a synthetic success.
+        "error_observed": False,
         # Turn-scoped: these have already been folded into the record by the
         # time a message boundary is crossed, so a reset cannot lose them.
         "containers": set(),
@@ -844,7 +848,12 @@ def synthesise_delta_message(state) -> dict:
         message["content"]["text"] = state["text"]
     if state["end_turn"] is not None:
         message["end_turn"] = state["end_turn"]
-    return {"v": {"message": message}}
+    envelope = {"message": message}
+    if state.get("error_observed"):
+        # Anonymous sentinel consumed by _has_error(); the upstream value is
+        # intentionally not retained or exposed.
+        envelope["error"] = True
+    return {"v": envelope}
 
 
 def fold_delta(payload, state) -> dict:
@@ -859,6 +868,8 @@ def fold_delta(payload, state) -> dict:
     seed_delta_state(state, _message_of(payload))
     for path, op, value in patch_operations(payload):
         _apply_patch(state, path, op, value)
+    if _has_error(payload):
+        state["error_observed"] = True
     return synthesise_delta_message(state)
 
 

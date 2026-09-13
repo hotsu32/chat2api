@@ -293,6 +293,26 @@ def test_an_explicit_failure_patch_is_not_a_completion():
     assert view["projection"]["action"] == rp.ACTION_FAILED
 
 
+def test_delta_envelope_error_survives_later_completion_patches():
+    """An envelope error must remain failure evidence through the rest of the turn."""
+    frames = [
+        {"c": 1, "o": "replace", "p": "/message", "v": {
+            "conversation_id": CONVERSATION,
+            "error": "upstream detail must not be retained",
+            "error_code": "server_error",
+            "message": assistant_message(),
+        }},
+        replace("/message/status", "finished_successfully"),
+        replace("/message/end_turn", True),
+        replace("/message/metadata/is_complete", True),
+    ]
+    store, view = run(frames, outcome="complete")
+    assert store.snapshot(CONVERSATION)["state"] == "failed"
+    assert view["projection"]["action"] == rp.ACTION_FAILED
+    assert view["projection"]["finished"] is True
+    assert "upstream detail" not in json.dumps(view)
+
+
 def test_a_cancelled_patch_is_not_a_completion():
     frames = [replace("/message", assistant_message()),
               replace("/message/status", "cancelled")]
