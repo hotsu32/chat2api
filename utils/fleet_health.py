@@ -30,7 +30,9 @@ healthy/unhealthy —— 其余状态由人工或熔断器持有。
   5. 代理只用**既有**显式绑定（routing 绑定 → 账号行 proxy_url）。探针不给账号
      分配新出口：那会破坏粘性绑定，并让健康结论对应到另一条链路；
   6. 日志与指标只含匿名标识、状态码与原因枚举；token 前缀、代理串、异常原文
-     与上游 body 一律不落。
+     与上游 body 一律不落；
+  7. 目标只取显式配置的 CHATGPT_BASE_URL：显式为空 = 没有目标，不发请求、不构造
+     客户端、也不回落到真实站点。探针测的必须是运维配的那条上游。
 """
 
 import asyncio
@@ -73,6 +75,8 @@ REASON_UPSTREAM_5XX = "upstream_5xx"
 REASON_HTTP_ERROR = "http_error"
 REASON_NETWORK_ERROR = "network_error"
 REASON_INTERNAL_ERROR = "internal_error"
+# 显式空的 CHATGPT_BASE_URL：没有探针目标。这不是账号的问题，也不许回落到真实站点。
+REASON_NO_BASE_URL = "no_base_url"
 # 探针已成功，但 dwell 未满：仍不接流量，也不对外报成 healthy。
 REASON_RECOVERING = "recovering"
 # 人工停用：这不是健康问题，探针不参与判定。
@@ -318,10 +322,13 @@ async def _probe_account(token: str, access_token: str, identity: dict, proxy_ur
     取消必须向上传播（整轮扫描被取消时不能被吞成 unhealthy），但连接不能泄漏：
     响应到手 → close() 归还池子；异常/取消 → discard() 硬关闭。
     """
-    base_url = (
-        random.choice(configs.chatgpt_base_url_list)
-        if configs.chatgpt_base_url_list else "https://chatgpt.com"
-    )
+    # 显式空 base URL = 没有配置上游，也就没有探针目标。旧实现回落到
+    # https://chatgpt.com：那会把运维明确关掉的外呼重新打开，而且探到的可用性
+    # 对应的是另一个上游。没有目标就**不构造客户端**，直接返回一个有界原因。
+    if not configs.chatgpt_base_url_list:
+        logger.info(f"[health] {anon_id(token)} probe skipped reason={REASON_NO_BASE_URL}")
+        return REASON_NO_BASE_URL
+    base_url = random.choice(configs.chatgpt_base_url_list)
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
