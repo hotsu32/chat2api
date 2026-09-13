@@ -126,6 +126,77 @@ for _dead_token in list(antiban_dead_tokens):
 # working cache; these push changes into SQLite (the durable truth).
 # ---------------------------------------------------------------------------
 
+# --- users 行的所有权：撤销授权不是删除账号 -----------------------------------
+# ``users`` 表被两类所有者共用，``status`` 就是它们的所有权类型：
+#
+#   - 运营者 / 导入授权（``OPERATOR_SEED_STATUS``）：唯一写入点是 AUTHORIZATION
+#     鉴权的 ``POST /seedtoken``。这一类行归 ``seed_map`` 所有 —— 它不在内存里，
+#     就是运营者撤掉了它；
+#   - 注册用户（trial / active / frozen）：所有者是 ``user_auth`` + 权益，
+#     ``seed_map`` 只是它当前绑定的一份缓存快照。它不在内存里，只说明这次快照
+#     没带上它（重启窗口、部分加载、clear 之后的空表）。
+#
+# 判据只认持久化的所有权标记，不认「内存里有没有」：内存是缓存，缓存里的绑定
+# 既不是权限，也不是删除授权。
+
+
+def _operator_seed_status() -> str:
+    """运营者所有权标记的唯一定义在 ``chatgpt.authorization``。
+
+    不能在模块级导入：那个模块在模块级 ``import utils.globals``，反向依赖会成环
+    （``gateway.share`` 对 ``gateway.backend`` 用的是同一个办法）。延迟导入发生在
+    真正需要判所有权时，届时授权层必然已经加载完毕。
+    """
+    from chatgpt.authorization import OPERATOR_SEED_STATUS
+    return OPERATOR_SEED_STATUS
+
+
+def _operator_owned_seeds() -> list:
+    """``users`` 里带运营者所有权标记的名字。
+
+    读失败被 ``store.list_users`` 折成空表；这里的结果只用于**撤销**，空表 = 一行
+    都不撤销，方向是安全的那一侧。
+    """
+    status = _operator_seed_status()
+    return [u["seed"] for u in store.list_users() if (u.get("status") or "") == status]
+
+
+def _revoke_operator_binding(seed) -> None:
+    """撤销一个运营者自有的绑定（单事务，该 seed 的会话一并撤销）。"""
+    try:
+        store.delete_operator_grant(seed, _operator_seed_status())
+    except store.StoreError:
+        # 撤销是旁路：失败只会留下一行过期授权，不会误删任何东西。
+        logger.error("[globals] operator grant prune unavailable")
+
+
+def revoke_all_operator_grants() -> int:
+    """原子吊销全部运营者/导入授权，并把账户域缓存重装成 durable 状态。
+
+    显式的一次事务调用（``store.delete_operator_grants``），失败即抛
+    ``StoreError`` 交给调用方回 503 —— 不靠「内存里没有 = 该删」的副作用推导。
+    注册用户的 users 行、会话历史与权益不在撤销范围内。
+    """
+    removed = store.delete_operator_grants(_operator_seed_status())
+    reload_account_cache()
+    return removed
+
+
+def reload_account_cache() -> None:
+    """从 SQLite 重装账户域缓存：重启走的就是这条路径。
+
+    撤销之后调用。内存是缓存、库里的幸存者才是真相，所以重装到「刚重启」的样子，
+    而不是手工猜哪些条目该丢 —— 猜错一次，注册用户就认不出自己的会话了
+    （归属检查读的是 ``seed_map``，见 ``gateway/chatgpt.py``）。读失败时
+    ``store.load_all`` 返回空结构，退化为一次缓存丢失，durable 状态不受影响。
+    """
+    loaded = store.load_all()
+    seed_map.clear()
+    seed_map.update(loaded["seed_map"])
+    conversation_map.clear()
+    conversation_map.update(loaded["conversation_map"])
+
+
 def persist_token_list():
     """Sync credential membership without deleting durable account records.
 
@@ -202,19 +273,27 @@ def persist_fp_token(token):
 
 
 def persist_seed_map():
-    """Sync users (seed -> current_account/plan_type); delete users no longer in seed_map."""
-    known = set()
+    """Sync operator-owned bindings; prune only the rows this map owns.
+
+    ``seed_map`` 拥有的是**运营者/导入授权**，不是注册用户的账号行。注册用户的
+    users 行归 ``user_auth`` + 订单所有，缺一条内存绑定说明不了任何事 —— 重启窗口、
+    部分加载、clear 之后的空表都会让它缺席。旧实现把「不在 seed_map」一律当作
+    「该删」，于是运营者按一次 clear 就删光全部注册用户，并级联删掉他们的会话历史。
+
+    判据是持久化的所有权标记（见本模块顶部「users 行的所有权」），不是内存快照。
+    """
+    owned = set()
     for seed, entry in seed_map.items():
         if isinstance(entry, dict):
-            known.add(seed)
+            owned.add(seed)
             store.upsert_user(
                 seed,
                 current_account=entry.get("token", ""),
                 plan_type=entry.get("plan_type"),
             )
-    for u in store.list_users():
-        if u["seed"] not in known:
-            store.delete_user(u["seed"])
+    for seed in _operator_owned_seeds():
+        if seed not in owned:
+            _revoke_operator_binding(seed)
 
 
 def persist_seed(seed):
@@ -242,18 +321,32 @@ def persist_conversation(seed, conv_id):
 
 
 def persist_conversation_map():
-    """Authoritative rebuild of the conversations table from seed_map + conversation_map."""
-    rows = []
+    """Rebuild the conversations of the seeds this map owns.
+
+    旧实现是一次整表重建（``replace_conversations`` 先 ``DELETE FROM
+    conversations`` 再整表重插）：``seed_map`` 为空或部分加载时，那等于删光
+    **所有**会话，注册用户的对话历史一起没了。会话归属与 users 行同源，因此这里
+    只补写自己名下的行，也只清理自己名下已经不在列表里的行。
+    """
+    written = {}
     for seed, entry in seed_map.items():
         if not isinstance(entry, dict):
             continue
         account = entry.get("token", "")
+        conv_ids = set()
         for conv_id in entry.get("conversations", []):
             c = conversation_map.get(conv_id, {}) or {}
             # 每个会话保留自己创建时的账号，切号后不被当前账号覆盖
             conv_account = c.get("account") or account
-            rows.append((conv_id, seed, conv_account, c.get("title"), c.get("create_time"), c.get("update_time")))
-    store.replace_conversations(rows)
+            store.upsert_conversation(conv_id, seed, conv_account, c.get("title"),
+                                      c.get("create_time"), c.get("update_time"))
+            conv_ids.add(conv_id)
+        written[seed] = conv_ids
+    # 只对自己名下的会话做收敛；别人的（注册用户、历史遗留）一行都不碰。
+    for row in store.all_conversations():
+        seed = row.get("seed")
+        if seed in written and row.get("conv_id") not in written[seed]:
+            store.delete_conversation(row.get("conv_id"))
 
 
 def persist_routing_config():

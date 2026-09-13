@@ -8,6 +8,7 @@ from fastapi import Request, HTTPException, Security
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials
 
+import utils.audit as audit
 import utils.globals as globals
 import utils.store as store
 from app import app, security_scheme
@@ -122,40 +123,44 @@ async def delete_seedtoken(request: Request, credentials: HTTPAuthorizationCrede
         seed = data.get("seed")
 
         if seed == "clear":
-            # 显式原子吊销全部运营者授权。**不能**指望 persist_seed_map 的 list_users
-            # 顺带扫到：那个读取把故障折叠成空表，撤销一行都不会发生，而这里照样回
-            # success —— 授权（users.status 标记）才是号池的钥匙，不是内存绑定。
-            # 先吊销再清内存：吊销失败时两边都保持原状，调用方拿到 503 而不是一个
-            # 「看起来成功」的空绑定表。
+            # 显式原子吊销全部运营者授权，然后按 durable 状态重装缓存。**不能**指望
+            # persist_seed_map 的 list_users 顺带扫到：那个读取把故障折叠成空表，撤销
+            # 一行都不会发生，而这里照样回 success —— 授权（users.status 标记）才是
+            # 号池的钥匙，不是内存绑定。先吊销再重装：吊销失败时两边都保持原状，
+            # 调用方拿到 503 而不是一个「看起来成功」的空绑定表。
+            #
+            # 撤销的边界是**运营者授权**：注册用户的 users 行、会话历史与权益不在
+            # 范围内 —— 撤销授权不是删除账号（见 utils/globals.py 的所有权说明）。
             try:
-                store.delete_operator_grants(OPERATOR_SEED_STATUS)
+                revoked = globals.revoke_all_operator_grants()
             except store.StoreError:
                 raise HTTPException(status_code=503, detail="Seed revocation unavailable") from None
-            globals.seed_map.clear()
             globals.persist_seed_map()
+            audit.record("seed.grants_revoked", detail={"count": revoked})
             return {"status": "success", "message": "All seeds deleted successfully"}
 
         if not seed:
             raise HTTPException(status_code=400, detail="Missing required field: seed")
 
-        # 名字吊销走显式的持久化撤销（单事务，失败即 503），不依赖 delete_user /
-        # persist_seed_map 的静默失败路径：授权是钥匙，绑定只是缓存。
+        # 名字吊销走显式的持久化撤销（单事务，失败即 503）：撤销的边界是**运营者
+        # 授权**，不是「这个字符串在内存里出现过」。注册用户的 seed 被运营者按名字
+        # 点到时一行都不能删 —— 授权是钥匙，账号与会话历史是别人的资产。
         try:
             revoked = store.delete_operator_grant(seed, OPERATOR_SEED_STATUS)
         except store.StoreError:
             raise HTTPException(status_code=503, detail="Seed revocation unavailable") from None
 
-        if seed in globals.seed_map:
-            del globals.seed_map[seed]
-            globals.persist_seed_map()
-            # 历史绑定（含非运营者的）连同会话一并清掉，保持既有语义。
-            store.delete_user(seed)
-        elif not revoked:
-            # 内存里没有绑定、库里也没有授权：这才是真正的「没有这个 seed」。
-            # 反过来，持久授权可能比内存绑定活得久（persist 失败 / 重启 / 直接改库），
-            # 那种情况必须能按名字吊销，否则删不掉的授权会永远留在库里。
+        if not revoked:
+            # 没有这个运营者授权：不删任何一行，也不动内存里那条（可能是别人的）
+            # 绑定。如实回「没有这个名字的授权」，而不是假装删掉了什么。
+            audit.record("seed.grant_revoked", ok=False, subject=audit.subject_id(seed),
+                         detail={"result": "not_found"})
             raise HTTPException(status_code=404, detail=f"Seed '{seed}' not found")
 
+        globals.seed_map.pop(seed, None)
+        globals.persist_seed_map()
+        audit.record("seed.grant_revoked", subject=audit.subject_id(seed),
+                     detail={"result": "revoked"})
         return {
             "status": "success",
             "message": f"Seed '{seed}' deleted successfully"
@@ -184,10 +189,18 @@ async def chatgpt_account_check(access_token):
     if not is_direct_upstream_credential(access_token):
         return {}
 
+    # 显式空的 ``CHATGPT_BASE_URL`` = 没有上游目标：不构造客户端、不发请求。
+    # 旧实现回落到硬编码的 ``https://chatgpt.com``，等于把运维明确关掉的外呼在一次
+    # 运营者刷新里重新打开（判据与 utils/fleet_health.py、utils/antiban/version_check.py
+    # 一致：目标只取显式配置）。
+    if not chatgpt_base_url_list:
+        logger.info("[share] account check skipped reason=no-base-url")
+        return {}
+
     auth_info = {}
     client = Client(proxy=random.choice(proxy_url_list) if proxy_url_list else None)
     try:
-        host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
+        host_url = random.choice(chatgpt_base_url_list)
         req_token = await get_real_req_token(access_token)
         access_token = await verify_token(req_token)
         fp = get_fp(req_token).copy()

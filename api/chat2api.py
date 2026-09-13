@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from starlette.responses import Response
 
+import utils.audit as audit
 import utils.globals as globals
 from app import app, templates, security_scheme
 from chatgpt.ChatService import ChatService
@@ -691,9 +692,16 @@ async def add_token(request: Request, text: str = Form(...)):
 @app.post(f"/{api_prefix}/seed_tokens/clear" if api_prefix else "/seed_tokens/clear")
 async def clear_seed_tokens(request: Request):
     _require_pool_admin(request)
-    globals.seed_map.clear()
-    globals.conversation_map.clear()
-    globals.persist_seed_map()
+    # 与 DELETE /seedtoken 的 clear 同一条所有权边界：显式原子吊销运营者授权，再按
+    # durable 状态重装账户域缓存。旧实现是「清内存 + 整表写回」——seed_map 一空，
+    # 写回就变成删光所有 users 行与会话（注册用户的账号和历史一起没了）。池管理端的
+    # 「清 seed」是一个授权操作，不是一个删账号的操作。
+    try:
+        revoked = globals.revoke_all_operator_grants()
+    except StoreError:
+        raise HTTPException(status_code=503, detail="Seed revocation unavailable") from None
     globals.persist_conversation_map()
+    audit.record("pool.seeds_cleared", detail={"count": revoked, "source": "pool_control"})
     logger.info(f"Seed token count: {len(globals.seed_map)}")
-    return {"status": "success", "seed_tokens_count": len(globals.seed_map)}
+    return {"status": "success", "seed_tokens_count": len(globals.seed_map),
+            "revoked": revoked}
