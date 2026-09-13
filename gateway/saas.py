@@ -293,6 +293,7 @@ _ALLOCATION_MESSAGES = {
     "exclusive_conflict": "当前套餐的独享账号已被占用，请稍后重试。",
     "account_unknown": "暂时没有可用账号，请稍后重试。",
     "account_not_healthy": "暂时没有可用账号，请稍后重试。",
+    "no_healthy_candidate": "暂时没有可用账号，请稍后重试。",
     "cross_tier": "暂时没有同档可用账号，请稍后重试。",
     "auth_not_active": "账号状态异常，请联系客服处理。",
     "operator_seed": "账号状态异常，请联系客服处理。",

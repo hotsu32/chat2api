@@ -494,7 +494,7 @@ def test_operator_user_view_reports_why_account_allocation_failed(client, admin_
     assert email not in str(entry)
     assert entry["failure"]["reason"] in (
         "capacity_unconfigured", "capacity_exceeded", "exclusive_conflict",
-        "account_unknown", "account_not_healthy", "cross_tier",
+        "account_unknown", "account_not_healthy", "no_healthy_candidate", "cross_tier",
         "auth_not_active", "operator_seed", "no_seed", "no_entitlement",
         "store_error",
     )
