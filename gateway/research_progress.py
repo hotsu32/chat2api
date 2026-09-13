@@ -470,36 +470,41 @@ def _has_error(payload) -> bool:
     the capture.  Only their presence is used; their values are upstream body
     fragments and are never copied anywhere.
     """
-    # Error envelopes have appeared both at the frame root and inside a
-    # batched patch's operation value.  Follow only the protocol's ``v`` chain
-    # so an unrelated ``error`` field in message content or source metadata
-    # cannot silently turn a healthy turn into failure.
-    pending = [(payload, True, 0)]
-    seen = 0
-    while pending and seen < 128:
-        candidate, is_root, depth = pending.pop()
-        if depth > 8:
-            continue
-        seen += 1
-        if isinstance(candidate, dict):
-            envelope = is_root or any(
-                key in candidate for key in ("conversation_id", "message", "input_message"))
-            if envelope:
-                for key in ("error", "error_code"):
-                    value = candidate.get(key)
-                    if isinstance(value, str):
-                        present = bool(value.strip())
-                    else:
-                        present = value not in (None, False, 0, [], {})
-                    if present:
-                        return True
-            value = candidate.get("v")
-            if isinstance(value, (dict, list)):
-                pending.append((value, False, depth + 1))
-        elif isinstance(candidate, list):
-            pending.extend((value, False, depth + 1)
-                           for value in candidate[:MAX_PATCH_OPS]
-                           if isinstance(value, (dict, list)))
+    def has_error_fields(candidate):
+        if not isinstance(candidate, dict):
+            return False
+        for key in ("error", "error_code"):
+            value = candidate.get(key)
+            if isinstance(value, str):
+                if value.strip():
+                    return True
+            elif value not in (None, False, 0, [], {}):
+                return True
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+    if has_error_fields(payload):
+        return True
+
+    value = payload.get("v")
+    # A single patch's value is an envelope only when it is an object.  A list
+    # here is commonly a source/reference array and must not be inspected.
+    if isinstance(value, dict) and has_error_fields(value):
+        return True
+
+    # The batched form is the one protocol list whose members are operations.
+    # Inspect the operation object and a dictionary operation value, but never
+    # recurse into arbitrary list values such as content references.
+    if payload.get("o") == "patch" and isinstance(value, list):
+        for operation in value[:MAX_PATCH_OPS]:
+            if not isinstance(operation, dict):
+                continue
+            if has_error_fields(operation):
+                return True
+            operation_value = operation.get("v")
+            if isinstance(operation_value, dict) and has_error_fields(operation_value):
+                return True
     return False
 
 

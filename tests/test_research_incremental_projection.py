@@ -352,6 +352,24 @@ def test_batched_nested_error_survives_later_completion_patches():
     assert "nested detail" not in json.dumps(view)
 
 
+def test_markerless_batched_error_survives_later_completion_patches():
+    """Error envelopes need no conversation marker to remain fail-closed."""
+    frames = [
+        replace("/message", assistant_message()),
+        batch(replace("/message", {
+            "error": "markerless detail",
+            "error_code": "markerless_error",
+        })),
+        replace("/message/status", "finished_successfully"),
+        replace("/message/end_turn", True),
+        replace("/message/metadata/is_complete", True),
+    ]
+    store, view = run(frames)
+    assert store.snapshot(CONVERSATION)["state"] == "failed"
+    assert view["projection"]["action"] == rp.ACTION_FAILED
+    assert "markerless detail" not in json.dumps(view)
+
+
 def test_unrelated_nested_error_fields_do_not_fail_a_healthy_snapshot():
     """Only protocol envelope errors count, not source/message metadata."""
     message = assistant_message(
