@@ -352,6 +352,21 @@ def test_batched_nested_error_survives_later_completion_patches():
     assert "nested detail" not in json.dumps(view)
 
 
+def test_unrelated_nested_error_fields_do_not_fail_a_healthy_snapshot():
+    """Only protocol envelope errors count, not source/message metadata."""
+    message = assistant_message(
+        status="finished_successfully",
+        end_turn=True,
+        metadata={
+            "is_complete": True,
+            "content_references": [{"url": "https://example.test", "error": False}],
+        },
+    )
+    store, view = run([{"v": {"message": message}}])
+    assert store.snapshot(CONVERSATION)["state"] == "complete"
+    assert view["projection"]["action"] == rp.ACTION_DONE
+
+
 def test_a_cancelled_patch_is_not_a_completion():
     frames = [replace("/message", assistant_message()),
               replace("/message/status", "cancelled")]

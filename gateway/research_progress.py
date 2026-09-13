@@ -471,26 +471,30 @@ def _has_error(payload) -> bool:
     fragments and are never copied anywhere.
     """
     # Error envelopes have appeared both at the frame root and inside a
-    # batched patch's operation value.  Walk the bounded decoded JSON tree so
-    # the batch form cannot silently turn an upstream failure into success.
-    pending = [(payload, 0)]
+    # batched patch's operation value.  Follow only the protocol's ``v`` chain
+    # so an unrelated ``error`` field in message content or source metadata
+    # cannot silently turn a healthy turn into failure.
+    pending = [(payload, True, 0)]
     seen = 0
     while pending and seen < 128:
-        candidate, depth = pending.pop()
+        candidate, is_root, depth = pending.pop()
         if depth > 8:
             continue
         seen += 1
         if isinstance(candidate, dict):
-            for key in ("error", "error_code"):
-                value = candidate.get(key)
-                if value is not None and value != "":
-                    return True
-            pending.extend((value, depth + 1)
-                           for value in candidate.values()
-                           if isinstance(value, (dict, list)))
+            envelope = is_root or any(
+                key in candidate for key in ("conversation_id", "message", "input_message"))
+            if envelope:
+                for key in ("error", "error_code"):
+                    value = candidate.get(key)
+                    if value is not None and value != "":
+                        return True
+            value = candidate.get("v")
+            if isinstance(value, (dict, list)):
+                pending.append((value, False, depth + 1))
         elif isinstance(candidate, list):
-            pending.extend((value, depth + 1)
-                           for value in candidate
+            pending.extend((value, False, depth + 1)
+                           for value in candidate[:128]
                            if isinstance(value, (dict, list)))
     return False
 
