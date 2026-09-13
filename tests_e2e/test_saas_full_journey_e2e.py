@@ -19,7 +19,9 @@
 
 全文只读真实 SQLite 账面与 mock 上游收到的报文，不 mock 权益、不 mock 试用余额。
 """
+import re
 import time
+import urllib.parse
 
 import utils.configs as configs
 import utils.store as store
@@ -32,6 +34,10 @@ PASSWORD = "Journey-example-password-734!"
 SECOND_EMAIL = "journey-second@example.test"
 PLUS_PLAN = "plus-shared-1m"
 PRO_PLAN = "pro-shared-1m"
+# Dashboard 两个购买入口渲染出来的目标套餐（独享月卡）。与上面两个「拼车」常量
+# 刻意分开：入口指向的是独享，链路测试买的是拼车，两者不能互相冒充。
+PLUS_CTA_PLAN = "plus-solo-1m"
+PRO_CTA_PLAN = "pro-solo-1m"
 CONVERSATION_PATH = "/backend-api/conversation"
 
 
@@ -103,6 +109,67 @@ def _expire_order(order_id, seconds_ago=60):
 
 
 # ---------------------------------------------------------------------------
+# CTA → 超市页：Dashboard 的购买入口必须把用户选中的档带过去
+# ---------------------------------------------------------------------------
+
+# 超市页会提交的那一个隐藏字段（也是 `js` 在浏览器里实时改写的那一个）
+_PLAN_INPUT_RE = re.compile(r'<input type="hidden" name="plan" id="plan-id" value="([^"]*)">')
+# 三个轴的选中态：只有服务端渲染出来的 `is-selected` 才算「预选」
+_OPTION_RE = r'<button class="([^"]*)" type="button" data-value="%s">'
+
+
+def _cta_href(body, label):
+    """取出 Dashboard 上某个购买 CTA 渲染出来的 href。
+
+    断言的是**页面里真实渲染的链接**，而不是测试自己拼的 URL —— 拼接会绕过
+    「入口是否带上档位」这个 bug 本身（这正是本次修复要钉死的行为）。
+    """
+    match = re.search(r'<a class="[^"]*plan-cta[^"]*" href="([^"]*)">' + label, body)
+    assert match, f"Dashboard 没有渲染出「{label}」入口"
+    return match.group(1)
+
+
+def _store_preselection(client, href):
+    """跟随 CTA 打开超市页，返回 ``(页面正文, 会提交的 plan 值)``。"""
+    page = client.get(href)
+    assert page.status_code == 200, f"{href} 未渲染超市页：{page.status_code}"
+    match = _PLAN_INPUT_RE.search(page.text)
+    assert match, "超市页没有渲染 hidden plan 字段"
+    return page.text, match.group(1)
+
+
+def _axis_selected(body, axis_value):
+    """该轴取值对应的按钮是否带 ``is-selected``（无 JS 时的预选事实）。"""
+    match = re.search(_OPTION_RE % re.escape(axis_value), body)
+    assert match, f"超市页没有渲染 data-value={axis_value} 的选项"
+    return "is-selected" in match.group(1).split()
+
+
+def _js_selection(body):
+    """超市页脚本里的初始 state —— 浏览器加载后 ``render()`` 会照它重写表单。
+
+    服务端渲染的 hidden 值只对「无 JS / 测试客户端」成立；真实浏览器里覆盖它的是
+    这段脚本。两者只要不同源，用户看到的预选就会在加载瞬间被打回默认档。
+    """
+    block = re.search(r"const state = \{(.*?)\};", body, re.S)
+    assert block, "超市页没有渲染预选 state 脚本"
+    fields = dict(re.findall(r'(\w+):\s*"([^"]*)"', block.group(1)))
+    assert set(fields) == {"tier", "density", "duration"}, f"预选 state 字段不全：{fields}"
+    return fields
+
+
+def _exhaust_trial(seed, email):
+    """把注册赠额全部结算完（走真实的预留→结算账，不直接改余额）。"""
+    remaining = trials.trial_state(email)["remaining"]
+    assert remaining > 0, "该账号没有可结算的试用额度"
+    for _ in range(remaining):
+        res_id = trials.reserve(seed)
+        assert res_id, "试用额度未按预期预留（余额提前耗尽）"
+        assert trials.settle(res_id, seed), "预留结算失败"
+    assert trials.trial_state(email)["remaining"] == 0
+
+
+# ---------------------------------------------------------------------------
 # The journey
 # ---------------------------------------------------------------------------
 
@@ -153,6 +220,14 @@ def test_single_user_full_saas_journey(client, client_factory, mock_upstream, mo
     assert "购买 Plus" in body and "购买 Pro" in body
     assert "开始试用" not in body
     _assert_no_free_product(body)
+
+    # 入口把档位带过去：跟随渲染出来的两个 CTA，超市页必须各自预选对应档位
+    pro_body, pro_plan = _store_preselection(client, _cta_href(body, "购买 Pro"))
+    plus_body, plus_plan = _store_preselection(client, _cta_href(body, "购买 Plus"))
+    assert pro_plan == PRO_CTA_PLAN and _axis_selected(pro_body, "pro")
+    assert _js_selection(pro_body)["tier"] == "pro"
+    assert plus_plan == PLUS_CTA_PLAN and _axis_selected(plus_body, "plus")
+    assert _js_selection(plus_body)["tier"] == "plus"
 
     # -- 5. 购买 Plus 拼车月卡：mock 结算 → 立即绑定同档健康号 -------------------
     assert _checkout(client, PLUS_PLAN).status_code == 200
@@ -274,3 +349,66 @@ def test_single_user_full_saas_journey(client, client_factory, mock_upstream, mo
     second_seed = store.get_user_auth(SECOND_EMAIL)["seed"]
     assert store.get_user(second_seed)["current_account"] == plus_token
     assert "服务正常" in other.get("/dashboard").text
+
+
+def test_dashboard_pro_cta_preselects_and_purchases_pro(client, mock_upstream, monkeypatch,
+                                                        seed_account, make_access_token):
+    """Dashboard 的「购买 Pro」入口必须一路把 Pro 带到结算为止。
+
+    回归的是这条真实缺陷：``store_page`` 丢掉 ``?plan=``，而 ``store.html`` 又把
+    预选档和 hidden 值写死成 ``plus-solo-1m``，于是用户点「购买 Pro」买到的是 Plus。
+    因此这里断言的是**从渲染出来的 CTA 一路走到订单**，而不是直接 POST 一个测试
+    自己拼的 plan —— 后者恰好会绕过出问题的那一段（查询串 → 预选 → 表单值）。
+    """
+    pro_token = make_access_token(account_id="acc-cta-pro", plan_type="pro")
+    seed_account(pro_token, plan_type="pro")
+
+    monkeypatch.setattr(configs, "require_email_verification", False)
+    email = "cta-pro@example.test"
+    assert _register(client, email).status_code == 200
+    seed = store.get_user_auth(email)["seed"]
+
+    # 两个购买入口只在试用耗尽后渲染
+    _exhaust_trial(seed, email)
+    dashboard = client.get("/dashboard").text
+    assert "购买 Plus" in dashboard and "购买 Pro" in dashboard
+
+    # 1. 跟随**渲染出来的** Pro CTA：超市页要预选 Pro，且提交值就是 Pro
+    href = _cta_href(dashboard, "购买 Pro")
+    assert href == f"/store?plan={PRO_CTA_PLAN}"
+    body, rendered_plan = _store_preselection(client, href)
+    assert rendered_plan == PRO_CTA_PLAN
+    assert _axis_selected(body, "pro"), "Pro 入口没有把 Pro 档预选上"
+    assert not _axis_selected(body, "plus")
+    # 预选必须贯穿到用户看到的摘要价，而不只是隐藏字段
+    assert "Pro · 独享 · 1 个月" in body and 'id="sel-price">¥199' in body
+    # 以及脚本状态：否则浏览器一加载 render() 就把预选打回 Plus
+    assert _js_selection(body) == {"tier": "pro", "density": "solo", "duration": "1m"}
+
+    # 2. 把超市页渲染出来的那个值真的提交出去 → 落一张 Pro 订单
+    csrf = client.cookies.get(configs.user_csrf_cookie) or ""
+    resp = client.post("/api/checkout", data={"plan": rendered_plan, "csrf_token": csrf},
+                       follow_redirects=True)
+    assert resp.status_code == 200
+    paid = [o for o in store.list_orders(email=email) if o["status"] == "paid"]
+    assert [o["tier_id"] for o in paid] == [PRO_CTA_PLAN], "「购买 Pro」入口最终卖出的不是 Pro"
+
+    # 3. Plus 入口没有被这次修复带偏：仍然预选 Plus
+    plus_body, plus_plan = _store_preselection(client, _cta_href(dashboard, "购买 Plus"))
+    assert plus_plan == PLUS_CTA_PLAN
+    assert _axis_selected(plus_body, "plus") and not _axis_selected(plus_body, "pro")
+
+    # 4. 未知 / 试图注入的值一律退回默认档，不能把任意字符串塞进结算表单
+    for bad in ("", "free-solo-1m", "pro-solo-1m-extra", "pro-solo", "  pro-solo-1m  ",
+                "<script>alert(1)</script>", "../../etc/passwd"):
+        _, value = _store_preselection(client, "/store?plan=" + urllib.parse.quote(bad))
+        assert value == "plus-solo-1m", f"非法 plan {bad!r} 未退回默认档，得到 {value!r}"
+
+    # 5. 默认落地（无查询串）保持原样：Plus 独享月卡
+    default_body, default_plan = _store_preselection(client, "/store")
+    assert default_plan == "plus-solo-1m"
+    assert _axis_selected(default_body, "plus") and _axis_selected(default_body, "1m")
+    assert _js_selection(default_body) == {"tier": "plus", "density": "solo", "duration": "1m"}
+    # 非法 plan 也不能只改脚本而不改服务端渲染（两者必须同源）
+    invalid_body, _ = _store_preselection(client, "/store?plan=pro-solo-1m-extra")
+    assert _js_selection(invalid_body) == {"tier": "plus", "density": "solo", "duration": "1m"}

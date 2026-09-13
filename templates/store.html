@@ -12,10 +12,10 @@
   <div class="axis">
     <div class="axis-title"><span class="idx">01</span>账号档次</div>
     <div class="axis-options" data-axis="tier">
-      <button class="opt is-selected" type="button" data-value="plus">
+      <button class="opt{% if selected.tier == 'plus' %} is-selected{% endif %}" type="button" data-value="plus">
         <span class="name">Plus</span><span class="hint">日常够用</span>
       </button>
-      <button class="opt" type="button" data-value="pro">
+      <button class="opt{% if selected.tier == 'pro' %} is-selected{% endif %}" type="button" data-value="pro">
         <span class="name">Pro</span><span class="hint">更强模型</span>
       </button>
     </div>
@@ -23,10 +23,10 @@
   <div class="axis">
     <div class="axis-title"><span class="idx">02</span>共享密度</div>
     <div class="axis-options" data-axis="density">
-      <button class="opt is-selected" type="button" data-value="solo">
+      <button class="opt{% if selected.density == 'solo' %} is-selected{% endif %}" type="button" data-value="solo">
         <span class="name">独享</span><span class="hint">专属号池</span>
       </button>
-      <button class="opt" type="button" data-value="shared">
+      <button class="opt{% if selected.density == 'shared' %} is-selected{% endif %}" type="button" data-value="shared">
         <span class="name">拼车</span><span class="hint">多人共享</span>
       </button>
     </div>
@@ -34,9 +34,9 @@
   <div class="axis">
     <div class="axis-title"><span class="idx">03</span>时长</div>
     <div class="axis-options" data-axis="duration">
-      <button class="opt" type="button" data-value="1d"><span class="name">1 天</span><span class="hint"></span></button>
-      <button class="opt" type="button" data-value="1w"><span class="name">1 周</span><span class="hint"></span></button>
-      <button class="opt is-selected" type="button" data-value="1m"><span class="name">1 个月</span><span class="hint"></span></button>
+      <button class="opt{% if selected.duration == '1d' %} is-selected{% endif %}" type="button" data-value="1d"><span class="name">1 天</span><span class="hint"></span></button>
+      <button class="opt{% if selected.duration == '1w' %} is-selected{% endif %}" type="button" data-value="1w"><span class="name">1 周</span><span class="hint"></span></button>
+      <button class="opt{% if selected.duration == '1m' %} is-selected{% endif %}" type="button" data-value="1m"><span class="name">1 个月</span><span class="hint"></span></button>
     </div>
   </div>
 </div>
@@ -44,11 +44,11 @@
 <div class="summary">
   <div>
     <div class="mono-label">已选</div>
-    <div class="summary-name" id="sel-name">Plus · 独享 · 1 个月</div>
+    <div class="summary-name" id="sel-name">{{ selected.label }}</div>
   </div>
-  <div class="summary-price" id="sel-price">¥99 <small>/ 月</small></div>
+  <div class="summary-price" id="sel-price">¥{{ selected.price }} <small>{{ selected.unit }}</small></div>
   <form method="get" action="/checkout">
-    <input type="hidden" name="plan" id="plan-id" value="plus-solo-1m">
+    <input type="hidden" name="plan" id="plan-id" value="{{ selected.id }}">
     <button class="btn" type="submit">立即下单</button>
   </form>
 </div>
@@ -66,7 +66,14 @@
   const DURATION_LABEL = { "1d": "1 天", "1w": "1 周", "1m": "1 个月" };
   const UNIT_LABEL = { "1d": "/ 天", "1w": "/ 周", "1m": "/ 月" };
 
-  const state = { tier: "plus", density: "solo", duration: "1m" };
+  // 服务端预选（来自入口的 ?plan=，已校验过目录）。render() 会在加载时按这里的
+  // 状态重写 hidden 值与摘要，所以服务端渲染与脚本必须同源，否则浏览器一加载
+  // 就会把预选悄悄改回默认档。
+  const state = {
+    tier: {{ selected.tier | tojson }},
+    density: {{ selected.density | tojson }},
+    duration: {{ selected.duration | tojson }},
+  };
 
   function render() {
     document.querySelectorAll("[data-axis]").forEach(function (axis) {

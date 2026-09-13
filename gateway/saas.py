@@ -395,14 +395,29 @@ def _fulfil_order(order_id: str) -> dict:
 
 # ---------------------------------------------------------------------- 页面
 
+# 超市页的默认预选档：没有任何（有效的）``?plan=`` 时的落地状态。
+# 与 Dashboard 的「购买 Plus」入口指向同一档，保持历史默认体验不变。
+_STORE_DEFAULT_PLAN = "plus-solo-1m"
+
+
 @app.get("/store", response_class=HTMLResponse)
-async def store_page(request: Request, expired: str = ""):
+async def store_page(request: Request, expired: str = "", plan: str = ""):
     _, redirect = _page_auth(request)
     if redirect:
         return redirect
+    # 入口链接（Dashboard 的「购买 Pro」）用 ``?plan=`` 指定要预选的档位。
+    # 只有目录里真实存在的 plan_id 才生效，未知/缺失/畸形一律退回默认档 ——
+    # 这样查询串既不能改变「默认落地」这一既有行为，也不能把任意字符串塞进
+    # 结算表单的 hidden 值。校验走 :func:`plans.plan_detail`，与结算页同源。
+    selected = plans.plan_detail(plan) or plans.plan_detail(_STORE_DEFAULT_PLAN)
     return _render_with_csrf(
         request, "store.html",
-        {"prices": plans.prices(), "expired": bool(expired), "nav_active": "store"},
+        {
+            "prices": plans.prices(),
+            "expired": bool(expired),
+            "selected": selected,
+            "nav_active": "store",
+        },
     )
 
 
