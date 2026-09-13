@@ -30,6 +30,7 @@ signals must be present before the guard is told the account did real work.
 """
 from functools import wraps
 from dataclasses import dataclass
+import re
 
 import anyio
 import asyncio
@@ -99,6 +100,103 @@ _COMPLETE_STREAMS = ("complete",)
 _STREAM_END_STATES = ("complete", "failed", "cancelled")
 
 
+# --- terminal-answer evidence -----------------------------------------------
+# One predicate decides whether the frames seen so far *are* the turn's answer,
+# and the research projection (``gateway.research_progress.project_event``)
+# answers it from the same evidence. That module mounts routes on ``app``, so
+# importing its projection from here would close a cycle; the rule is therefore
+# restated once, here, and both ledgers are kept in step by the tests that drive
+# the same real capture.
+#
+# What the capture fixes (``tests/fixtures/deep_research_plus_shapes.json``, the
+# 2026-09-12 Plus Deep Research turn, 23 events, field shapes only):
+#
+# * the answer frame is the only frame carrying ``metadata.is_complete``; it is
+#   assistant-authored, ``finished_successfully``, carries ``end_turn``, and
+#   carries the answer as ``content.text`` -- with no ``parts`` at all. Reading
+#   only ``parts`` meant the one frame a real research turn ends on never
+#   charged the trial it consumed;
+# * every interim frame carries ``parts`` instead and carries no ``is_complete``,
+#   while several of them are upstream-marked
+#   ``is_visually_hidden_from_conversation`` or name a tool invocation in their
+#   metadata. ``end_turn`` alone is not an answer: the capture records the field
+#   on the walk of frames leading up to it.
+#
+# So "the turn produced an answer" is: the assistant closed the turn, the frame
+# declares itself complete, a visible body is present, and the frame is not one
+# of the internal ones (hidden, tool-addressed, or reasoning) that share the
+# stream. The result feeds the trial ledger alone; the antiban verdict above
+# keeps its own, older evidence, because a lost pacing hint and a wrongly
+# charged generation are not the same mistake.
+ASSISTANT_ROLE = "assistant"
+FINISHED_STATUS = "finished_successfully"
+
+_HIDDEN_KEY = "is_visually_hidden_from_conversation"
+
+# A tool recipient is namespace-qualified (``web.run`` is the observed one), and
+# the observed tool metadata keys are the same two the projection excludes.
+_TOOL_RECIPIENT_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+_TOOL_METADATA_KEYS = ("invoked_resource", "invoked_plugin")
+
+# Content types whose body is not the answer: reasoning is not the report, and
+# the official UI does not show it either.
+NON_ANSWER_CONTENT_TYPES = frozenset({"thoughts", "reasoning_recap"})
+
+
+def _declares_completion(metadata) -> bool:
+    """Whether this frame's own metadata permits it to be the answer frame.
+
+    ``is_complete`` is the flag the capture shows on exactly one frame -- the
+    answer -- so a frame that carries message metadata at all has to declare it.
+    A frame that carries none is the plain chat shape this ledger has always
+    settled: it has no completion flag to declare, and the rest of the predicate
+    still has to hold for it.
+
+    That last clause is the rule's only divergence from the projection, and the
+    capture cannot reach it: every message frame of the real research turn
+    carries metadata, so for the stream this rule exists for, the two agree
+    frame by frame (``tests/test_trial_research_settlement.py`` drives exactly
+    that). It stays because the ordinary chat shape -- the one this ledger has
+    settled since it existed, and the one the gateway's chat fixtures pin -- has
+    no metadata to read a completion flag out of, and a plain chat turn is not a
+    research turn.
+    """
+    if not isinstance(metadata, dict) or not metadata:
+        return True
+    return metadata.get("is_complete") is True
+
+
+def _normalised_content_type(content) -> str:
+    value = content.get("content_type") if isinstance(content, dict) else None
+    return value.strip().lower() if isinstance(value, str) else ""
+
+
+def _has_body(content) -> bool:
+    """Whether this content carries the answer body, in either observed shape.
+
+    ``content.text`` is the answer frame's shape and ``content.parts`` is every
+    other frame's; neither is privileged, and a body that is only whitespace is
+    not an answer.
+    """
+    if not isinstance(content, dict):
+        return False
+    text = content.get("text")
+    if isinstance(text, str) and text.strip():
+        return True
+    parts = content.get("parts")
+    return isinstance(parts, list) and any(
+        isinstance(part, str) and part.strip() for part in parts)
+
+
+def _tool_recipient(recipient) -> bool:
+    return bool(recipient) and bool(_TOOL_RECIPIENT_RE.match(recipient))
+
+
+def _tool_metadata(metadata) -> bool:
+    return isinstance(metadata, dict) and any(
+        metadata.get(key) for key in _TOOL_METADATA_KEYS)
+
+
 @dataclass
 class _Trial:
     reservation: str
@@ -109,31 +207,55 @@ class _Trial:
     role: str = ""
     status: str = ""
     end_turn: bool = False
-    has_text: bool = False
+    has_body: bool = False
+    content_type: str = ""
+    declared_complete: bool = False
+    hidden: bool = False
+    tool_recipient: bool = False
+    tool_metadata: bool = False
     delta_path: str = ""
     delta_operation: str = "replace"
 
     @property
     def assistant_complete(self):
-        return (self.role == 'assistant' and self.status == 'finished_successfully'
-                and self.end_turn and self.has_text)
+        """Whether the frames observed so far are the turn's own answer.
 
-    @staticmethod
-    def _has_text(parts):
-        return isinstance(parts, list) and any(isinstance(p, str) and p.strip() for p in parts)
+        The evidence is the research projection's, and the internal-frame
+        exclusions are the ones its report gate applies: an answer nobody could
+        see is not a generation the user consumed.
+        """
+        return (self.role == ASSISTANT_ROLE
+                and self.status == FINISHED_STATUS
+                and self.end_turn
+                and self.has_body
+                and self.declared_complete
+                and self.content_type not in NON_ANSWER_CONTENT_TYPES
+                and not (self.hidden or self.tool_recipient or self.tool_metadata))
 
     def _snapshot(self, message):
         # Retain only completion metadata, never generated text or identifiers.
-        self.role, self.status, self.end_turn, self.has_text = '', '', False, False
+        self.role, self.status, self.end_turn, self.has_body = '', '', False, False
+        self.content_type, self.declared_complete = '', False
+        self.hidden, self.tool_recipient, self.tool_metadata = False, False, False
         if not isinstance(message, dict):
             return
         author, content = message.get('author'), message.get('content')
         self.role = author.get('role', '') if isinstance(author, dict) else ''
         self.status = message.get('status', '')
         self.end_turn = message.get('end_turn') is True
-        self.has_text = self._has_text(content.get('parts')) if isinstance(content, dict) else False
+        self.has_body = _has_body(content)
+        self.content_type = _normalised_content_type(content)
+        # Recipient first: the tool rule reads it together with the metadata.
+        recipient = message.get('recipient')
+        self.tool_recipient = _tool_recipient(recipient if isinstance(recipient, str) else '')
+        self._metadata(message.get('metadata'))
         if self.status in ('failed', 'cancelled', 'incomplete'):
             self.failed = True
+
+    def _metadata(self, metadata):
+        self.hidden = isinstance(metadata, dict) and metadata.get(_HIDDEN_KEY) is True
+        self.tool_metadata = _tool_metadata(metadata)
+        self.declared_complete = _declares_completion(metadata)
 
     def _delta(self, delta, depth=0):
         if not isinstance(delta, dict):
@@ -167,13 +289,22 @@ class _Trial:
                 self.failed = True
         elif path == '/message/end_turn':
             self.end_turn = value is True
+        elif path == '/message/recipient':
+            self.tool_recipient = _tool_recipient(value if isinstance(value, str) else '')
+        elif path == '/message/metadata':
+            self._metadata(value)
+        elif path == '/message/metadata/is_complete':
+            self.declared_complete = value is True
         elif path == '/message/content':
-            self.has_text = self._has_text(value.get('parts')) if isinstance(value, dict) else False
+            self.has_body = _has_body(value)
+            self.content_type = _normalised_content_type(value)
+        elif path == '/message/content/text':
+            self.has_body = isinstance(value, str) and bool(value.strip())
         elif path == '/message/content/parts':
-            self.has_text = self._has_text(value)
+            self.has_body = _has_body({'parts': value})
         elif path == '/message/content/parts/0':
             nonempty = isinstance(value, str) and bool(value.strip())
-            self.has_text = self.has_text or nonempty if operation == 'append' else nonempty
+            self.has_body = self.has_body or nonempty if operation == 'append' else nonempty
 
     def observe(self, event):
         if not is_complete_event(event):
@@ -194,15 +325,16 @@ class _Trial:
     def finish(self, delivered):
         """End the response lifetime: settled only if ``completed and delivered``.
 
-        ``completed`` is the answer-shape evidence (a finished assistant turn
-        plus the upstream's terminal frame); ``delivered`` is the response
-        lifetime's own record that the whole ASGI body reached the client. A
-        browser that disconnects -- or a send that fails -- after the answer was
-        produced but before the response finished never received a complete
-        reply, and a reply nobody received is not a consumed generation. This is
-        the rule the /v1 lifetime already applies (``utils.trials.TrialAttempt``:
-        "只有「本次生成确实完成」且「客户端确实收到了完整响应」同时成立才结算"),
-        and the two ledgers must not disagree about the same turn.
+        ``completed`` is the answer-shape evidence above (``assistant_complete``:
+        the turn's own answer frame) plus the upstream's terminal frame;
+        ``delivered`` is the response lifetime's own record that the whole ASGI
+        body reached the client. A browser that disconnects -- or a send that
+        fails -- after the answer was produced but before the response finished
+        never received a complete reply, and a reply nobody received is not a
+        consumed generation. This is the rule the /v1 lifetime already applies
+        (``utils.trials.TrialAttempt``: "只有「本次生成确实完成」且「客户端确实收到了
+        完整响应」同时成立才结算"), and the two ledgers must not disagree about
+        the same turn.
 
         Settled once: the response wrapper and the pre-response failure path
         both funnel here, and settling twice would hand out two slots (or
