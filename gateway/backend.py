@@ -25,7 +25,8 @@ from gateway.reverseProxy import chatgpt_reverse_proxy, content_generator, get_r
     headers_accept_list, resolve_seed_token
 from utils.Client import Client
 from utils.Logger import logger
-from utils.configs import x_sign, turnstile_solver_url, chatgpt_base_url_list, no_sentinel, sentinel_proxy_url_list, \
+from utils.configs import x_sign, turnstile_solver_url, pick_chatgpt_base_url, UpstreamNotConfigured, \
+    no_sentinel, sentinel_proxy_url_list, \
     force_no_history
 
 banned_paths = [
@@ -46,6 +47,19 @@ chatgpt_paths = ["c/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-
 
 def has_direct_access_token(token: str) -> bool:
     return len(token) == 45 or token.startswith("eyJhbGciOi")
+
+
+def _upstream_target_or_fail_closed() -> str:
+    """上游目标；显式空 ``CHATGPT_BASE_URL`` → 本地 503。
+
+    在本模块的路由里放在最前面：不读 Authorization、不解析凭据、不构造客户端，
+    因此没有任何凭据或对话体可能被发到一个未配置的站点。旧实现回落
+    ``https://chatgpt.com``，等于把外呼开关交回给一个没人配置过的默认值。
+    """
+    try:
+        return pick_chatgpt_base_url()
+    except UpstreamNotConfigured:
+        raise HTTPException(status_code=503, detail="upstream not configured") from None
 
 
 def _anon(value: str) -> str:
@@ -612,6 +626,8 @@ if no_sentinel:
 
     @app.post("/backend-api/sentinel/chat-requirements")
     async def sentinel_chat_conversations(request: Request):
+        # 显式空上游 = 本地 503，先于读凭据与任何客户端构造。
+        host_url = _upstream_target_or_fail_closed()
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
         req_token = await get_real_req_token(token)
         access_token = await verify_token(req_token)
@@ -621,7 +637,6 @@ if no_sentinel:
         user_agent = fp.get("user-agent",
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0")
 
-        host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
         proof_token = None
         turnstile_token = None
 
@@ -712,6 +727,8 @@ if no_sentinel:
     @app.post("/backend-alt/conversation")
     @app.post("/backend-api/conversation")
     async def chat_conversations(request: Request):
+        # 显式空上游 = 本地 503，先于读凭据、sentinel 与对话体转发。
+        host_url = _upstream_target_or_fail_closed()
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
         req_token = await get_real_req_token(token)
         access_token = await verify_token(req_token)
@@ -721,7 +738,6 @@ if no_sentinel:
         user_agent = fp.get("user-agent",
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0")
 
-        host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
         proof_token = None
         turnstile_token = None
 

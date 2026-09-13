@@ -18,7 +18,8 @@ from utils.Client import Client
 from utils.Logger import logger
 from utils import antiban
 from utils.configs import (
-    chatgpt_base_url_list,
+    pick_chatgpt_base_url,
+    UpstreamNotConfigured,
     ark0se_token_url_list,
     sentinel_proxy_url_list,
     history_disabled,
@@ -91,7 +92,13 @@ class ChatService(AuthMixin, ModelMixin, FileMixin):
         logger.info(f"Request UA: {self.user_agent}")
         logger.info(f"Request impersonate: {self.impersonate}")
 
-        self.host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
+        # 上游目标：显式空 CHATGPT_BASE_URL = 没有目标。必须在构造任何 HTTP 客户端之前
+        # 本地失败——旧实现回落 https://chatgpt.com，会把 access token 与对话体发给一个
+        # 运维明确没有配置的站点。
+        try:
+            self.host_url = pick_chatgpt_base_url()
+        except UpstreamNotConfigured:
+            raise HTTPException(status_code=503, detail="Upstream not configured") from None
         self.ark0se_token_url = random.choice(ark0se_token_url_list) if ark0se_token_url_list else None
 
         session_source = self.req_token or "no-auth"

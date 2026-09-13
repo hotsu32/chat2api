@@ -1,5 +1,6 @@
 import ast
 import os
+import random
 
 from dotenv import load_dotenv
 
@@ -80,6 +81,35 @@ user_agents_list = ast.literal_eval(user_agents_list_str)
 device_tuple = ast.literal_eval(device_tuple_str)
 browser_tuple = ast.literal_eval(browser_tuple_str)
 platform_tuple = ast.literal_eval(platform_tuple_str)
+
+
+class UpstreamNotConfigured(RuntimeError):
+    """显式空 ``CHATGPT_BASE_URL``：没有上游目标。
+
+    这是「显式留空」而不是「未配置」——未配置走 ``CHATGPT_BASE_URL`` 的默认值。
+    调用方拿到它必须在本地失败（有界 503 / 跳过探针），绝不回落到 chatgpt.com 或
+    其他公开主机：那会把运维明确关掉的外呼重新打开，并且把账号凭据发给一个与配置
+    无关的站点。
+    """
+
+    def __init__(self, message: str = "CHATGPT_BASE_URL is not configured"):
+        super().__init__(message)
+
+
+def pick_chatgpt_base_url() -> str:
+    """随机取一个显式配置的上游 base URL；显式留空则抛 ``UpstreamNotConfigured``。
+
+    全项目唯一的上游目标出口：配置了就连字符都不改写地返回（含自定义路径前缀），
+    没配置就失败，调用方不得自行兜底成字面主机名。
+
+    每次调用读模块级 ``chatgpt_base_url_list``（可变对象，测试与热更新都按 in-place
+    改写），因此判据是调用时刻的配置，而不是导入时刻的快照。整串都是空白的配置
+    （如 ``CHATGPT_BASE_URL=","``）同样算没有目标——它不能变成相对 URL 的起点。
+    """
+    candidates = [url for url in chatgpt_base_url_list if str(url or "").strip()]
+    if not candidates:
+        raise UpstreamNotConfigured()
+    return random.choice(candidates)
 
 enable_gateway = is_true(os.getenv('ENABLE_GATEWAY', False))
 auto_seed = is_true(os.getenv('AUTO_SEED', True))

@@ -51,7 +51,8 @@ from utils.Client import Client
 from utils.Logger import logger
 from utils.configs import (
     accept_language,
-    chatgpt_base_url_list,
+    pick_chatgpt_base_url,
+    UpstreamNotConfigured,
     chat_request_timeout,
     turnstile_solver_url,
     sentinel_proxy_url_list,
@@ -134,12 +135,17 @@ async def _upstream_context(request, req_token, host_url):
 
 async def _server_sentinel(request, access_token, req_token, headers, fp, cookies=None):
     """服务端调 sentinel chat-requirements，返回 (chat_token, proof_token, turnstile_token, client, clients, session_id, user_agent)。"""
+    # 显式空上游 = 本地 503，先于构造任何客户端：sentinel 请求带账号凭据，不能发给
+    # 一个没配置过的默认站点。
+    try:
+        host_url = pick_chatgpt_base_url()
+    except UpstreamNotConfigured:
+        raise HTTPException(status_code=503, detail="upstream not configured") from None
     user_agent = fp.get(
         "user-agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
     )
-    host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
     proxy_url = fp.pop("proxy_url", None)
     impersonate = fp.pop("impersonate", "safari15_3")
 
@@ -228,7 +234,11 @@ async def f_sentinel_prepare(request: Request):
     """拦截 sentinel prepare：服务端算 sentinel，返回假 prepare_token（让前端跳过 PoW）。"""
     token = resolve_seed_token(request)
     req_token = await get_real_req_token_wrapper(token)
-    host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
+    # 显式空上游 = 本地 503：上游 origin/host 头与 sentinel 都依赖它，不能先干活再猜。
+    try:
+        host_url = pick_chatgpt_base_url()
+    except UpstreamNotConfigured:
+        raise HTTPException(status_code=503, detail="upstream not configured") from None
     headers, fp, cookies, access_token = await _upstream_context(request, req_token, host_url)
     try:
         chat_token, proof_token, turnstile_token, client, clients, _, _ = await _server_sentinel(
@@ -363,11 +373,16 @@ async def f_conversation(request: Request):
     # 权益不足先拒绝，避免为已到期请求刷新官网会话或发起上游预检。
     enforce_tier(token)
     req_token = await get_real_req_token_wrapper(token)
+    # 显式空上游 = 本地 503，先于试用额度预约与官网会话刷新：没有目标就没有要送的对象，
+    # 不该为一个注定失败的一轮占掉额度或刷新凭据。
+    try:
+        host_url = pick_chatgpt_base_url()
+    except UpstreamNotConfigured:
+        raise HTTPException(status_code=503, detail="upstream not configured") from None
     await admit_generation(request, req_token, token)
     # 匿名阶段日志：只打可稳定关联同一账号/会话的哈希前缀，不落 token / cookie / 代理地址。
     logger.info(f"[f_conversation] phase=received seed={_anon(token)} account={_anon(req_token)}")
 
-    host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
     headers, fp, request_cookies, access_token = await _upstream_context(request, req_token, host_url)
 
     proxy_url = fp.pop("proxy_url", None)

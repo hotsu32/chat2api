@@ -14,7 +14,7 @@ from chatgpt.authorization import verify_token, get_req_token, reject_developmen
 from chatgpt.fp import extract_header_fp, get_fp
 from utils.Client import Client
 from utils.Logger import logger
-from utils.configs import chatgpt_base_url_list, sentinel_proxy_url_list, force_no_history, file_host, voice_host, accept_language
+from utils.configs import pick_chatgpt_base_url, UpstreamNotConfigured, sentinel_proxy_url_list, force_no_history, file_host, voice_host, accept_language
 from gateway.frontend_sync import get_session_cookie, refresh_cached_frontend, FrontendSessionError
 from gateway.identity import decode_jwt_payload
 from gateway.sse_parser import extract_data_json, iter_sse_events_async
@@ -426,7 +426,10 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
             if (key.lower() in headers_accept_list)
         }
 
-        base_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
+        # 目标：显式配置的上游。下面这几类端点各有自己的固定目标（匿名 CDN / 文件 CDN /
+        # 沙箱），与账号上游配置无关，先按 path 判定；都不是才取配置的上游——
+        # 显式留空 = 没有目标，本地 503，绝不回落 chatgpt.com。
+        base_url = None
         context = None
         if is_static_asset:
             headers.pop('authorization', None)
@@ -440,6 +443,11 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         if "sandbox" in path:
             base_url = "https://web-sandbox.oaiusercontent.com"
             path = path.replace("sandbox/", "")
+        if base_url is None:
+            try:
+                base_url = pick_chatgpt_base_url()
+            except UpstreamNotConfigured:
+                raise HTTPException(status_code=503, detail="upstream not configured") from None
 
         # 会话隔离：账号身份以 `token` cookie（SeedToken）为准，而非浏览器 Authorization 头里的
         # client-bootstrap JWT（那是账号持有者抓 HTML 时泄漏的凭据，会导致所有用户串号到同一账号）。
