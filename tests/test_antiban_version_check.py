@@ -23,13 +23,11 @@ def _pinned_local_version(monkeypatch):
 
 
 def _explode_on_client(monkeypatch):
-    """任何 AsyncClient 构造都算「发出了请求」。"""
-    import httpx
-
+    """任何生产 Client 构造都算「发出了请求」。"""
     def _explode(*args, **kwargs):
         raise AssertionError("no HTTP client may be constructed when no base URL is configured")
 
-    monkeypatch.setattr(httpx, "AsyncClient", _explode)
+    monkeypatch.setattr(version_check, "Client", _explode)
 
 
 async def test_empty_base_url_list_skips_without_constructing_a_client(monkeypatch, caplog):
@@ -40,7 +38,7 @@ async def test_empty_base_url_list_skips_without_constructing_a_client(monkeypat
     is_drift, message = await version_check.probe_and_compare()
 
     assert is_drift is False
-    assert message == "skipped"
+    assert message == "no-base-url"
     blob = "\n".join(r.getMessage() for r in caplog.records)
     assert "no CHATGPT_BASE_URL configured" in blob
     assert "chatgpt.com" not in blob
@@ -58,19 +56,17 @@ async def test_configured_base_url_is_still_probed(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def get(self, url, headers=None):
+        async def get(self, url, headers=None, **kwargs):
             seen["url"] = url
             return _Response()
 
-    import httpx
+        async def close(self):
+            pass
 
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+        async def discard(self):
+            pass
+
+    monkeypatch.setattr(version_check, "Client", _Client)
 
     is_drift, message = await version_check.probe_and_compare()
 
