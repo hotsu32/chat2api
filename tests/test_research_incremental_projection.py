@@ -313,6 +313,45 @@ def test_delta_envelope_error_survives_later_completion_patches():
     assert "upstream detail" not in json.dumps(view)
 
 
+def test_error_wins_when_same_frame_also_contains_completion_evidence():
+    """An error must not be lost when upstream combines it with completion."""
+    message = assistant_message(
+        status="finished_successfully",
+        end_turn=True,
+        metadata={"is_complete": True},
+    )
+    store, view = run([replace("/message", {
+        "conversation_id": CONVERSATION,
+        "error": "upstream detail",
+        "error_code": "server_error",
+        "message": message,
+    })])
+    assert store.snapshot(CONVERSATION)["state"] == "failed"
+    assert view["projection"]["action"] == rp.ACTION_FAILED
+    assert "upstream detail" not in json.dumps(view)
+
+
+def test_batched_nested_error_survives_later_completion_patches():
+    """A batched operation value is still an error envelope, not a success."""
+    nested = {
+        "conversation_id": CONVERSATION,
+        "error": "nested detail",
+        "error_code": "nested_error",
+        "message": assistant_message(),
+    }
+    frames = [
+        replace("/message", assistant_message()),
+        batch(replace("/message", nested)),
+        replace("/message/status", "finished_successfully"),
+        replace("/message/end_turn", True),
+        replace("/message/metadata/is_complete", True),
+    ]
+    store, view = run(frames)
+    assert store.snapshot(CONVERSATION)["state"] == "failed"
+    assert view["projection"]["action"] == rp.ACTION_FAILED
+    assert "nested detail" not in json.dumps(view)
+
+
 def test_a_cancelled_patch_is_not_a_completion():
     frames = [replace("/message", assistant_message()),
               replace("/message/status", "cancelled")]

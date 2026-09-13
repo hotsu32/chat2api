@@ -470,13 +470,28 @@ def _has_error(payload) -> bool:
     the capture.  Only their presence is used; their values are upstream body
     fragments and are never copied anywhere.
     """
-    for candidate in (payload, payload.get("v") if isinstance(payload.get("v"), dict) else None):
-        if not isinstance(candidate, dict):
+    # Error envelopes have appeared both at the frame root and inside a
+    # batched patch's operation value.  Walk the bounded decoded JSON tree so
+    # the batch form cannot silently turn an upstream failure into success.
+    pending = [(payload, 0)]
+    seen = 0
+    while pending and seen < 128:
+        candidate, depth = pending.pop()
+        if depth > 8:
             continue
-        for key in ("error", "error_code"):
-            value = candidate.get(key)
-            if value is not None and value != "":
-                return True
+        seen += 1
+        if isinstance(candidate, dict):
+            for key in ("error", "error_code"):
+                value = candidate.get(key)
+                if value is not None and value != "":
+                    return True
+            pending.extend((value, depth + 1)
+                           for value in candidate.values()
+                           if isinstance(value, (dict, list)))
+        elif isinstance(candidate, list):
+            pending.extend((value, depth + 1)
+                           for value in candidate
+                           if isinstance(value, (dict, list)))
     return False
 
 
@@ -962,14 +977,14 @@ def project_event(payload, kind=None) -> dict:
         assistant_message = role == ASSISTANT_ROLE
         assistant_answer = (assistant_message and status == "finished_successfully"
                             and end_turn and metadata.get("is_complete") is True)
-        if assistant_message and status in {"failed", "cancelled", "incomplete"}:
+        if _has_error(payload):
+            terminal_state = "failed"
+        elif assistant_message and status in {"failed", "cancelled", "incomplete"}:
             terminal_state = "cancelled" if status == "cancelled" else "failed"
         elif event_type == "message_stream_complete":
             terminal_state = "complete"
         elif assistant_answer:
             terminal_state = "complete"
-        elif _has_error(payload):
-            terminal_state = "failed"
 
         # The answer body, from the same evidence the terminal detection uses:
         # only an assistant message may speak, hidden and tool messages may not,
