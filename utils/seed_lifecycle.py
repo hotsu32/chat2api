@@ -51,13 +51,26 @@ def _entitlement(conn, email, seed, now):
     return '', '', 'shared'
 
 
+def _fleet_health():
+    """The one account state machine. Lazy: fleet_health imports routing at import.
+
+    Every caller must resolve this **before** taking ``store._WRITE_LOCK``
+    (see ``_transition``): importing a module graph while holding that
+    non-reentrant lock can deadlock if the graph itself writes to SQLite.
+    """
+    from utils import fleet_health
+    return fleet_health
+
+
 def _candidate_denial(conn, account, tier, seed, capacity, density, now):
-    from utils import globals
     row = conn.execute('SELECT plan_type, status FROM accounts WHERE token=?', (account,)).fetchone()
     if row is None:
         return 'account_unknown'
-    if (row[1] != 'healthy' or account in globals.error_token_list
-            or account in globals.antiban_dead_tokens):
+    # One state machine for the panel and the routing gate: circuit/persisted dead,
+    # manual disable, degraded, error-listed and unproven rows are all non-routable
+    # here, exactly as the operator view reports them.
+    health = _fleet_health()
+    if health.resolve_account_status(account, row[1]) != health.STATUS_HEALTHY:
         return 'account_not_healthy'
     if row[0] != tier:
         return 'cross_tier'
@@ -98,6 +111,9 @@ def _transition(seed, candidate=None, capacity=None, now=None, *, route=False, f
         raise LifecycleDenied('capacity_unconfigured')
     activating = route or candidate is not None
     now = int(time.time()) if now is None else int(now)
+    # Prewarm the state-machine import outside the write lock; the lock is not
+    # reentrant, so a first-import inside the transaction can deadlock.
+    _fleet_health()
     try:
         with store._WRITE_LOCK, closing(store._connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -140,7 +156,10 @@ def _transition(seed, candidate=None, capacity=None, now=None, *, route=False, f
                                       else list(dict.fromkeys(a for a in [account, *pool] if a)))
                     else:
                         candidates = list(dict.fromkeys(a for a in (account, candidate) if a))
-                    reason = 'account_unknown'
+                    # Route candidates come from the tier pool, so an exhausted pool is
+                    # denied as such instead of borrowing the "unknown account" code:
+                    # the two failures need different operator responses.
+                    reason = 'no_healthy_candidate' if route else 'account_unknown'
                     for target in candidates:
                         reason = _candidate_denial(conn, target, tier, seed, capacity, density, now)
                         if reason is None:

@@ -55,7 +55,11 @@
 
 ### 3.2 保留独立（正交子系统，不迁，不属账号域）
 
-当前健康写入约束：凭据列表同步只维护成员关系和错误信号，不以“凭据仍在列表”证明恢复。已有 disabled、dead、degraded、unhealthy 状态不会因清空错误列表而变为 healthy；账号刷新后仍需有效健康证据。健康扫描仅更新已有且状态未发生变化的 healthy/unhealthy 行，不插入已删除账号，也不覆盖扫描期间的停用或降级决定。写入失败必须报告，不能计入成功探针数。dead 的 dwell 恢复与多个旧状态源的完整统一仍待四线目标验收。
+当前健康写入约束：凭据列表同步只维护成员关系和错误信号，不以“凭据仍在列表”证明恢复。已有 disabled、dead、degraded、unhealthy 状态不会因清空错误列表而变为 healthy；账号刷新后仍需有效健康证据。健康扫描仅更新已有且状态未发生变化的 healthy/unhealthy 行，不插入已删除账号，也不覆盖扫描期间的停用或降级决定。写入失败必须报告，不能计入成功探针数。dead 的 dwell 恢复已有回归覆盖（`tests/test_proxy_route_coupling.py`：代理故障 → 探针失败 → 不可路由；持续成功满 dwell 才重新可路由）。
+
+唯一状态机是 `utils.fleet_health.resolve_account_status`：人工停用 > dead（熔断标记或账号行）> 持久化 degraded > 错误列表 > 已被证实的 healthy；未建模取值与缺失账号行一律落 `unhealthy`。现在**面板与路由闸门读同一个判定**：`utils.routing.project_account_status` 用它产出 `status`（面板三档词表：正常/异常/停用）以及新增的机器可读 `account_status`、`status_label`；`utils.seed_lifecycle._candidate_denial` 也用它决定候选是否可路由。此前面板自带的映射只认账号行三态与错误列表，把 `status='dead'` 的熔断账号投影成「正常」——那是路由会拒绝、面板却说可用的账号。面板的汇总/告警/代理卡计数同样改为按该判定聚合（新增 `accounts_disabled`；`accounts_bad` 只统计 degraded/unhealthy/dead，不含运营主动停用）。运营者路径的全量 `seed_map` 写入收敛仍未处理。
+
+路由候选的排序仍未纳入 `utils/proxy_health` 的逐节点 EWMA：该模块只暴露 `record` 与随机化的 `weighted_choice`，没有单节点健康读取接口，加入会引入随机分配并改动不属于本模块的公开面。当前代理健康对路由的影响是经由探针的（绑定出口 → 探针判定 → 状态 → 闸门），不是候选排序权重。
 
 Seed 到期处理使用 `utils.seed_lifecycle.freeze_if_expired`：在同一 SQLite 事务内重新读取权益，仅冻结，不隐式激活续费用户；保留原账号、档次和会话记录。聊天门禁即时执行，启动时与每60秒的 `seed_expiry` 任务补齐闲置用户的到期状态。安全封禁仍归 `user_auth.status` 管理，普通到期不能禁止登录和续费。
 
@@ -63,7 +67,7 @@ Seed 到期处理使用 `utils.seed_lifecycle.freeze_if_expired`：在同一 SQL
 
 SaaS 进入镜像和切号现经 `route_seed` 在同一事务内选取并激活，读取数据库原绑定而非内存快照。优先恢复原账号；原号不符合条件时，在同档 healthy 候选中优先填充已有绑定的账号，同时遵守容量与独享限制。强制切换排除当前账号，找不到候选时保留绑定。两种 AUTO_SEED 模式都执行 SaaS 约束；镜像无可分配账号时返回503，不以空凭据继续发请求。运营者历史分配路径仍有全量 seed_map 写入，须继续收敛，不能据 SaaS 路径通过就宣布全部写入并发安全。
 
-运营配置 `FLEET_MAX_SHARED_SEEDS_PER_ACCOUNT` 为共享/试用的活跃绑定上限，默认0表示未配置，此时共享/试用分配返回503；独享固定1人。启用共享前必须根据本部署实测设置正整数，测试中的2只是合成测试数据，不能作为上游安全容量结论。冻结绑定不占此计数，恢复时重新检查。请求并发仍由独立准入租约控制。支付后立即分配、绑定失败恢复、代理健康共同路由与真实账号容量校准尚待验收；已有订单在用户再次进入时会经该路由恢复，但不等于支付回调已完成自动分配。
+运营配置 `FLEET_MAX_SHARED_SEEDS_PER_ACCOUNT` 为共享/试用的活跃绑定上限，默认0表示未配置，此时共享/试用分配返回503；独享固定1人。启用共享前必须根据本部署实测设置正整数，测试中的2只是合成测试数据，不能作为上游安全容量结论。冻结绑定不占此计数（`tests/test_seed_route_failclosed.py` 覆盖），恢复时重新检查。请求并发仍由独立准入租约控制。已覆盖的失败路径：受限账号（dead/disabled/degraded/unhealthy/错误列表/熔断标记）一律拒绝且不动已有绑定、跨档候选拒绝、候选池耗尽与强切无候选分别以 `no_healthy_candidate` 拒绝、并发强切后库与内存一致、重启后沿用持久化绑定且不复活冻结 Seed。支付后立即分配、绑定失败恢复与真实账号容量校准尚待验收；已有订单在用户再次进入时会经该路由恢复，但不等于支付回调已完成自动分配。代理健康对路由的影响经探针生效（见上），尚未成为候选排序权重。
 
 容量是**用户可见**的：未配置时三次注册试用的入口不会出现（Dashboard 显示「试用容量暂未开放」），而不是渲染一个必然失败的「开始试用」。该状态由 `gateway/saas.py` 的 `trial_capacity_configured` 驱动，取值仍是同一个 `FLEET_MAX_SHARED_SEEDS_PER_ACCOUNT` —— 不新增第二份容量口径，也不因为有用户点不到试用而放宽默认值。
 
@@ -163,7 +167,7 @@ CREATE TABLE proxies (
 - **付费用量**：Plus/Pro 权益按有效期执行，旧档位配置中的每日次数不再阻断付费聊天。
   历史 usage 仅用于观测；注册试用必须使用独立的成功结算额度，不能混用付费次数统计。
 - **健康**：周期后台任务（挂 `@app.on_event("startup")`）对每账号 `verify_token` → 轻量探活；
-  `status` 三态；与 antiban `circuit` 的 dead 判定整合（避免两套健康判定打架）。
+  账号行的可路由状态；与 antiban `circuit` 的 dead 判定整合为一个折叠判定（避免两套健康判定打架）。持久化列仍只由探针写 healthy/unhealthy，dead/disabled/degraded 由熔断器或人工持有，见 3.2 的唯一状态机。
 - **粘性**：`get_req_token(seed)` 查 `users[seed].current_account`，空则按 `users[seed].plan_type`
   从健康号池分配并写回。会话隔离由 `conversations.seed` 负责。
 - **切换**：`GET /api/account-status`（当前账号健康态 + 匿名身份）+ `POST /api/switch-account`
@@ -178,7 +182,7 @@ CREATE TABLE proxies (
 |-------|------|------------------|
 | **0 持久化底座** | `utils/store.py` + 建表 + 冷启动一次性迁移 JSON→SQLite + globals 改为缓存 | 冷启动后 SQLite 有原 JSON 全部数据；旧 JSON 不再作为真相源；重启幂等 |
 | **1 等级分池** | 导入时解 plan_type/real_email；懒解码写回 | 导入 access_token 后 `accounts.plan_type` 正确；refresh/session 首次换出后写回 |
-| **2 健康检查** | 周期探活 + status 三态 + 与 antiban/error_token 整合 | 坏账号周期后 `status=unhealthy` 且后台可见 |
+| **2 健康检查** | 周期探活 + 唯一账号状态机（healthy/degraded/unhealthy/dead/disabled）+ 与 antiban/error_token 整合 | 坏账号周期后 `status=unhealthy` 且后台可见；面板与路由闸门读同一判定 |
 | **3 粘性路由 + 切换 + 匿名化** | `get_req_token` 走 users 粘性+等级；`/api/account-status` + `/api/switch-account`；`build_session` 匿名化 | 新 seed 自动分号；健康拒切换；坏号切换后返回新号匿名身份，旧会话仍隔离 |
 | **4 用量统计** | 内存计数 + 周期落库 + admin 聚合 | 发 N 次后后台可见用户与账号各 N 次 |
 | **5 管理后台 SPA** | 扩展 `get_dashboard_payload` + `account_proxy_bindings.html`：等级/状态/用量列 + 用户绑定 + 图表 | 后台可见账号 tier/status/usage、用户 tier/当前账号，图表可渲染 |

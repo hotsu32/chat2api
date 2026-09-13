@@ -214,17 +214,38 @@ def get_bound_proxy(req_token):
     return None
 
 
-def _status_label(token, account):
-    """Map the SQLite three-state ``accounts.status`` to the admin-panel label."""
-    status = (account or {}).get("status")
-    if status == "disabled":
-        return "停用"
-    if status == "unhealthy":
-        return "异常"
-    if status == "healthy":
-        return "正常"
-    # Defensive fallback: token present in memory but not yet in accounts table.
-    return "异常" if token in set(globals.error_token_list) else "正常"
+def _fleet_health():
+    """Lazy import to avoid a circular import (fleet_health -> routing.get_bound_proxy)."""
+    from utils import fleet_health
+    return fleet_health
+
+
+# The panel's own vocabulary predates the five-state model and is what the
+# template renders, so it stays three-valued. Every restricted state maps to
+# 异常; only a state the canonical machine actually proved healthy maps to 正常.
+_PANEL_HEALTHY = "正常"
+_PANEL_IMPAIRED = "异常"
+_PANEL_DISABLED = "停用"
+
+
+def project_account_status(token, account):
+    """``(panel label, canonical status, canonical label)`` for one account.
+
+    The panel used to keep its own three-state mapping over ``accounts.status``
+    plus the in-memory error list, which rendered a circuit-dead account (row
+    ``status='dead'``, ``antiban_status='dead'``) as 正常 -- an account the Seed
+    router refuses to bind. Delegating to ``fleet_health.resolve_account_status``
+    makes the operator view and the routing gate read the same state machine.
+    """
+    health = _fleet_health()
+    status = health.resolve_account_status(token, (account or {}).get("status"))
+    if status == health.STATUS_DISABLED:
+        label = _PANEL_DISABLED
+    elif status == health.STATUS_HEALTHY:
+        label = _PANEL_HEALTHY
+    else:
+        label = _PANEL_IMPAIRED
+    return label, status, health.status_label(status)
 
 
 def _antiban_modules():
@@ -264,13 +285,32 @@ def get_dashboard_payload():
     proxies = config.get("proxies", [])
     tokens = list(globals.token_list)
     error_tokens = set(globals.error_token_list)
-    active_tokens = len([token for token in tokens if token not in error_tokens])
+    health = _fleet_health()
+
+    _projected = {}
+
+    def project(token):
+        """Memoised canonical projection; also covers bound tokens off token_list."""
+        if token not in _projected:
+            account = store.get_account(token) or {}
+            _projected[token] = project_account_status(token, account)
+        return _projected[token]
+
+    for token in tokens:
+        project(token)
+    healthy_tokens = {t for t in _projected if _projected[t][1] == health.STATUS_HEALTHY}
+    impaired_tokens = {t for t in _projected if health.is_impaired(_projected[t][1])}
+    dead_tokens = {t for t in _projected if _projected[t][1] == health.STATUS_DEAD}
+    disabled_count = len([
+        t for t in _projected if _projected[t][1] == health.STATUS_DISABLED
+    ])
     grouped_rules = {}
 
     proxy_stats = []
     for proxy in proxies:
         matched_tokens = [token for token, binding in bindings.items() if binding.get("proxy_url") == proxy["proxy_url"]]
-        bad_count = len([token for token in matched_tokens if token in error_tokens])
+        bad_count = len([token for token in matched_tokens if project(token)[1] in health.IMPAIRED_STATUSES])
+        ok_count = len([token for token in matched_tokens if project(token)[1] == health.STATUS_HEALTHY])
         rule_name = None
         if matched_tokens:
             rule_name = bindings[matched_tokens[0]].get("group")
@@ -286,7 +326,7 @@ def get_dashboard_payload():
             "name": proxy["name"],
             "proxy_url": proxy["proxy_url"],
             "accounts": len(matched_tokens),
-            "ok": len(matched_tokens) - bad_count,
+            "ok": ok_count,
             "bad": bad_count,
             "group": rule_name or "-",
         })
@@ -296,7 +336,7 @@ def get_dashboard_payload():
         binding = bindings.get(token, {})
         account_meta = config.get("account_meta", {}).get(token, {})
         acct = store.get_account(token) or {}
-        status = _status_label(token, acct)
+        status, account_status, status_label = project(token)
         proxy_name = binding.get("proxy_name", "-")
         proxy_url = binding.get("proxy_url", "")
         group_name = binding.get("group", "-")
@@ -316,6 +356,8 @@ def get_dashboard_payload():
             "token_masked": mask_token(token),
             "token_type": token_type,
             "status": status,
+            "account_status": account_status,
+            "status_label": status_label,
             "plan_type": acct.get("plan_type") or "-",
             "nickname": acct.get("nickname") or "",
             "antiban_status": _antiban_status(token),
@@ -352,8 +394,10 @@ def get_dashboard_payload():
         })
 
     alerts = []
-    if error_tokens:
-        alerts.append(f"当前有 {len(error_tokens)} 个异常账号，建议优先检查刷新状态。")
+    if impaired_tokens:
+        alerts.append(f"当前有 {len(impaired_tokens)} 个异常账号，建议优先检查刷新状态。")
+    if dead_tokens:
+        alerts.append(f"其中有 {len(dead_tokens)} 个账号已被熔断，需重新取证后才可恢复接量。")
     unbound_count = max(len(tokens) - len(bindings), 0)
     if unbound_count:
         alerts.append(f"还有 {unbound_count} 个账号未绑定固定代理。")
@@ -375,8 +419,9 @@ def get_dashboard_payload():
     return {
         "summary": {
             "accounts_total": len(tokens),
-            "accounts_ok": active_tokens,
-            "accounts_bad": len(error_tokens),
+            "accounts_ok": len(healthy_tokens),
+            "accounts_bad": len(impaired_tokens),
+            "accounts_disabled": disabled_count,
             "proxy_total": len(proxies),
             "group_total": len(grouped_rules),
             "bound_total": len(bindings),
