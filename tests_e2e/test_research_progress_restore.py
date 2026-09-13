@@ -694,3 +694,130 @@ def test_a_non_research_turn_logs_no_research_phase_line(
     with caplog.at_level(logging.INFO):
         assert _turn(client, {'token': SEED}).status_code == 200
     assert 'phase=research_progress' not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# The incremental encoding: what the browser's own turn actually streams
+# ---------------------------------------------------------------------------
+# ``rewrite_f_conversation_body`` forwards the frontend's ``supported_encodings``
+# to the legacy endpoint (see tests/test_m2_stream_encoding.py), so the answer
+# arrives as the delta encoding the new frontend renders from rather than as
+# whole message snapshots.  The shapes below are the protocol's; the bodies are
+# synthetic.  Nothing here claims a captured delta stream.
+
+INCREMENTAL_REPORT = '研究报告：结论正文。'
+
+
+def _incremental_research_stream():
+    frames = [
+        json.dumps({'p': '/message', 'o': 'replace', 'v': {
+            'author': {'role': 'assistant'},
+            'content': {'content_type': 'text', 'parts': []},
+            'status': 'in_progress', 'metadata': {}}}),
+        json.dumps({'p': '/message/content/parts/0', 'o': 'append',
+                    'v': '研究报告：'}),
+        json.dumps({'p': '/message/content/parts/0', 'o': 'append',
+                    'v': '结论正文。'}),
+        json.dumps({'p': '/message/metadata/content_references', 'o': 'replace',
+                    'v': [{'url': 'https://a.test/1'}, {'url': 'https://a.test/2'}]}),
+        json.dumps({'p': '/message/status', 'o': 'replace',
+                    'v': 'finished_successfully'}),
+        json.dumps({'p': '/message/end_turn', 'o': 'replace', 'v': True}),
+        json.dumps({'p': '/message/metadata/is_complete', 'o': 'replace', 'v': True}),
+        '[DONE]',
+    ]
+    return ('data: ' + '\n\ndata: '.join(frames) + '\n\n').encode('utf-8')
+
+
+def test_an_incremental_research_turn_projects_its_answer_and_sources(
+        client, mock_upstream, bound_account, monkeypatch):
+    """A delta-encoded research turn is not a turn with no answer.
+
+    Without the fold these frames are anonymous patches, and the panel reports
+    "upstream sent no body" while the browser has already been handed the whole
+    answer on the same stream.
+    """
+    monkeypatch.setattr(mock_upstream, 'conversation_sse',
+                        _incremental_research_stream())
+    assert client.post('/backend-api/f/conversation', cookies={'token': SEED},
+                       json=_research_payload()).status_code == 200
+
+    body = client.get(PROJECTION, cookies={'token': SEED}).json()
+    projection = body['projection']
+    assert body['state'] == 'complete' and projection['finished'] is True
+    assert projection['report'] == INCREMENTAL_REPORT
+    assert projection['report_final'] is True, 'the frame that ended the turn spoke'
+    assert projection['sources'] == 2
+    assert projection['sources_evidenced'] is True
+    assert 'a.test' not in json.dumps(body), 'a source stays a count, never a value'
+
+
+def test_an_incremental_research_turn_reaches_the_browser_verbatim(
+        client, mock_upstream, bound_account, monkeypatch):
+    """The fold is a projection: the bytes the browser gets are unchanged."""
+    stream = _incremental_research_stream()
+    monkeypatch.setattr(mock_upstream, 'conversation_sse', stream)
+    response = client.post('/backend-api/f/conversation', cookies={'token': SEED},
+                           json=_research_payload())
+    assert response.status_code == 200
+    assert response.content == stream
+
+
+# ---------------------------------------------------------------------------
+# A follow-up plain chat in the same conversation
+# ---------------------------------------------------------------------------
+
+def _plain_chat_stream(text='普通聊天回复。'):
+    frames = [
+        json.dumps({'conversation_id': CONVERSATION, 'message': {
+            'author': {'role': 'assistant'},
+            'content': {'content_type': 'text', 'text': text},
+            'end_turn': True, 'status': 'finished_successfully',
+            'metadata': {'is_complete': True}}}),
+        '[DONE]',
+    ]
+    return ('data: ' + '\n\ndata: '.join(frames) + '\n\n').encode('utf-8')
+
+
+def test_a_follow_up_chat_turn_does_not_resurrect_the_panel_on_a_refresh(
+        client, mock_upstream, bound_account, monkeypatch):
+    """The refresh path must agree with the live path.
+
+    The live panel is retired the moment the conversation's newest turn is an
+    ordinary chat.  A browser that reloads that conversation asks the
+    conversation-scoped route -- and if that route still said "research", the
+    panel would open again, over the chat turn, with the chat turn's state.
+    """
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_report=True).status_code == 200
+    assert client.get(ACTIVE, cookies={'token': SEED}).json()['research'] is True
+
+    # The same conversation, this time a real plain chat: a different answer on
+    # the wire, so nothing about this turn can be mistaken for the research one.
+    monkeypatch.setattr(mock_upstream, 'conversation_sse', _plain_chat_stream())
+    assert _turn(client, {'token': SEED}).status_code == 200
+    assert client.get(ACTIVE, cookies={'token': SEED}).json() == {'research': False}
+
+    restored = client.get(PROJECTION, cookies={'token': SEED}).json()
+    assert restored['research'] is False, 'the panel must stay closed over a chat turn'
+    assert restored['projection']['report'] == RESEARCH_REPORT, \
+        'the retained research answer is not the chat answer, and is not lost'
+    assert restored['projection']['finished'] is True
+
+
+def test_a_second_research_turn_does_not_inherit_the_first_turns_evidence(
+        client, mock_upstream, bound_account, monkeypatch):
+    """Sources and the frozen clock belong to the turn that produced them."""
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_sources=True, with_report=True).status_code == 200
+    first = client.get(PROJECTION, cookies={'token': SEED}).json()['projection']
+    assert first['sources'] == 2
+
+    monkeypatch.setattr(mock_upstream, 'conversation_sse',
+                        _research_stream(with_sources=False))
+    assert _research_turn(client, {'token': SEED}, monkeypatch, mock_upstream,
+                          with_sources=False).status_code == 200
+    second = client.get(PROJECTION, cookies={'token': SEED}).json()['projection']
+    assert second['sources'] == 0, 'the new turn evidenced no sources'
+    assert second['sources_evidenced'] is True, 'it did list an empty list'
+    assert 'a.test' not in json.dumps(second)

@@ -20,6 +20,10 @@ negotiates through ``supported_encodings``.  Everything below therefore keys off
   official research region does not render it in a normal browser (measured on
   a real turn) -- see the report section below for what may and may not be
   shown;
+* both encodings the frontend can negotiate are read: whole message snapshots
+  (the shape the 2026-09-12 capture contains) and the incremental ``{p, o, v}``
+  patches the new frontend renders from (see the incremental section below --
+  the negotiation contract is documented, the delta *bytes* are not captured);
 * the terminal marker reaches the browser exactly once per turn.
 
 Nothing here claims a research turn *succeeded*.  A synthetic stream proves the
@@ -508,6 +512,356 @@ def _walk_sources(node, active, depth, found, state):
             _walk_sources(value, active, depth + 1, found, state)
 
 
+# ---------------------------------------------------------------------------
+# The incremental family: patches instead of whole messages
+# ---------------------------------------------------------------------------
+# ``rewrite_f_conversation_body`` forwards the frontend's ``supported_encodings``
+# to the legacy endpoint, so the browser's turn is answered with the delta
+# encoding that frontend renders from::
+#
+#     {"p": "/message/content/parts/0", "o": "append", "v": "..."}
+#     {"o": "patch", "v": [{"p": ..., "o": ..., "v": ...}, ...], "c": 3}
+#
+# Read as whole messages, every one of those frames is an anonymous patch: the
+# answer they build and the source containers they add are invisible, and a real
+# research turn would reach the panel as "upstream sent no body" while the
+# browser had already been handed the entire answer -- the exact failure the
+# report projection exists to prevent.
+#
+# The fold below is deliberately *not* a JSON-Pointer implementation.  It
+# recognises the paths this protocol uses and ignores every other one, so an
+# unknown path can never write into the state; it stays observable as an event
+# and contributes no claim.  The reconstructed message is then handed to
+# ``project_event`` unchanged, which keeps one set of rules deciding what may be
+# shown: assistant-authored only, hidden/tool/reasoning excluded, bounded body,
+# and completion only on upstream's own end-of-turn evidence.
+#
+# Reconstructed state is per turn (reset in ``begin``), bounded in slots and in
+# characters, and never leaves the server except as the count/label projection.
+_PATCH_OPS = frozenset({"add", "replace", "append", "remove"})
+MAX_PATCH_OPS = 64
+MAX_DELTA_PARTS = 64
+_MAX_DELTA_TOKEN_CHARS = 64
+_MESSAGE_PATH = "/message"
+_MESSAGE_PATH_PREFIX = "/message/"
+_PARTS_PATH = "content/parts"
+_PARTS_PATH_PREFIX = "content/parts/"
+_TEXT_PATH = "content/text"
+_METADATA_PATH_PREFIX = "metadata/"
+# Per-turn ceiling on distinct source identifiers.  The walk is bounded per
+# frame, but the number of frames is not, so without a ceiling a long stream
+# could grow the digest set without limit.  A turn that lists thousands of
+# sources is out of any real range, and the ceiling only stops the count from
+# growing -- it never removes what was already evidenced.
+MAX_SOURCE_DIGESTS = 4096
+# Message statuses that end a turn without completing it.  Only these are read
+# off a patch, and only in the failure direction: completion still needs the
+# full end-of-turn evidence.
+_TERMINAL_STATUSES = {"failed": "failed", "cancelled": "cancelled",
+                      "incomplete": "failed"}
+
+
+def patch_operations(payload) -> list:
+    """The bounded ``(path, op, value)`` list of one incremental frame.
+
+    Both observed envelopes are read: the single patch (``p``/``o``/``v`` at the
+    frame root) and the batch (``o`` plus ``v`` holding a list of patches).  A
+    frame with neither shape yields no operations -- it is not a patch frame,
+    and nothing downstream may read it as one.  Path and operator must be
+    strings; a frame where either is not is not an operation.
+
+    The batch form is only a batch when *every* item really is an operation: a
+    single patch is free to have a list as its *value* (a source container
+    replaced in one patch is exactly that), and reading that as a batch would
+    silently discard the patch.
+    """
+    if not isinstance(payload, dict):
+        return []
+    path, op, batch = payload.get("p"), payload.get("o"), payload.get("v")
+    if isinstance(batch, list) and isinstance(op, str) and batch:
+        operations = [(item["p"], item["o"], item.get("v"))
+                      for item in batch[:MAX_PATCH_OPS]
+                      if isinstance(item, dict) and isinstance(item.get("p"), str)
+                      and _is_operation(item.get("o"))]
+        if len(operations) == min(len(batch), MAX_PATCH_OPS):
+            return operations
+    if isinstance(path, str) and isinstance(op, str):
+        return [(path, op, batch)]
+    return []
+
+
+def _is_operation(op) -> bool:
+    """Whether a value names one of the protocol's patch operators."""
+    return isinstance(op, str) and op.strip().lower() in _PATCH_OPS
+
+
+def new_delta_state() -> dict:
+    """Empty per-turn state for the message an incremental turn is building."""
+    return {
+        # The message this state describes.  A turn can build several in a row
+        # (a tool submessage, then the answer), and everything below describes
+        # one of them, so a new id resets the message-scoped half of the state.
+        "message_id": "",
+        "role": "",
+        "content_type": "",
+        "text": "",
+        "parts": {},
+        "chars": 0,
+        "status": "",
+        "end_turn": None,
+        "recipient": "",
+        "is_complete": False,
+        "hidden": False,
+        "terminal": "",
+        # Turn-scoped: these have already been folded into the record by the
+        # time a message boundary is crossed, so a reset cannot lose them.
+        "containers": set(),
+        "digests": set(),
+        "research_confirmed": False,
+    }
+
+
+def _reset_message_scope(state):
+    """Forget the message being built; keep everything the turn already proved."""
+    state.update({
+        "role": "", "content_type": "", "text": "", "parts": {}, "chars": 0,
+        "status": "", "end_turn": None, "recipient": "", "is_complete": False,
+        "hidden": False, "terminal": "",
+    })
+
+
+def _put_part(state, index: int, text: str, append: bool):
+    """Write one body slot, bounded in slot count and in total characters."""
+    existing = state["parts"].get(index, "")
+    if index not in state["parts"] and len(state["parts"]) >= MAX_DELTA_PARTS:
+        return
+    room = _REPORT_BUILD_LIMIT - (state["chars"] - len(existing))
+    if room <= 0:
+        return
+    combined = (existing + text) if append else text
+    combined = combined[:room]
+    state["chars"] += len(combined) - len(existing)
+    state["parts"][index] = combined
+
+
+def _replace_parts(state, parts):
+    """Replace the whole body from a parts array, clearing what was there.
+
+    A parts array is the message declaring its own content, so a slot it does
+    not fill is empty rather than "keep whatever the previous message left".
+    """
+    state["parts"] = {}
+    state["chars"] = 0
+    if not isinstance(parts, list):
+        return
+    for index, part in enumerate(parts[:MAX_DELTA_PARTS]):
+        _put_part(state, index, part if isinstance(part, str) else "", append=False)
+
+
+def _add_container(state, key: str, value):
+    """Record that upstream listed sources, reducing them to digests at once."""
+    state["containers"].add(key)
+    if len(state["digests"]) >= MAX_SOURCE_DIGESTS:
+        return
+    digests, _ = _collect_sources({key: value})
+    state["digests"].update(digests)
+
+
+def seed_delta_state(state, message):
+    """Fold a whole message object into the incremental state.
+
+    The capture contains frames that carry a message envelope *and* patch fields
+    in the same body; seeding first keeps those frames projected exactly as they
+    were, with any patches applied on top of them.
+
+    A message object that names a *different* message than the one being built
+    starts a new one: without that, a tool submessage's ``recipient`` would
+    still be in force when the answer's body arrived and the answer would be
+    excluded as a tool payload, and the answer would be appended to the tool
+    message's body.  Both are wrong in opposite directions, so the boundary is
+    read from the protocol's own name for the message.
+
+    The assumption this rests on, stated rather than implied: a message object
+    that carries *no* id is folded into the message already being built, because
+    the capture shows an ``id`` on every message object and there is no other
+    way to tell a refresh from an introduction.  The failure direction is the
+    safe one -- at worst an answer stays unshown, never misattributed.
+    """
+    if not isinstance(message, dict):
+        return
+    message_id = message.get("id")
+    if isinstance(message_id, str) and message_id:
+        if state["message_id"] and message_id != state["message_id"]:
+            _reset_message_scope(state)
+        state["message_id"] = message_id
+    author = message.get("author") if isinstance(message.get("author"), dict) else {}
+    role = _token(author.get("role"))
+    if role:
+        state["role"] = role
+    if "recipient" in message:
+        # Authoritative, including "no recipient": this is the message's own
+        # object saying what it is.
+        state["recipient"] = _token(message.get("recipient"))
+    status = message.get("status")
+    if isinstance(status, str) and status.strip():
+        state["status"] = status.strip()[:_MAX_DELTA_TOKEN_CHARS]
+        state["terminal"] = _TERMINAL_STATUSES.get(state["status"], "")
+    if isinstance(message.get("end_turn"), bool):
+        state["end_turn"] = message["end_turn"]
+    content = message.get("content") if isinstance(message.get("content"), dict) else {}
+    content_type = content.get("content_type")
+    if isinstance(content_type, str) and content_type.strip():
+        state["content_type"] = content_type.strip()[:_MAX_DELTA_TOKEN_CHARS]
+    if isinstance(content.get("text"), str) and content["text"]:
+        state["text"] = content["text"][:_REPORT_BUILD_LIMIT]
+    if isinstance(content.get("parts"), list):
+        _replace_parts(state, content["parts"])
+    metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    for key in _SOURCE_CONTAINER_KEYS:
+        if key in metadata:
+            _add_container(state, key, metadata[key])
+    if _is_hidden_message(metadata):
+        state["hidden"] = True
+    if metadata.get("is_complete") is True:
+        state["is_complete"] = True
+    if metadata.get("deep_research_version") not in (None, "", False):
+        state["research_confirmed"] = True
+
+
+def _apply_patch(state, path, op, value):
+    """Fold one patch into the state; an unrecognised path writes nothing."""
+    if not isinstance(path, str) or not isinstance(op, str):
+        return
+    op = op.strip().lower()
+    if op not in _PATCH_OPS:
+        return
+    if path in ("", _MESSAGE_PATH):
+        # ``/message`` is where a whole message object is introduced.
+        if isinstance(value, dict):
+            seed_delta_state(state, value)
+        return
+    if not path.startswith(_MESSAGE_PATH_PREFIX):
+        return
+    field = path[len(_MESSAGE_PATH_PREFIX):]
+    if field == "content/content_type":
+        if isinstance(value, str) and value.strip():
+            state["content_type"] = value.strip()[:_MAX_DELTA_TOKEN_CHARS]
+        return
+    if field == _TEXT_PATH:
+        if op == "remove":
+            state["text"] = ""
+        elif isinstance(value, str):
+            # ``append`` concatenates, like the parts form does.
+            combined = (state["text"] + value) if op == "append" else value
+            state["text"] = combined[:_REPORT_BUILD_LIMIT]
+        return
+    if field == _PARTS_PATH:
+        if op == "remove":
+            state["parts"] = {}
+            state["chars"] = 0
+        elif isinstance(value, list):
+            # Only a real array replaces the body: a malformed patch must not be
+            # able to clear a body upstream already streamed.
+            _replace_parts(state, value)
+        return
+    if field.startswith(_PARTS_PATH_PREFIX):
+        index = field[len(_PARTS_PATH_PREFIX):]
+        if not index.isdigit():
+            return
+        index = int(index)
+        if index >= MAX_DELTA_PARTS:
+            return
+        if op == "remove":
+            state["chars"] -= len(state["parts"].pop(index, ""))
+        elif isinstance(value, str) and value:
+            _put_part(state, index, value, append=(op == "append"))
+        return
+    if field == "status":
+        if isinstance(value, str) and value.strip():
+            state["status"] = value.strip()[:_MAX_DELTA_TOKEN_CHARS]
+            # Only the failure direction is read here.  Completion still needs
+            # upstream's full end-of-turn evidence -- and a *user* echo cannot
+            # end a turn this way, because the echo names its author and the
+            # projection excludes a non-assistant message from the pass below.
+            state["terminal"] = _TERMINAL_STATUSES.get(state["status"], "")
+        return
+    if field == "end_turn":
+        if isinstance(value, bool):
+            state["end_turn"] = value
+        return
+    if field == "recipient":
+        state["recipient"] = _token(value)
+        return
+    if field == "author/role":
+        state["role"] = _token(value)
+        return
+    if field.startswith(_METADATA_PATH_PREFIX):
+        key = field[len(_METADATA_PATH_PREFIX):]
+        if key in _SOURCE_CONTAINER_KEYS:
+            # A removal is not the same statement as a listing: "upstream
+            # dropped its source list" must not read as "upstream listed none".
+            if op != "remove":
+                _add_container(state, key, value)
+        elif key == "is_complete":
+            if value is True:
+                state["is_complete"] = True
+        elif key == "is_visually_hidden_from_conversation":
+            if value is True:
+                state["hidden"] = True
+        elif key == "deep_research_version":
+            if value not in (None, "", False):
+                state["research_confirmed"] = True
+
+
+def synthesise_delta_message(state) -> dict:
+    """The message object the incremental state adds up to.
+
+    Handed to ``project_event`` so exactly the same rules decide what may be
+    shown.  Container keys are synthesised as *presence markers* with no value:
+    the digests were computed from the patch value as it arrived, never carried.
+    """
+    metadata = {}
+    if state["containers"]:
+        metadata.update({key: [] for key in sorted(state["containers"])})
+    if state["hidden"]:
+        metadata["is_visually_hidden_from_conversation"] = True
+    if state["is_complete"]:
+        metadata["is_complete"] = True
+    if state["research_confirmed"]:
+        # Presence marker only: this module never reads the version's value.
+        metadata["deep_research_version"] = True
+    message = {
+        "author": {"role": state["role"]},
+        "content": {"content_type": state["content_type"],
+                    "parts": [state["parts"][index] for index in sorted(state["parts"])]},
+        "status": state["status"],
+        "recipient": state["recipient"],
+        "metadata": metadata,
+    }
+    if state["text"]:
+        # The capture's own answer frame carries the body here, so a turn that
+        # patched it must be able to say so.
+        message["content"]["text"] = state["text"]
+    if state["end_turn"] is not None:
+        message["end_turn"] = state["end_turn"]
+    return {"v": {"message": message}}
+
+
+def fold_delta(payload, state) -> dict:
+    """Fold one incremental frame into ``state``; return the message it builds.
+
+    Always returns a payload.  A frame the fold could not read adds nothing to
+    the state, and the synthesised message then says nothing new -- which is why
+    an unknown patch path can never become an activity claim or a body.
+    """
+    if not isinstance(state, dict) or not state:
+        state = new_delta_state()
+    seed_delta_state(state, _message_of(payload))
+    for path, op, value in patch_operations(payload):
+        _apply_patch(state, path, op, value)
+    return synthesise_delta_message(state)
+
+
 def project_event(payload, kind=None) -> dict:
     """Project a real upstream event into credential-free UI state.
 
@@ -835,6 +1189,10 @@ class _Progress:
         self.report = ""
         self.report_final = False
         self.report_truncated = False
+        # Per-turn state for the incremental family: the message an incremental
+        # turn builds patch by patch.  Reset by ``begin`` with the rest of the
+        # turn's state, so a new turn never inherits the previous one's body.
+        self.delta = new_delta_state()
 
     def projection(self, now):
         """The browser-facing view: whitelisted keys, no upstream text."""
@@ -891,19 +1249,7 @@ class ResearchProgressStore:
                 self._records[conversation_id] = record
                 self._evict_conversations()
             else:
-                # A new turn supersedes the previous terminal marker; keeping it
-                # would report "finished" while the new turn is still running.
-                record.events = [e for e in record.events if e["kind"] != KIND_TERMINAL]
-                record.terminal = False
-                record.state = "streaming"
                 record.updated_at = time.time()
-                # Elapsed time is per turn: the frozen clock of the previous
-                # turn must not be inherited by this one.
-                record.started_at = record.updated_at
-                record.finished_at = None
-                record.report = ""
-                record.report_final = False
-                record.report_truncated = False
                 # Sticky: the conversation keeps its retained research turn for
                 # the restore route.  Per-turn: this turn decides whether the
                 # research panel is current, so a chat turn on the same
@@ -911,7 +1257,44 @@ class ResearchProgressStore:
                 record.research = record.research or bool(research)
                 record.current_turn_research = bool(research)
                 if research:
+                    # A new research turn supersedes the previous turn's
+                    # *projection* outright: its terminal marker, clock, answer
+                    # and every accumulated evidence field belong to the turn
+                    # that is running now.  The retained event log and its
+                    # counters stay cumulative on purpose -- they are the
+                    # forensic record of the conversation, bounded by
+                    # ``_evict_events``, and resetting them would throw away the
+                    # only copy of what upstream actually sent.
+                    record.events = [e for e in record.events
+                                     if e["kind"] != KIND_TERMINAL]
+                    record.terminal = False
+                    record.state = "streaming"
+                    record.started_at = record.updated_at
+                    record.finished_at = None
+                    record.report = ""
+                    record.report_final = False
+                    record.report_truncated = False
+                    record.delta = new_delta_state()
                     record.action = ACTION_STARTING
+                    # Every field a projection accumulates describes the turn
+                    # that produced it.  Carrying one of them over would report
+                    # the previous turn's sources, markers or tool as this
+                    # turn's -- evidence this turn never produced.
+                    record.family = ""
+                    record.tool = ""
+                    record.markers = []
+                    record.content_types = []
+                    record.source_digests = set()
+                    record.sources_evidenced = False
+                    record.urls_moderated = 0
+                    record.research_confirmed = False
+                # A plain chat turn on the same conversation deliberately leaves
+                # the research projection alone: the panel is retired by the
+                # per-turn flag above, while the frozen clock and the answer the
+                # research turn produced stay restorable -- which is what a
+                # refresh onto that conversation is asking for.  Overwriting them
+                # with the chat turn's own state is how a refresh used to bring
+                # the panel back with an empty report over an unrelated turn.
             return True
 
     def record(self, conversation_id: str, event: bytes):
@@ -937,10 +1320,45 @@ class ResearchProgressStore:
             elif kind == KIND_OTHER_JSON and isinstance(payload, dict):
                 fingerprint = structure_fingerprint(payload)
                 record.unknown[fingerprint] = record.unknown.get(fingerprint, 0) + 1
-            if record.research and isinstance(payload, dict):
-                self._apply_projection(record, project_event(payload, kind))
+            if record.current_turn_research and isinstance(payload, dict):
+                self._apply_projection(record, self._project(record, payload, kind))
             self._evict_events(record)
             self._records.move_to_end(conversation_id)
+
+    def _project(self, record, payload, kind):
+        """One frame's projection, folding the incremental family first.
+
+        A patch frame carries no message object, so it is folded into the turn's
+        incremental state and projected as the message that state adds up to.
+        Source digests are computed from the patch value as it arrives -- the
+        same bounded walk the snapshot path uses -- and merged here, so an
+        incremental turn can evidence sources without the store ever keeping a
+        source value.
+        """
+        if kind != KIND_MESSAGE_DELTA:
+            return project_event(payload, kind)
+        projection = project_event(fold_delta(payload, record.delta), kind)
+        if record.delta["digests"]:
+            projection["source_digests"] = sorted(
+                set(projection["source_digests"]) | record.delta["digests"])
+        explicit = record.delta.get("terminal")
+        if explicit and not projection.get("terminal_state") \
+                and record.delta.get("role") in ("", ASSISTANT_ROLE):
+            # A failure or cancellation upstream stated on the message it was
+            # building.  Only the failure direction is read from a patch: a
+            # cancelled turn replayed without a named author would otherwise be
+            # recorded complete by the transport's own ``[DONE]`` marker, and
+            # erring toward "failed" is the honest direction.  A message
+            # upstream positively attributed to someone else is left alone.
+            #
+            # The consequence is accepted rather than accidental: a *tool*
+            # submessage that fails freezes the whole turn as failed even if the
+            # answer arrives afterwards.  The snapshot path has always behaved
+            # this way -- its failure branch deliberately does not require
+            # ``end_turn`` -- and a turn whose own record says it failed is the
+            # honest reading of that stream.
+            projection["terminal_state"] = explicit
+        return projection
 
     def _apply_projection(self, record, projection):
         """Fold one event's projection into the record, within fixed bounds."""
@@ -961,7 +1379,8 @@ class ResearchProgressStore:
         if projection.get("research_confirmed"):
             record.research_confirmed = True
         record.urls_moderated += projection.get("urls_moderated") or 0
-        record.source_digests.update(projection.get("source_digests") or ())
+        if len(record.source_digests) < MAX_SOURCE_DIGESTS:
+            record.source_digests.update(projection.get("source_digests") or ())
         # Report precedence, decided by evidence rather than by arrival order:
         # the frame that ends the turn carries the answer and outranks any
         # interim body, while a later interim frame must not overwrite it.  Two
@@ -1099,9 +1518,16 @@ class ResearchProgressStore:
             return self._view(record, now)
 
     def _view(self, record, now):
-        """The browser-facing shape shared by both read paths."""
+        """The browser-facing shape shared by both read paths.
+
+        ``research`` is the panel's own show/hide bit and answers "is a research
+        turn current for this conversation", not "did one ever run here".  A
+        conversation whose newest turn is an ordinary chat still *serves* its
+        retained research projection -- the frozen clock and the answer stay
+        readable -- but it does not ask the panel to open over that chat turn.
+        """
         return {
-            "research": True,
+            "research": bool(record.current_turn_research),
             # The panel needs the id to tell "this is the turn I am watching"
             # from "an older research turn on the same account".
             "conversation_id": record.conversation_id,
