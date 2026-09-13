@@ -32,7 +32,7 @@
 ### 配置（`.env` 或 docker-compose environment）
 
 ```yaml
-ENABLE_ANTIBAN: 'true'                   # 总开关
+ENABLE_ANTIBAN: 'true'                   # 总开关（仅单 Worker；声明多 Worker 时启动失败）
 STRICT_IP_BINDING: 'true'                # 严格 IP 绑定（有代理池时开）
 BUCKET_MAX_ACCOUNTS_PER_IP: '5'          # 每个 IP 容纳的账号数
 ACCOUNT_MIN_INTERVAL_SECONDS: '60'       # Team/Plus 最小间隔
@@ -53,6 +53,20 @@ CIRCUIT_BUCKET_HEAL_MINUTES: '30'        # 桶自愈扫描间隔
 ```
 
 运行中：管理后台 → "代理与路由" 可看到每个桶的状态（healthy/degraded/dead）。
+
+匿名指标快照（部署形态 / 死号存量 / 各模块计数器）在管理后台
+`GET /admin/antiban/metrics`（带 `API_PREFIX` 时同前缀），与其它后台接口共用
+`require_admin_auth`。响应只有计数与有界枚举，不含 token、桶 id 或代理串。
+
+### 边界
+
+- **只支持单 Worker。** 状态（并发租约、冷却、熔断）都是进程内的。声明 worker 数 > 1
+  （`WEB_CONCURRENCY` / `UVICORN_WORKERS` / `GUNICORN_WORKERS` / `WORKERS`）且没有共享
+  协调层时启动直接失败，不会按「worker 数 × 上限」静默放行。注意该检测只看环境变量，
+  `uvicorn --workers N` / `gunicorn -w N` 这类命令行声明不在检测范围内。
+- **死号状态是持久的。** 被判死的账号会写入 `data/antiban_dead.json` 并回写 SQLite
+  `accounts.status`；把 `ENABLE_ANTIBAN` 关掉**不会**清除它们——这是有意的：
+  死号恢复走号池的探活 + dwell 契约，而不是靠翻开关。
 
 ---
 

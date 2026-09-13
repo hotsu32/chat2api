@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 import utils.globals as globals
 from utils import configs
+from utils.antiban.concurrency import anon_id
 from utils.Logger import logger
 from utils.routing import get_routing_config, update_single_binding
 
@@ -151,7 +152,7 @@ def assign_account(token: str) -> Optional[str]:
         # 所有同档桶都满了/不健康；严格模式拒绝漂移；宽松模式 → 拒绝分配让上游走默认
         if configs.strict_ip_binding:
             logger.warning(
-                f"[antiban] no healthy bucket for token {token[:12]}... "
+                f"[antiban] no healthy bucket for {anon_id(token)} "
                 f"(plan_type={plan_type}, strict_ip_binding=True); caller must handle"
             )
         return None
@@ -177,7 +178,7 @@ def assign_account(token: str) -> Optional[str]:
         logger.error(f"[antiban] failed to persist binding to routing_config: {e}")
 
     logger.info(
-        f"[antiban] token {token[:12]}... assigned to bucket "
+        f"[antiban] {anon_id(token)} assigned to bucket "
         f"{bucket.get('proxy_name','?')} ({len(bucket['accounts'])}/{configs.bucket_max_accounts_per_ip})"
     )
     return bucket_id

@@ -10,7 +10,7 @@
      时必须 fail closed，不能因为读不到时间就当作已恢复。
   3. **不能在多 Worker 下假装安全。** 本层状态是进程内字典，多 Worker 时每号并发
      上限是「每 Worker 一份」，实际并发 = worker 数 × 上限。没有共享协调层就必须
-     把这件事变成可查询、可告警的事实，而不是静默放行。
+     fail closed：启动期拒绝，而不是把「worker 数 × 上限」当成上限静默放行。
 
 隔离：不发任何网络请求，不写真实 data/（持久化全部打桩）。
 """
@@ -24,7 +24,11 @@ import pytest
 
 import utils.configs as configs
 import utils.globals as globals
-from utils.antiban import bucket, circuit, concurrency, cooldown, guard
+from utils.antiban import bucket, circuit, concurrency, cooldown, fingerprint, guard
+
+# 在 autouse fixture 打桩之前抓住真函数：`_isolate` 把 bucket.assign_account
+# 换成 no-op，好让准入类测试不必真的分桶；日志卫生测试必须跑真实现。
+_real_assign_account = bucket.assign_account
 
 # 测试专用假凭据。断言「它不出现在指标/日志里」，而不是断言真值。
 FAKE_TOKEN = "eyJhbGciOiJIUzI1NitestonlyMETRICS135790"
@@ -372,8 +376,12 @@ def test_coordination_reports_disabled_when_antiban_off(monkeypatch):
     assert guard.coordination_status()["mode"] == guard.COORDINATION_DISABLED
 
 
-async def test_init_logs_the_coordination_gap_loudly(monkeypatch, caplog, _isolate):
-    """多 Worker 无协调层必须显式告警，不能只在文档里写一句。"""
+async def test_init_refuses_declared_multi_worker_without_a_coordinator(monkeypatch, caplog, _isolate):
+    """多 Worker 无协调层必须启动期拒绝（fail closed），不能降级放行。
+
+    RED 形态：旧实现只打一行 ERROR 然后照常启用——真实每号并发会是
+    worker 数 × 上限，但对外仍宣称受保护。
+    """
     import asyncio
 
     from utils.antiban import version_check
@@ -381,16 +389,48 @@ async def test_init_logs_the_coordination_gap_loudly(monkeypatch, caplog, _isola
     caplog.set_level(logging.DEBUG)
     monkeypatch.setenv("WEB_CONCURRENCY", "4")
     monkeypatch.setattr(bucket, "bulk_assign", lambda tokens: {"assigned": 0, "skipped": 0})
-    # 不得真的发版本探测请求
+    # 不得真的发版本探测请求（拒绝发生在探测之前，这里只是兜底）
     monkeypatch.setattr(version_check, "probe_and_compare", _noop_async)
 
-    await guard.init()
+    with pytest.raises(guard.UncoordinatedMultiWorkerError):
+        await guard.init()
     await asyncio.sleep(0)
 
     blob = _blob(caplog)
     assert "multi_process_uncoordinated" in blob
     records = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert records, "an uncoordinated multi-worker deployment must be logged at ERROR"
+    assert records, "拒绝启动前必须留下 ERROR 级证据，说明为什么拒绝"
+
+
+async def test_init_proceeds_when_exactly_one_worker_is_declared(monkeypatch, caplog, _isolate):
+    """单 Worker 是当前shipped 形态，必须照常启用。"""
+    from utils.antiban import version_check
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setenv("WEB_CONCURRENCY", "1")
+    assigned = []
+    monkeypatch.setattr(
+        bucket, "bulk_assign", lambda tokens: assigned.append(list(tokens)) or {"assigned": 0, "skipped": 0}
+    )
+    monkeypatch.setattr(version_check, "probe_and_compare", _noop_async)
+
+    await guard.init()
+
+    assert assigned, "单 Worker 下 bulk_assign 必须照常执行"
+    assert "coordination=single_process " in _blob(caplog)
+
+
+async def test_init_proceeds_when_no_worker_count_is_declared(monkeypatch, caplog, _isolate):
+    """未声明 worker 数沿用 shipped 默认（单进程），不得因此拒绝启动。"""
+    from utils.antiban import version_check
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(bucket, "bulk_assign", lambda tokens: {"assigned": 0, "skipped": 0})
+    monkeypatch.setattr(version_check, "probe_and_compare", _noop_async)
+
+    await guard.init()
+
+    assert "coordination=single_process_assumed " in _blob(caplog)
 
 
 def test_metrics_snapshot_exposes_coordination_status(monkeypatch):
@@ -435,3 +475,57 @@ def test_metrics_snapshot_does_not_expose_dead_token_identity():
     snap = metrics_snapshot()
     assert FAKE_TOKEN not in json.dumps(snap, ensure_ascii=False)
     assert snap["counts"]["dead_accounts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 6. 日志卫生：账号标识一律匿名摘要，token 前缀不算脱敏
+# ---------------------------------------------------------------------------
+
+def test_bucket_assignment_logs_carry_no_token_prefix(monkeypatch, caplog, _isolate):
+    """批量分配发生在启动期，正是冒烟抓日志的时刻。
+
+    RED 形态：旧实现打 `token[:12]`。前缀可直接比对/关联账号，属于凭据泄漏面。
+    """
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(configs, "strict_ip_binding", True)
+    monkeypatch.setattr(bucket, "_persist", lambda: None)
+    monkeypatch.setattr(bucket, "update_single_binding", lambda *a, **kw: None)
+    monkeypatch.setattr(bucket, "assign_account", _real_assign_account)
+    _put_bucket(BUCKET_ID, status="healthy")
+
+    assert bucket.assign_account(FAKE_TOKEN) == BUCKET_ID
+
+    blob = _blob(caplog)
+    assert FAKE_TOKEN not in blob
+    for n in (6, 8, 10, 12, 16):
+        assert FAKE_TOKEN[:n] not in blob, f"token prefix of length {n} leaked into bucket logs"
+    assert concurrency.anon_id(FAKE_TOKEN) in blob
+
+
+def test_bucket_refusal_log_carries_no_token_prefix(monkeypatch, caplog, _isolate):
+    """所有桶都不可用时的拒绝日志同样只能有匿名标识。"""
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(configs, "strict_ip_binding", True)
+    monkeypatch.setattr(bucket, "_persist", lambda: None)
+    monkeypatch.setattr(bucket, "assign_account", _real_assign_account)
+    monkeypatch.setattr(bucket, "_pick_least_loaded_healthy", lambda plan_type: None)
+
+    assert bucket.assign_account(FAKE_TOKEN) is None
+
+    blob = _blob(caplog)
+    for n in (6, 8, 10, 12, 16):
+        assert FAKE_TOKEN[:n] not in blob, f"token prefix of length {n} leaked into bucket logs"
+    assert concurrency.anon_id(FAKE_TOKEN) in blob
+
+
+def test_fingerprint_extension_log_carries_no_token_prefix(monkeypatch, caplog, _isolate):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(fingerprint, "_persist_fp", lambda: None)
+
+    fingerprint.ensure_extended(FAKE_TOKEN)
+
+    blob = _blob(caplog)
+    assert FAKE_TOKEN not in blob
+    for n in (6, 8, 10, 12, 16):
+        assert FAKE_TOKEN[:n] not in blob, f"token prefix of length {n} leaked into fingerprint logs"
+    assert concurrency.anon_id(FAKE_TOKEN) in blob

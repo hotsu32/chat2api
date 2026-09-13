@@ -390,7 +390,7 @@ curl -N 'http://127.0.0.1:5005/${API_PREFIX}/v1/chat/completions' \
 | 功能 | `RANDOM_TOKEN` | `true` | 随机选取后台 Token（关闭则顺序轮询） |
 | 网关 | `ENABLE_GATEWAY` | `false` | 启用官网镜像；开启后默认无认证，需配 `AUTH_KEY` 或 IP 白名单 |
 | 网关 | `AUTO_SEED` | `true` | 启用随机账号模式（`seed` 参数自动匹配账号） |
-| Antiban | `ENABLE_ANTIBAN` | `false`（multi 默认 `true`） | 风控规避层：IP 粘性桶 / 地域一致性 / 熔断自愈 |
+| Antiban | `ENABLE_ANTIBAN` | `false`（multi 默认 `true`） | 风控规避层：IP 粘性桶 / 地域一致性 / 熔断自愈。状态是进程内的，因此只支持单 Worker：声明多 Worker（`WEB_CONCURRENCY`/`UVICORN_WORKERS`/`GUNICORN_WORKERS`/`WORKERS` > 1）且无共享协调层时启动会直接失败，不会按「worker 数 × 上限」静默放行 |
 | Antiban | `STRICT_IP_BINDING` | `true` | 无匹配代理时拒绝（不退化到母机直连） |
 | Antiban | `BUCKET_MAX_ACCOUNTS_PER_IP` | `5`（multi 默认 `1`） | 每 IP 桶容纳的账号数 |
 | Antiban | `CIRCUIT_429_COOLDOWN` | `1800` | 429 触发后账号冷却秒数 |

@@ -43,12 +43,16 @@ anon_id = concurrency.anon_id
 # 本层的状态（并发租约、冷却、退避等级、网络错误计数）全部是**进程内**字典。
 # 单进程时它们就是全局真相；多 Worker 时每个 Worker 各持一份，于是
 # 「每号并发上限 N」的实际效果是 worker 数 × N，冷却窗口也会被稀释。
-# 在没有共享协调层（Redis 等）之前，这不能靠文档一句话糊过去：
-# 必须变成可查询、可告警的事实，禁止静默 fail-open。
 #
-# 本模块只做**检测与报告**。拒绝放行属于部署策略，需要 configs/app 层开关，
-# 已作为接口建议提交主控（见交付报告），不在本层擅自 fail closed——
-# 那会让所有多 Worker 部署直接 503。
+# 当前契约（最小且可证伪）：
+#   * 单 Worker / 未声明 worker 数：正常启用，coordination 字段如实标注
+#     capacity_is_global=False（未声明时是「假定单进程」，不是「保证」）。
+#   * 声明 worker 数 > 1 且没有共享协调层：**启动期拒绝**（fail closed）。
+#     没有 Redis 之类的共享后端时，多 Worker 下本层无法兑现它宣称的账号保护，
+#     静默按每 Worker 上限放行等于把「worker 数 × 上限」的真实并发当成上限。
+#     与其降级运行并让人误以为已受保护，不如拒绝启动，把问题交给部署方：
+#     要么回到单 Worker，要么先落地共享协调层。
+# 判定与拒绝都放在 antiban 层，因为它才是唯一知道自身协调能力的地方。
 # ---------------------------------------------------------------------------
 COORDINATION_DISABLED = "disabled"
 COORDINATION_SINGLE_PROCESS = "single_process"
@@ -57,6 +61,14 @@ COORDINATION_MULTI_PROCESS_UNCOORDINATED = "multi_process_uncoordinated"
 
 # 进程模型由部署方声明。这不是凭据，只是 worker 数量。
 _WORKER_ENV_VARS = ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS", "WORKERS")
+
+
+class UncoordinatedMultiWorkerError(RuntimeError):
+    """antiban 已启用，但部署声明了多个 worker 且没有共享协调层。
+
+    进程内状态无法在多 Worker 间共享，容量与冷却会被按 worker 数稀释。
+    启动期抛此异常即 fail closed：拒绝在无法兑现保护的情况下运行。
+    """
 
 
 def _declared_workers() -> Optional[int]:
@@ -107,6 +119,26 @@ def _log_coordination_status(status: Dict[str, Any]) -> None:
         )
         return
     logger.info(f"[antiban] coordination={status['mode']} capacity_scope=process")
+
+
+def _refuse_uncoordinated_multi_worker(status: Dict[str, Any]) -> None:
+    """声明多 Worker 且无共享协调层 → 启动期拒绝（fail closed）。
+
+    先记 ERROR 再抛：日志留下「为什么拒绝了」，异常让进程起不来，
+    两条证据都需要，缺一条就会变成「静默降级」。
+    """
+    if status["mode"] != COORDINATION_MULTI_PROCESS_UNCOORDINATED:
+        return
+    _log_coordination_status(status)
+    raise UncoordinatedMultiWorkerError(
+        f"antiban is enabled but {status['declared_workers']} workers are declared and no "
+        f"shared coordinator is configured. Per-account concurrency, cooldown and circuit "
+        f"state are process-local, so effective per-account concurrency would be "
+        f"workers x cap and cooldowns would be diluted. Refusing to start: run a single "
+        f"worker, or deploy a shared coordinator before enabling ENABLE_ANTIBAN. "
+        f"(Worker count is read from {'/'.join(_WORKER_ENV_VARS)}; a platform-injected "
+        f"value you do not control can be unset or pinned to 1.)"
+    )
 
 
 def redact_proxy(proxy_url: Optional[str]) -> str:
@@ -193,8 +225,10 @@ async def init() -> None:
         logger.info("[antiban] disabled; original behavior preserved")
         return
 
-    # 先把部署形态说清楚：多 Worker 无协调层必须显式告警，不能静默按本进程上限放行
-    _log_coordination_status(coordination_status())
+    # 先把部署形态说清楚：多 Worker 无协调层必须启动即拒绝，不能静默按本进程上限放行
+    status = coordination_status()
+    _refuse_uncoordinated_multi_worker(status)
+    _log_coordination_status(status)
 
     # 冷启动：把已加载 tokens 批量分配到桶（已绑定则跳过）
     try:

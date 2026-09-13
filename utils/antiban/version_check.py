@@ -1,7 +1,7 @@
 """D4: 客户端版本启动时自检。
 
 策略：
-  1. 启动时 GET https://chatgpt.com/，从 HTML 中提取 data-build 属性；
+  1. 启动时 GET CHATGPT_BASE_URL/（未配置则跳过，不回落到真实主机），从 HTML 中提取 data-build 属性；
   2. 与本地 configs.oai_client_version / oai_client_build_number 比对；
   3. 偏差大（前缀完全不同 或 build 号差距 > 阈值）→ 日志告警，
      提示用户手工同步避免"客户端版本过旧"风控。
@@ -57,7 +57,13 @@ async def probe_and_compare() -> Tuple[bool, str]:
     local_version = configs.oai_client_version or ""
     local_build_num = configs.oai_client_build_number
 
-    base_urls = configs.chatgpt_base_url_list or ["https://chatgpt.com"]
+    base_urls = configs.chatgpt_base_url_list
+    if not base_urls:
+        # 显式把 CHATGPT_BASE_URL 留空的部署，意图就是「不要碰真实主机」。
+        # 回落硬编码 https://chatgpt.com 会在启动期制造一次计划外外发，
+        # 而本探测只做告警、不强制更新——跳过比偷偷出网更符合它的定位。
+        logger.info("[antiban] version_check skipped (no CHATGPT_BASE_URL configured)")
+        return False, "skipped"
     target = (base_urls[0] if isinstance(base_urls, list) else base_urls).rstrip("/")
 
     try:

@@ -18,15 +18,19 @@
 
 边界声明：
   本层状态全部是**进程内**字典。多 Worker 部署下每号并发上限、冷却与熔断状态
-  都是「每 Worker 一份」，实际并发 = worker 数 × 上限。coordination 字段把这件事
-  变成可查询事实；在共享协调层落地之前，不得声称多 Worker 安全。
+  都是「每 Worker 一份」，实际并发 = worker 数 × 上限。
+
+  因此当前契约是 fail closed：声明 worker 数 > 1 且没有共享协调层时，
+  init() 直接抛 UncoordinatedMultiWorkerError，启动即失败——宁可起不来，
+  也不在无法兑现保护的情况下假装受保护。单 Worker（或未声明 worker 数）正常启用。
+  coordination 字段把部署形态变成可查询事实，供指标与排查使用。
 """
 
 from utils.antiban import bucket as _bucket
 from utils.antiban import circuit as _circuit
 from utils.antiban import cooldown as _cooldown
 from utils.antiban import guard as _guard
-from utils.antiban.guard import acquire_context, admission_error, anon_id, coordination_status, redact_proxy, release_context, report_error, report_network_error, report_success, init, sniff_account_warning  # noqa: F401
+from utils.antiban.guard import UncoordinatedMultiWorkerError, acquire_context, admission_error, anon_id, coordination_status, redact_proxy, release_context, report_error, report_network_error, report_success, init, sniff_account_warning  # noqa: F401
 
 
 def _bucket_status_counts():

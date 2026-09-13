@@ -1288,6 +1288,22 @@ async def routing_admin_audit(request: Request, limit: int = 100):
     return JSONResponse({"status": "success", "events": audit.recent(limit)})
 
 
+async def routing_admin_antiban_metrics(request: Request):
+    """antiban 匿名指标快照。
+
+    metrics_snapshot() 只返回计数与有界枚举，不含 token、bucket id、代理串或
+    上游原文，因此可以直接暴露；但「可暴露」不等于「可公开」——它仍然读得到
+    部署形态与死号存量，所以和其它后台接口一样走 require_admin_auth。
+
+    antiban 关闭时快照是零值 + enabled=false，不是 404：路由存在本身就是
+    「开关关掉了」和「这个版本没有这个接口」的区分点。
+    """
+    require_admin_auth(request)
+    from utils.antiban import metrics_snapshot
+
+    return JSONResponse(metrics_snapshot())
+
+
 app.add_api_route("/admin/routing", routing_admin_page, methods=["GET"], response_class=HTMLResponse)
 app.add_api_route("/admin/routing/data", routing_admin_data, methods=["GET"])
 app.add_api_route("/admin/routing/save", routing_admin_save, methods=["POST"])
@@ -1314,6 +1330,7 @@ app.add_api_route("/admin/harvester/import-cookie", routing_admin_harvester_impo
 app.add_api_route("/admin/users", routing_admin_users, methods=["GET"])
 app.add_api_route("/admin/users/status", routing_admin_user_status, methods=["POST"])
 app.add_api_route("/admin/audit", routing_admin_audit, methods=["GET"])
+app.add_api_route("/admin/antiban/metrics", routing_admin_antiban_metrics, methods=["GET"])
 
 if api_prefix:
     app.add_api_route(f"/{api_prefix}/admin/routing", routing_admin_page, methods=["GET"], response_class=HTMLResponse)
@@ -1342,3 +1359,4 @@ if api_prefix:
     app.add_api_route(f"/{api_prefix}/admin/users", routing_admin_users, methods=["GET"])
     app.add_api_route(f"/{api_prefix}/admin/users/status", routing_admin_user_status, methods=["POST"])
     app.add_api_route(f"/{api_prefix}/admin/audit", routing_admin_audit, methods=["GET"])
+    app.add_api_route(f"/{api_prefix}/admin/antiban/metrics", routing_admin_antiban_metrics, methods=["GET"])

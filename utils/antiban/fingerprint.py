@@ -19,6 +19,7 @@ from typing import Dict, Optional
 
 import utils.globals as globals
 from utils import configs
+from utils.antiban.concurrency import anon_id
 from utils.Logger import logger
 
 _write_lock = threading.Lock()
@@ -523,7 +524,7 @@ def ensure_extended(token: str) -> Dict:
     if dirty:
         try:
             _persist_fp()
-            logger.info(f"[antiban] fingerprint extended for token={token[:12]}...")
+            logger.info(f"[antiban] fingerprint extended for {anon_id(token)}")
         except Exception as e:  # pragma: no cover
             logger.error(f"[antiban] failed to persist extended fp: {e}")
 

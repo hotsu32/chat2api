@@ -463,7 +463,8 @@ async def scheduled_heal() -> None:
     """定时任务入口：由 APScheduler 调用。
 
     只自愈 bucket（代理层，可观测且可逆）。死号**不**在此自动复活：
-    复活需要「探针成功 + dwell」，其接口尚未存在（见交付报告的 health-recovery 需求）。
+    复活需要「认证探针成功 + dwell 窗口」，走号池的 fleet_health 路径
+    （`fleet_health.check_account` → `revive_token`），不是靠定时器无条件翻回来。
     """
     restored = _bucket.heal_buckets()
     if restored:
